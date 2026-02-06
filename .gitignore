@@ -23,3 +23,8 @@ apps/briefcase-extension/playwright-report
 
 # Local caches (e.g. docker-mounted cargo registry)
 .cache
+
+# Android
+apps/briefcase-mobile-signer/android/.gradle
+apps/briefcase-mobile-signer/android/**/build
+apps/briefcase-mobile-signer/android/local.properties
