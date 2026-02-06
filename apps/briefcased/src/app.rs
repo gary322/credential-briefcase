@@ -15,9 +15,9 @@ use briefcase_api::types::{
     ListApprovalsResponse, ListBudgetsResponse, ListMcpServersResponse, ListProvidersResponse,
     ListReceiptsResponse, ListToolsResponse, McpOAuthExchangeRequest, McpOAuthExchangeResponse,
     McpOAuthStartRequest, McpOAuthStartResponse, OAuthExchangeRequest, OAuthExchangeResponse,
-    ProviderSummary, SetBudgetRequest, SignerPairCompleteRequest, SignerPairCompleteResponse,
-    SignerPairStartResponse, SignerSignedRequest, UpsertMcpServerRequest, UpsertProviderRequest,
-    VerifyReceiptsResponse,
+    ProviderSummary, SetBudgetRequest, SignerAlgorithm, SignerPairCompleteRequest,
+    SignerPairCompleteResponse, SignerPairStartResponse, SignerSignedRequest,
+    UpsertMcpServerRequest, UpsertProviderRequest, VerifyReceiptsResponse,
 };
 use briefcase_core::{
     PolicyDecision, ToolCall, ToolEgressPolicy, ToolFilesystemPolicy, ToolLimits, ToolManifest,
@@ -1341,16 +1341,31 @@ async fn complete_signer_pairing(
     let signer_pubkey = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(req.signer_pubkey_b64.as_bytes())
         .map_err(|_| bad_request("invalid_signer_pubkey_b64"))?;
-    if signer_pubkey.len() != 32 {
-        return Err(bad_request("invalid_signer_pubkey_len"));
-    }
 
-    let mut pubkey_arr = [0u8; 32];
-    pubkey_arr.copy_from_slice(&signer_pubkey);
-    let _vk = ed25519_dalek::VerifyingKey::from_bytes(&pubkey_arr)
-        .map_err(|_| bad_request("invalid_signer_pubkey"))?;
+    let algorithm = match req.algorithm {
+        SignerAlgorithm::Ed25519 => {
+            if signer_pubkey.len() != 32 {
+                return Err(bad_request("invalid_signer_pubkey_len"));
+            }
+            let mut pubkey_arr = [0u8; 32];
+            pubkey_arr.copy_from_slice(&signer_pubkey);
+            let _vk = ed25519_dalek::VerifyingKey::from_bytes(&pubkey_arr)
+                .map_err(|_| bad_request("invalid_signer_pubkey"))?;
+            "ed25519"
+        }
+        SignerAlgorithm::P256 => {
+            if signer_pubkey.len() != 33 && signer_pubkey.len() != 65 {
+                return Err(bad_request("invalid_signer_pubkey_len"));
+            }
+            let point = p256::EncodedPoint::from_bytes(&signer_pubkey)
+                .map_err(|_| bad_request("invalid_signer_pubkey"))?;
+            let _vk = p256::ecdsa::VerifyingKey::from_encoded_point(&point)
+                .map_err(|_| bad_request("invalid_signer_pubkey"))?;
+            "p256"
+        }
+    };
 
-    let pubkey_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(signer_pubkey);
+    let pubkey_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&signer_pubkey);
 
     let mut noise = crate::pairing::noise_responder(&psk).map_err(internal_error)?;
     let mut payload = vec![0u8; 1024];
@@ -1361,7 +1376,12 @@ async fn complete_signer_pairing(
     let signer_id = Uuid::new_v4();
     state
         .db
-        .upsert_signer(signer_id, &pubkey_b64)
+        .upsert_signer(
+            signer_id,
+            algorithm,
+            &pubkey_b64,
+            req.device_name.as_deref(),
+        )
         .await
         .map_err(internal_error)?;
 
@@ -1425,7 +1445,7 @@ async fn verify_signer_request(
     approval_id: Option<Uuid>,
     req: &SignerSignedRequest,
 ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
-    let pk_b64 = state
+    let (algorithm, pk_b64) = state
         .db
         .signer_pubkey_b64(req.signer_id)
         .await
@@ -1435,13 +1455,6 @@ async fn verify_signer_request(
     let pk = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(pk_b64.as_bytes())
         .map_err(|_| bad_request("invalid_signer_pubkey_b64"))?;
-    if pk.len() != 32 {
-        return Err(bad_request("invalid_signer_pubkey_len"));
-    }
-    let mut pk_arr = [0u8; 32];
-    pk_arr.copy_from_slice(&pk);
-    let vk = ed25519_dalek::VerifyingKey::from_bytes(&pk_arr)
-        .map_err(|_| bad_request("invalid_signer_pubkey"))?;
 
     let ts = chrono::DateTime::parse_from_rfc3339(&req.ts_rfc3339)
         .map_err(|_| bad_request("invalid_ts"))?
@@ -1459,8 +1472,6 @@ async fn verify_signer_request(
     let sig_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(req.sig_b64.as_bytes())
         .map_err(|_| bad_request("invalid_sig_b64"))?;
-    let sig =
-        ed25519_dalek::Signature::from_slice(&sig_bytes).map_err(|_| bad_request("invalid_sig"))?;
 
     let approval_line = approval_id
         .map(|id| id.to_string())
@@ -1469,8 +1480,37 @@ async fn verify_signer_request(
         "{kind}\n{}\n{}\n{}\n{}\n",
         req.signer_id, approval_line, req.ts_rfc3339, req.nonce
     );
-    vk.verify_strict(msg.as_bytes(), &sig)
-        .map_err(|_| bad_request("invalid_signature"))?;
+    match algorithm.as_str() {
+        "ed25519" => {
+            if pk.len() != 32 {
+                return Err(bad_request("invalid_signer_pubkey_len"));
+            }
+            let mut pk_arr = [0u8; 32];
+            pk_arr.copy_from_slice(&pk);
+            let vk = ed25519_dalek::VerifyingKey::from_bytes(&pk_arr)
+                .map_err(|_| bad_request("invalid_signer_pubkey"))?;
+            let sig = ed25519_dalek::Signature::from_slice(&sig_bytes)
+                .map_err(|_| bad_request("invalid_sig"))?;
+            vk.verify_strict(msg.as_bytes(), &sig)
+                .map_err(|_| bad_request("invalid_signature"))?;
+        }
+        "p256" => {
+            if pk.len() != 33 && pk.len() != 65 {
+                return Err(bad_request("invalid_signer_pubkey_len"));
+            }
+            let point = p256::EncodedPoint::from_bytes(&pk)
+                .map_err(|_| bad_request("invalid_signer_pubkey"))?;
+            let vk = p256::ecdsa::VerifyingKey::from_encoded_point(&point)
+                .map_err(|_| bad_request("invalid_signer_pubkey"))?;
+            let sig = p256::ecdsa::Signature::from_der(&sig_bytes)
+                .or_else(|_| p256::ecdsa::Signature::from_slice(&sig_bytes))
+                .map_err(|_| bad_request("invalid_sig"))?;
+            use p256::ecdsa::signature::Verifier as _;
+            vk.verify(msg.as_bytes(), &sig)
+                .map_err(|_| bad_request("invalid_signature"))?;
+        }
+        _ => return Err(bad_request("unknown_signer_algorithm")),
+    }
 
     Ok(())
 }
@@ -2876,6 +2916,86 @@ mod tests {
                 call: ToolCall {
                     tool_id: "note_add".to_string(),
                     args: serde_json::json!({ "text": "secret note" }),
+                    context: ToolCallContext::new(),
+                    approval_token: Some(approved.approval_token),
+                },
+            })
+            .await?;
+        assert!(matches!(resp, CallToolResponse::Ok { .. }));
+
+        daemon_task.abort();
+        provider_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn signer_p256_pairing_and_approval_flow() -> anyhow::Result<()> {
+        let (provider_addr, _provider_state, provider_task) = start_mock_provider().await?;
+        let provider_base_url = format!("http://{provider_addr}");
+
+        let (_state, _daemon_base, client, daemon_task) = start_daemon_with_options(
+            provider_base_url,
+            AppOptions {
+                require_signer_for_approvals: true,
+            },
+        )
+        .await?;
+
+        let pair = client.signer_pair_start().await?;
+        let sim = signer_sim::SimP256Signer::new();
+        let signer_id = sim
+            .pair(&client, pair.pairing_id, &pair.pairing_code)
+            .await?;
+
+        // note_add requires approval.
+        let resp = client
+            .call_tool(CallToolRequest {
+                call: ToolCall {
+                    tool_id: "note_add".to_string(),
+                    args: serde_json::json!({ "text": "secret note p256" }),
+                    context: ToolCallContext::new(),
+                    approval_token: None,
+                },
+            })
+            .await?;
+
+        let approval_id = match resp {
+            CallToolResponse::ApprovalRequired { approval } => approval.id,
+            _ => anyhow::bail!("expected approval_required"),
+        };
+
+        // Signer can list approvals.
+        let approvals = client
+            .signer_list_approvals(sim.signed_request(signer_id, "list_approvals", None))
+            .await?
+            .approvals;
+        assert!(
+            approvals.iter().any(|a| a.id == approval_id),
+            "approval not found in signer list"
+        );
+
+        // Normal approve is blocked when signer enforcement is enabled.
+        match client.approve(&approval_id).await {
+            Ok(_) => anyhow::bail!("expected signer_required error"),
+            Err(BriefcaseClientError::Daemon { code, .. }) => {
+                assert_eq!(code, "signer_required");
+            }
+            Err(other) => anyhow::bail!("unexpected error: {other:?}"),
+        };
+
+        let approved = client
+            .signer_approve(
+                &approval_id,
+                sim.signed_request(signer_id, "approve", Some(approval_id)),
+            )
+            .await?;
+
+        // Retry with approval token.
+        let resp = client
+            .call_tool(CallToolRequest {
+                call: ToolCall {
+                    tool_id: "note_add".to_string(),
+                    args: serde_json::json!({ "text": "secret note p256" }),
                     context: ToolCallContext::new(),
                     approval_token: Some(approved.approval_token),
                 },

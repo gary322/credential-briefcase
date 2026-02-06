@@ -433,16 +433,31 @@ components:
           type: string
           format: date-time
 
+    SignerAlgorithm:
+      type: string
+      enum: [ed25519, p256]
+      description: |
+        Signer public key algorithm.
+
+        - `ed25519`: 32-byte Ed25519 public key.
+        - `p256`: SEC1-encoded P-256 public key bytes (compressed or uncompressed).
+
     SignerPairCompleteRequest:
       type: object
-      required: [msg1_b64, signer_pubkey_b64]
+      required: [msg1_b64, algorithm, signer_pubkey_b64]
       properties:
         msg1_b64:
           type: string
           description: Noise handshake message 1 (base64url).
+        algorithm:
+          $ref: "#/components/schemas/SignerAlgorithm"
         signer_pubkey_b64:
           type: string
-          description: Ed25519 public key bytes (base64url).
+          description: |
+            Signer public key bytes (base64url).
+
+            - `ed25519`: 32 raw bytes.
+            - `p256`: SEC1-encoded bytes (33-byte compressed or 65-byte uncompressed).
         device_name:
           type: ["string", "null"]
 
@@ -469,7 +484,11 @@ components:
           description: A unique per-request nonce (UUID string recommended).
         sig_b64:
           type: string
-          description: Ed25519 signature over the request tuple (base64url).
+          description: |
+            Signature over the request tuple (base64url).
+
+            - `ed25519`: 64 raw bytes.
+            - `p256`: DER-encoded ECDSA signature.
 
     ReceiptRecord:
       type: object

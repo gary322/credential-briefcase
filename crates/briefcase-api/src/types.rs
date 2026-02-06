@@ -119,6 +119,15 @@ pub struct SetBudgetRequest {
     pub daily_limit_microusd: i64,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SignerAlgorithm {
+    /// 32-byte Ed25519 public key.
+    Ed25519,
+    /// SEC1-encoded P-256 public key bytes (compressed or uncompressed).
+    P256,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SignerPairStartResponse {
     pub pairing_id: Uuid,
@@ -131,7 +140,12 @@ pub struct SignerPairStartResponse {
 pub struct SignerPairCompleteRequest {
     /// Noise handshake message 1 (base64url).
     pub msg1_b64: String,
-    /// Ed25519 public key bytes (base64url).
+    /// Signer public key algorithm.
+    pub algorithm: SignerAlgorithm,
+    /// Signer public key bytes (base64url).
+    ///
+    /// - `ed25519`: 32 raw bytes.
+    /// - `p256`: SEC1-encoded bytes (33-byte compressed or 65-byte uncompressed).
     pub signer_pubkey_b64: String,
     /// Optional UI label for the signer device.
     pub device_name: Option<String>,

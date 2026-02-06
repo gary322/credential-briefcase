@@ -847,6 +847,7 @@ dependencies = [
  "directories",
  "ed25519-dalek",
  "jsonschema",
+ "p256",
  "rand 0.9.2",
  "reqwest",
  "rusqlite",

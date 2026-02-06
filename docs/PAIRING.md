@@ -27,23 +27,33 @@ Noise parameters:
 - PSK index `0`
 - The PSK is the `pairing_code` decoded from base64url.
 
-The signer sends Noise message 1 (`msg1_b64`). `briefcased` responds with Noise message 2 (`msg2_b64`) whose decrypted payload includes the assigned `signer_id`.
+The signer sends:
+
+- Noise message 1 (`msg1_b64`)
+- a signing public key (`signer_pubkey_b64`) and `algorithm` (`ed25519` or `p256`)
+
+`briefcased` responds with Noise message 2 (`msg2_b64`) whose decrypted payload includes the assigned `signer_id`.
 
 ### Approval requests (signed + replay protected)
 
-Signer requests are authenticated by an Ed25519 signature plus a timestamp + nonce.
+Signer requests are authenticated by a signature plus a timestamp + nonce.
 
 For a signed request, the signer sends:
 
 - `signer_id`
 - `ts_rfc3339`
 - `nonce` (UUID string)
-- `sig_b64` (base64url Ed25519 signature)
+- `sig_b64` (base64url signature; format depends on `algorithm`)
 
 The signature input is a simple newline-delimited string:
 
 - `list_approvals\n{signer_id}\n-\n{ts}\n{nonce}\n`
 - `approve\n{signer_id}\n{approval_id}\n{ts}\n{nonce}\n`
+
+Signature formats:
+
+- `ed25519`: 64 raw bytes.
+- `p256`: DER-encoded ECDSA signature (X9.62).
 
 `briefcased` enforces:
 
@@ -54,4 +64,3 @@ The signature input is a simple newline-delimited string:
 
 - The daemon continues to default to a Unix socket on Unix platforms. For cross-device pairing you must run `briefcased` on TCP (`BRIEFCASE_TCP_ADDR`), and consider additional network controls.
 - v0.1 implements a local-first reference protocol; enterprise deployments should integrate with a proper device enrollment and transport security profile.
-

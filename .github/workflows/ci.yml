@@ -129,3 +129,26 @@ jobs:
 
       - name: Run TPM2 tests (swtpm)
         run: docker run --rm -v ${{ github.workspace }}:/workspace -w /workspace credential-briefcase-swtpm bash docker/swtpm/run-tests.sh
+
+  ios_signer_build:
+    name: iOS signer (build)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install xcodegen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        working-directory: apps/briefcase-mobile-signer/ios
+        run: xcodegen generate
+
+      - name: xcodebuild (iOS Simulator)
+        working-directory: apps/briefcase-mobile-signer/ios
+        run: |
+          xcodebuild \
+            -project BriefcaseMobileSigner.xcodeproj \
+            -scheme BriefcaseMobileSigner \
+            -destination 'platform=iOS Simulator,name=iPhone 15' \
+            CODE_SIGNING_ALLOWED=NO \
+            build

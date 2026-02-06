@@ -189,7 +189,7 @@ For each task, include:
   - **Done when**: daemon can enroll a simulated signer and require it for approvals.
   - **Verify**: `cargo test -p briefcased signer_*`
 
-- [ ] 6.2 Implement iOS signer app (Secure Enclave)
+- [x] 6.2 Implement iOS signer app (Secure Enclave)
   - **Do**: implement iOS app with secure enclave key + signing; approval UI; QR pairing.
   - **Files**: `apps/briefcase-mobile-signer/ios/*`
   - **Done when**: iOS can pair and approve/sign requests end-to-end.

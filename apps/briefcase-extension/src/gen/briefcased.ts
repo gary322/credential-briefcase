@@ -301,10 +301,25 @@ export interface components {
       /** Format: date-time */
       expires_at_rfc3339: string;
     };
+    /**
+     * @description Signer public key algorithm.
+     *
+     * - `ed25519`: 32-byte Ed25519 public key.
+     * - `p256`: SEC1-encoded P-256 public key bytes (compressed or uncompressed).
+     *
+     * @enum {string}
+     */
+    SignerAlgorithm: "ed25519" | "p256";
     SignerPairCompleteRequest: {
       /** @description Noise handshake message 1 (base64url). */
       msg1_b64: string;
-      /** @description Ed25519 public key bytes (base64url). */
+      algorithm: components["schemas"]["SignerAlgorithm"];
+      /**
+       * @description Signer public key bytes (base64url).
+       *
+       * - `ed25519`: 32 raw bytes.
+       * - `p256`: SEC1-encoded bytes (33-byte compressed or 65-byte uncompressed).
+       */
       signer_pubkey_b64: string;
       device_name?: string | null;
     };
@@ -319,7 +334,12 @@ export interface components {
       ts_rfc3339: string;
       /** @description A unique per-request nonce (UUID string recommended). */
       nonce: string;
-      /** @description Ed25519 signature over the request tuple (base64url). */
+      /**
+       * @description Signature over the request tuple (base64url).
+       *
+       * - `ed25519`: 64 raw bytes.
+       * - `p256`: DER-encoded ECDSA signature.
+       */
       sig_b64: string;
     };
     ReceiptRecord: {

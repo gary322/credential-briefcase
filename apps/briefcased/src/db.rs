@@ -120,7 +120,9 @@ impl Db {
 
                     CREATE TABLE IF NOT EXISTS signers (
                       id                TEXT PRIMARY KEY,
+                      algorithm         TEXT NOT NULL,
                       pubkey_b64         TEXT NOT NULL,
+                      device_name        TEXT,
                       created_at_rfc3339 TEXT NOT NULL
                     );
 
@@ -193,6 +195,11 @@ impl Db {
                     "ALTER TABLE remote_mcp_oauth ADD COLUMN dpop_algs_json TEXT NOT NULL DEFAULT '[]'",
                     [],
                 );
+                let _ = conn.execute(
+                    "ALTER TABLE signers ADD COLUMN algorithm TEXT NOT NULL DEFAULT 'ed25519'",
+                    [],
+                );
+                let _ = conn.execute("ALTER TABLE signers ADD COLUMN device_name TEXT", []);
                 Ok(())
             })
             .await;
@@ -744,19 +751,27 @@ impl Db {
         Ok(())
     }
 
-    pub async fn upsert_signer(&self, signer_id: Uuid, pubkey_b64: &str) -> anyhow::Result<()> {
+    pub async fn upsert_signer(
+        &self,
+        signer_id: Uuid,
+        algorithm: &str,
+        pubkey_b64: &str,
+        device_name: Option<&str>,
+    ) -> anyhow::Result<()> {
         let signer_id = signer_id.to_string();
+        let algorithm = algorithm.to_string();
         let pubkey_b64 = pubkey_b64.to_string();
+        let device_name = device_name.map(|s| s.to_string());
         let created_at = Utc::now().to_rfc3339();
         self.conn
             .call(move |conn| {
                 conn.execute(
                     r#"
-                    INSERT INTO signers(id, pubkey_b64, created_at_rfc3339)
-                    VALUES (?1, ?2, ?3)
-                    ON CONFLICT(id) DO UPDATE SET pubkey_b64=excluded.pubkey_b64
+                    INSERT INTO signers(id, algorithm, pubkey_b64, device_name, created_at_rfc3339)
+                    VALUES (?1, ?2, ?3, ?4, ?5)
+                    ON CONFLICT(id) DO UPDATE SET algorithm=excluded.algorithm, pubkey_b64=excluded.pubkey_b64, device_name=excluded.device_name
                     "#,
-                    params![signer_id, pubkey_b64, created_at],
+                    params![signer_id, algorithm, pubkey_b64, device_name, created_at],
                 )?;
                 Ok(())
             })
@@ -764,16 +779,19 @@ impl Db {
         Ok(())
     }
 
-    pub async fn signer_pubkey_b64(&self, signer_id: Uuid) -> anyhow::Result<Option<String>> {
+    pub async fn signer_pubkey_b64(
+        &self,
+        signer_id: Uuid,
+    ) -> anyhow::Result<Option<(String, String)>> {
         let signer_id = signer_id.to_string();
         let row = self
             .conn
             .call(move |conn| {
                 let row = conn
                     .query_row(
-                        "SELECT pubkey_b64 FROM signers WHERE id=?1",
+                        "SELECT algorithm, pubkey_b64 FROM signers WHERE id=?1",
                         params![signer_id],
-                        |r| r.get::<_, String>(0),
+                        |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
                     )
                     .optional()?;
                 Ok(row)
