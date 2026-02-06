@@ -56,7 +56,7 @@ fn load_auth_token(path: &Path) -> anyhow::Result<String> {
     Ok(tok)
 }
 
-fn resolve_endpoint(args: &Args, data_dir: &Path) -> anyhow::Result<DaemonEndpoint> {
+fn resolve_endpoint(args: &Args, _data_dir: &Path) -> anyhow::Result<DaemonEndpoint> {
     #[cfg(unix)]
     {
         if let Some(p) = &args.unix_socket {
@@ -64,7 +64,7 @@ fn resolve_endpoint(args: &Args, data_dir: &Path) -> anyhow::Result<DaemonEndpoi
                 socket_path: p.clone(),
             });
         }
-        let default_sock = data_dir.join("briefcased.sock");
+        let default_sock = _data_dir.join("briefcased.sock");
         if default_sock.exists() {
             return Ok(DaemonEndpoint::Unix {
                 socket_path: default_sock,
