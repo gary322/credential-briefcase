@@ -18,6 +18,38 @@ pub struct RemoteMcpServerRecord {
     pub endpoint_url: String,
 }
 
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct RemoteMcpOauthRecord {
+    pub server_id: String,
+    pub issuer: String,
+    pub authorization_endpoint: String,
+    pub token_endpoint: String,
+    pub resource: String,
+}
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct RemoteMcpOauthClientRecord {
+    pub server_id: String,
+    pub client_id: String,
+    pub scope: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct OAuthSessionRecord {
+    pub state: String,
+    pub kind: String,
+    pub server_id: String,
+    pub created_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    pub code_verifier: String,
+    pub redirect_uri: String,
+    pub client_id: String,
+    pub scope: String,
+    pub token_endpoint: String,
+}
+
 impl Db {
     pub async fn open(path: &Path) -> anyhow::Result<Self> {
         if let Some(parent) = path.parent() {
@@ -94,6 +126,38 @@ impl Db {
                       endpoint_url      TEXT NOT NULL,
                       created_at_rfc3339 TEXT NOT NULL
                     );
+
+                    CREATE TABLE IF NOT EXISTS remote_mcp_oauth (
+                      server_id             TEXT PRIMARY KEY,
+                      issuer                TEXT NOT NULL,
+                      authorization_endpoint TEXT NOT NULL,
+                      token_endpoint        TEXT NOT NULL,
+                      resource              TEXT NOT NULL,
+                      discovered_at_rfc3339 TEXT NOT NULL
+                    );
+
+                    CREATE TABLE IF NOT EXISTS remote_mcp_oauth_clients (
+                      server_id        TEXT PRIMARY KEY,
+                      client_id        TEXT NOT NULL,
+                      scope            TEXT NOT NULL,
+                      updated_at_rfc3339 TEXT NOT NULL
+                    );
+
+                    CREATE TABLE IF NOT EXISTS oauth_sessions (
+                      state            TEXT PRIMARY KEY,
+                      kind             TEXT NOT NULL,
+                      server_id        TEXT NOT NULL,
+                      created_at_rfc3339 TEXT NOT NULL,
+                      expires_at_rfc3339 TEXT NOT NULL,
+                      code_verifier    TEXT NOT NULL,
+                      redirect_uri     TEXT NOT NULL,
+                      client_id        TEXT NOT NULL,
+                      scope            TEXT NOT NULL,
+                      token_endpoint   TEXT NOT NULL
+                    );
+
+                    CREATE INDEX IF NOT EXISTS oauth_sessions_expires_idx ON oauth_sessions(expires_at_rfc3339);
+                    CREATE INDEX IF NOT EXISTS oauth_sessions_server_idx ON oauth_sessions(server_id);
                     "#,
                 )?;
                 Ok(())
@@ -195,6 +259,15 @@ impl Db {
         self.conn
             .call(move |conn| {
                 conn.execute("DELETE FROM remote_mcp_servers WHERE id=?1", params![id])?;
+                conn.execute(
+                    "DELETE FROM remote_mcp_oauth WHERE server_id=?1",
+                    params![id],
+                )?;
+                conn.execute(
+                    "DELETE FROM remote_mcp_oauth_clients WHERE server_id=?1",
+                    params![id],
+                )?;
+                conn.execute("DELETE FROM oauth_sessions WHERE server_id=?1", params![id])?;
                 Ok(())
             })
             .await?;
@@ -217,6 +290,237 @@ impl Db {
             })
             .await?;
         Ok(rows)
+    }
+
+    pub async fn upsert_remote_mcp_oauth(
+        &self,
+        server_id: &str,
+        issuer: &str,
+        authorization_endpoint: &str,
+        token_endpoint: &str,
+        resource: &str,
+    ) -> anyhow::Result<()> {
+        let server_id = server_id.to_string();
+        let issuer = issuer.to_string();
+        let authorization_endpoint = authorization_endpoint.to_string();
+        let token_endpoint = token_endpoint.to_string();
+        let resource = resource.to_string();
+        let discovered_at = Utc::now().to_rfc3339();
+        self.conn
+            .call(move |conn| {
+                conn.execute(
+                    r#"
+                    INSERT INTO remote_mcp_oauth(server_id, issuer, authorization_endpoint, token_endpoint, resource, discovered_at_rfc3339)
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                    ON CONFLICT(server_id) DO UPDATE SET
+                      issuer=excluded.issuer,
+                      authorization_endpoint=excluded.authorization_endpoint,
+                      token_endpoint=excluded.token_endpoint,
+                      resource=excluded.resource,
+                      discovered_at_rfc3339=excluded.discovered_at_rfc3339
+                    "#,
+                    params![
+                        server_id,
+                        issuer,
+                        authorization_endpoint,
+                        token_endpoint,
+                        resource,
+                        discovered_at
+                    ],
+                )?;
+                Ok(())
+            })
+            .await?;
+        Ok(())
+    }
+
+    pub async fn get_remote_mcp_oauth(
+        &self,
+        server_id: &str,
+    ) -> anyhow::Result<Option<RemoteMcpOauthRecord>> {
+        let server_id = server_id.to_string();
+        let row = self
+            .conn
+            .call(move |conn| {
+                Ok(conn
+                    .query_row(
+                        r#"
+                        SELECT server_id, issuer, authorization_endpoint, token_endpoint, resource
+                        FROM remote_mcp_oauth
+                        WHERE server_id=?1
+                        "#,
+                        params![server_id],
+                        |row| {
+                            Ok(RemoteMcpOauthRecord {
+                                server_id: row.get(0)?,
+                                issuer: row.get(1)?,
+                                authorization_endpoint: row.get(2)?,
+                                token_endpoint: row.get(3)?,
+                                resource: row.get(4)?,
+                            })
+                        },
+                    )
+                    .optional()?)
+            })
+            .await?;
+        Ok(row)
+    }
+
+    pub async fn upsert_remote_mcp_oauth_client(
+        &self,
+        server_id: &str,
+        client_id: &str,
+        scope: &str,
+    ) -> anyhow::Result<()> {
+        let server_id = server_id.to_string();
+        let client_id = client_id.to_string();
+        let scope = scope.to_string();
+        let updated_at = Utc::now().to_rfc3339();
+        self.conn
+            .call(move |conn| {
+                conn.execute(
+                    r#"
+                    INSERT INTO remote_mcp_oauth_clients(server_id, client_id, scope, updated_at_rfc3339)
+                    VALUES (?1, ?2, ?3, ?4)
+                    ON CONFLICT(server_id) DO UPDATE SET
+                      client_id=excluded.client_id,
+                      scope=excluded.scope,
+                      updated_at_rfc3339=excluded.updated_at_rfc3339
+                    "#,
+                    params![server_id, client_id, scope, updated_at],
+                )?;
+                Ok(())
+            })
+            .await?;
+        Ok(())
+    }
+
+    pub async fn get_remote_mcp_oauth_client(
+        &self,
+        server_id: &str,
+    ) -> anyhow::Result<Option<RemoteMcpOauthClientRecord>> {
+        let server_id = server_id.to_string();
+        let row = self
+            .conn
+            .call(move |conn| {
+                Ok(conn
+                    .query_row(
+                        r#"
+                        SELECT server_id, client_id, scope
+                        FROM remote_mcp_oauth_clients
+                        WHERE server_id=?1
+                        "#,
+                        params![server_id],
+                        |row| {
+                            Ok(RemoteMcpOauthClientRecord {
+                                server_id: row.get(0)?,
+                                client_id: row.get(1)?,
+                                scope: row.get(2)?,
+                            })
+                        },
+                    )
+                    .optional()?)
+            })
+            .await?;
+        Ok(row)
+    }
+
+    pub async fn create_oauth_session(&self, session: OAuthSessionRecord) -> anyhow::Result<()> {
+        self.conn
+            .call(move |conn| {
+                conn.execute(
+                    r#"
+                    INSERT INTO oauth_sessions(
+                      state, kind, server_id, created_at_rfc3339, expires_at_rfc3339,
+                      code_verifier, redirect_uri, client_id, scope, token_endpoint
+                    )
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                    "#,
+                    params![
+                        session.state,
+                        session.kind,
+                        session.server_id,
+                        session.created_at.to_rfc3339(),
+                        session.expires_at.to_rfc3339(),
+                        session.code_verifier,
+                        session.redirect_uri,
+                        session.client_id,
+                        session.scope,
+                        session.token_endpoint
+                    ],
+                )?;
+                Ok(())
+            })
+            .await?;
+        Ok(())
+    }
+
+    pub async fn get_oauth_session(
+        &self,
+        state: &str,
+    ) -> anyhow::Result<Option<OAuthSessionRecord>> {
+        let state = state.to_string();
+        let row = self
+            .conn
+            .call(move |conn| {
+                Ok(conn
+                    .query_row(
+                        r#"
+                        SELECT
+                          state, kind, server_id, created_at_rfc3339, expires_at_rfc3339,
+                          code_verifier, redirect_uri, client_id, scope, token_endpoint
+                        FROM oauth_sessions
+                        WHERE state=?1
+                        "#,
+                        params![state],
+                        |row| {
+                            let created_at: String = row.get(3)?;
+                            let expires_at: String = row.get(4)?;
+                            Ok(OAuthSessionRecord {
+                                state: row.get(0)?,
+                                kind: row.get(1)?,
+                                server_id: row.get(2)?,
+                                created_at: DateTime::parse_from_rfc3339(&created_at)
+                                    .map_err(|e| {
+                                        rusqlite::Error::FromSqlConversionFailure(
+                                            0,
+                                            rusqlite::types::Type::Text,
+                                            Box::new(e),
+                                        )
+                                    })?
+                                    .with_timezone(&Utc),
+                                expires_at: DateTime::parse_from_rfc3339(&expires_at)
+                                    .map_err(|e| {
+                                        rusqlite::Error::FromSqlConversionFailure(
+                                            0,
+                                            rusqlite::types::Type::Text,
+                                            Box::new(e),
+                                        )
+                                    })?
+                                    .with_timezone(&Utc),
+                                code_verifier: row.get(5)?,
+                                redirect_uri: row.get(6)?,
+                                client_id: row.get(7)?,
+                                scope: row.get(8)?,
+                                token_endpoint: row.get(9)?,
+                            })
+                        },
+                    )
+                    .optional()?)
+            })
+            .await?;
+        Ok(row)
+    }
+
+    pub async fn delete_oauth_session(&self, state: &str) -> anyhow::Result<()> {
+        let state = state.to_string();
+        self.conn
+            .call(move |conn| {
+                conn.execute("DELETE FROM oauth_sessions WHERE state=?1", params![state])?;
+                Ok(())
+            })
+            .await?;
+        Ok(())
     }
 
     pub async fn budget_allows(

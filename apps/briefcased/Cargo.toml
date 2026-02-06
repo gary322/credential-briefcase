@@ -34,6 +34,7 @@ briefcase-api = { path = "../../crates/briefcase-api" }
 briefcase-core = { path = "../../crates/briefcase-core" }
 briefcase-identity = { path = "../../crates/briefcase-identity" }
 briefcase-mcp = { path = "../../crates/briefcase-mcp" }
+briefcase-oauth-discovery = { path = "../../crates/briefcase-oauth-discovery" }
 briefcase-payments = { path = "../../crates/briefcase-payments" }
 briefcase-policy = { path = "../../crates/briefcase-policy" }
 briefcase-receipts = { path = "../../crates/briefcase-receipts" }

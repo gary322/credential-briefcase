@@ -22,6 +22,7 @@ pub struct HttpMcpClientOptions {
     pub endpoint: Url,
     pub protocol_version: String,
     pub session_id: Option<String>,
+    pub bearer_token: Option<String>,
     pub timeout: Duration,
 }
 
@@ -31,6 +32,7 @@ impl HttpMcpClientOptions {
             endpoint,
             protocol_version: PROTOCOL_VERSION_LATEST.to_string(),
             session_id: None,
+            bearer_token: None,
             timeout: Duration::from_secs(30),
         }
     }
@@ -43,6 +45,7 @@ pub struct HttpMcpClient {
     endpoint: Url,
     protocol_version: String,
     session_id: Option<String>,
+    bearer_token: Option<String>,
     initialized: bool,
     ready: bool,
 }
@@ -59,9 +62,14 @@ impl HttpMcpClient {
             endpoint: opts.endpoint,
             protocol_version: opts.protocol_version,
             session_id: opts.session_id,
+            bearer_token: opts.bearer_token,
             initialized: false,
             ready: false,
         })
+    }
+
+    pub fn set_bearer_token(&mut self, token: Option<String>) {
+        self.bearer_token = token;
     }
 
     pub fn session_id(&self) -> Option<&str> {
@@ -146,6 +154,10 @@ impl HttpMcpClient {
             .header("mcp-protocol-version", &self.protocol_version)
             .json(&msg);
 
+        if let Some(tok) = &self.bearer_token {
+            req = req.bearer_auth(tok);
+        }
+
         if let Some(sid) = &self.session_id {
             req = req.header("mcp-session-id", sid);
         }
@@ -172,6 +184,10 @@ impl HttpMcpClient {
             .header("content-type", "application/json")
             .header("mcp-protocol-version", &self.protocol_version)
             .json(&req_msg);
+
+        if let Some(tok) = &self.bearer_token {
+            req = req.bearer_auth(tok);
+        }
 
         if let Some(sid) = &self.session_id {
             req = req.header("mcp-session-id", sid);

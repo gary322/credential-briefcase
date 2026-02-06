@@ -7,7 +7,10 @@ use axum::extract::{Query, State};
 use axum::response::Html;
 use axum::routing::get;
 use base64::Engine as _;
-use briefcase_api::types::{CallToolRequest, CallToolResponse, OAuthExchangeRequest};
+use briefcase_api::types::{
+    CallToolRequest, CallToolResponse, McpOAuthExchangeRequest, McpOAuthStartRequest,
+    OAuthExchangeRequest,
+};
 use briefcase_api::{BriefcaseClient, DaemonEndpoint};
 use briefcase_core::{ToolCall, ToolCallContext};
 use clap::{Parser, Subcommand};
@@ -125,8 +128,20 @@ enum McpCommand {
 #[derive(Debug, Subcommand)]
 enum McpServersCommand {
     List,
-    Upsert { id: String, endpoint_url: String },
-    Delete { id: String },
+    Upsert {
+        id: String,
+        endpoint_url: String,
+    },
+    Delete {
+        id: String,
+    },
+    OauthLogin {
+        id: String,
+        #[arg(long, default_value = "briefcase-cli")]
+        client_id: String,
+        #[arg(long)]
+        scope: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -275,6 +290,14 @@ async fn handle_mcp(client: &BriefcaseClient, cmd: McpCommand) -> anyhow::Result
             McpServersCommand::Delete { id } => {
                 let r = client.delete_mcp_server(&id).await?;
                 println!("mcp_server_delete: id={}", r.server_id);
+            }
+            McpServersCommand::OauthLogin {
+                id,
+                client_id,
+                scope,
+            } => {
+                mcp_oauth_login(client, &id, &client_id, scope.as_deref()).await?;
+                println!("mcp_oauth_login: ok server={id}");
             }
         },
     }
@@ -460,6 +483,83 @@ async fn oauth_login(
                 redirect_uri,
                 client_id: oauth_client_id.to_string(),
                 code_verifier,
+            },
+        )
+        .await?;
+
+    Ok(())
+}
+
+async fn mcp_oauth_login(
+    client: &BriefcaseClient,
+    server_id: &str,
+    oauth_client_id: &str,
+    scope: Option<&str>,
+) -> anyhow::Result<()> {
+    let (tx, rx) = tokio::sync::oneshot::channel::<OAuthCallback>();
+    let st = CallbackState {
+        tx: Arc::new(Mutex::new(Some(tx))),
+    };
+
+    async fn callback(
+        State(st): State<CallbackState>,
+        Query(q): Query<CallbackQuery>,
+    ) -> Html<String> {
+        if let Some(tx) = st.tx.lock().await.take() {
+            let _ = tx.send(OAuthCallback {
+                code: q.code,
+                state: q.state,
+            });
+        }
+        Html(
+            "<h1>OAuth complete</h1><p>You can close this tab and return to the terminal.</p>"
+                .to_string(),
+        )
+    }
+
+    let app = Router::new()
+        .route("/callback", get(callback))
+        .with_state(st);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let handle = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let redirect_uri = format!("http://127.0.0.1:{}/callback", addr.port());
+
+    let start = client
+        .mcp_oauth_start(
+            server_id,
+            McpOAuthStartRequest {
+                client_id: oauth_client_id.to_string(),
+                redirect_uri: redirect_uri.clone(),
+                scope: scope.map(|s| s.to_string()),
+            },
+        )
+        .await?;
+
+    println!(
+        "Open this URL in your browser:\n\n{}\n",
+        start.authorization_url
+    );
+
+    let cb = tokio::time::timeout(std::time::Duration::from_secs(180), rx)
+        .await
+        .context("oauth callback timed out")??;
+
+    handle.abort();
+
+    if cb.state != start.state {
+        anyhow::bail!("oauth state mismatch");
+    }
+
+    client
+        .mcp_oauth_exchange(
+            server_id,
+            McpOAuthExchangeRequest {
+                code: cb.code,
+                state: cb.state,
             },
         )
         .await?;

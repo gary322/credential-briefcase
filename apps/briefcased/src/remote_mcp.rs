@@ -7,6 +7,10 @@ use briefcase_core::{
     AuthMethod, OutputFirewall, ToolCategory, ToolCost, ToolSpec, util::sha256_hex,
 };
 use briefcase_mcp::{CallToolParams, HttpMcpClient, HttpMcpClientOptions, ListToolsParams};
+use briefcase_oauth_discovery::OAuthDiscoveryClient;
+use briefcase_secrets::SecretStore;
+use chrono::{DateTime, Utc};
+use serde::Deserialize;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 use url::Url;
@@ -25,6 +29,9 @@ struct RemoteToolDef {
 struct RemoteSession {
     endpoint_url: String,
     client: HttpMcpClient,
+    oauth_token_endpoint: Option<String>,
+    access_token: Option<String>,
+    access_token_expires_at: Option<DateTime<Utc>>,
     tools: HashMap<String, RemoteToolDef>, // tool_id -> def
     fetched_at: Option<Instant>,
 }
@@ -32,17 +39,32 @@ struct RemoteSession {
 #[derive(Clone)]
 pub struct RemoteMcpManager {
     db: Db,
+    secrets: Arc<dyn SecretStore>,
+    oauth: Arc<OAuthDiscoveryClient>,
+    http: reqwest::Client,
     sessions: Arc<Mutex<HashMap<String, Arc<Mutex<RemoteSession>>>>>, // server_id -> session
     ttl: Duration,
 }
 
 impl RemoteMcpManager {
-    pub fn new(db: Db) -> Self {
-        Self {
+    pub fn new(
+        db: Db,
+        secrets: Arc<dyn SecretStore>,
+        oauth: Arc<OAuthDiscoveryClient>,
+    ) -> anyhow::Result<Self> {
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(20))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .context("build reqwest client")?;
+        Ok(Self {
             db,
+            secrets,
+            oauth,
+            http,
             sessions: Arc::new(Mutex::new(HashMap::new())),
             ttl: Duration::from_secs(30),
-        }
+        })
     }
 
     pub async fn list_tool_specs(&self) -> Vec<ToolSpec> {
@@ -105,6 +127,24 @@ impl RemoteMcpManager {
 
         let session = self.session_for(&server).await?;
         let mut guard = session.lock().await;
+
+        // Endpoint changed: reset session.
+        if guard.endpoint_url != server.endpoint_url {
+            let endpoint =
+                Url::parse(&server.endpoint_url).context("parse remote mcp endpoint_url")?;
+            guard.client = HttpMcpClient::new(HttpMcpClientOptions::new(endpoint))?;
+            guard.endpoint_url = server.endpoint_url.clone();
+            guard.tools.clear();
+            guard.fetched_at = None;
+            guard.oauth_token_endpoint = None;
+            guard.access_token = None;
+            guard.access_token_expires_at = None;
+        }
+
+        // If OAuth is configured for this server, ensure we have an access token attached.
+        self.ensure_bearer_token(&server_id, &server, &mut guard)
+            .await?;
+
         if guard
             .fetched_at
             .map(|t| t.elapsed() < self.ttl)
@@ -172,6 +212,9 @@ impl RemoteMcpManager {
         let sess = Arc::new(Mutex::new(RemoteSession {
             endpoint_url: server.endpoint_url.clone(),
             client,
+            oauth_token_endpoint: None,
+            access_token: None,
+            access_token_expires_at: None,
             tools: HashMap::new(),
             fetched_at: None,
         }));
@@ -194,6 +237,9 @@ impl RemoteMcpManager {
             guard.endpoint_url = server.endpoint_url.clone();
             guard.tools.clear();
             guard.fetched_at = None;
+            guard.oauth_token_endpoint = None;
+            guard.access_token = None;
+            guard.access_token_expires_at = None;
         }
 
         if guard
@@ -211,9 +257,11 @@ impl RemoteMcpManager {
     async fn refresh_locked(
         &self,
         server_id: &str,
-        _server: &RemoteMcpServerRecord,
+        server: &RemoteMcpServerRecord,
         session: &mut RemoteSession,
     ) -> anyhow::Result<()> {
+        self.ensure_bearer_token(server_id, server, session).await?;
+
         if !session.client.is_ready() {
             info!(server_id, "initializing remote mcp session");
             let _ = session
@@ -243,6 +291,104 @@ impl RemoteMcpManager {
 
         session.tools = tools;
         session.fetched_at = Some(Instant::now());
+        Ok(())
+    }
+
+    async fn ensure_bearer_token(
+        &self,
+        server_id: &str,
+        server: &RemoteMcpServerRecord,
+        session: &mut RemoteSession,
+    ) -> anyhow::Result<()> {
+        let key = format!("oauth.mcp.{server_id}.refresh_token");
+        let Some(raw) = self.secrets.get(&key).await? else {
+            session.client.set_bearer_token(None);
+            session.access_token = None;
+            session.access_token_expires_at = None;
+            return Ok(());
+        };
+        let refresh_token =
+            String::from_utf8(raw.into_inner()).context("refresh token is not utf-8")?;
+
+        let client_id = self
+            .db
+            .get_remote_mcp_oauth_client(server_id)
+            .await?
+            .map(|r| r.client_id)
+            .unwrap_or_else(|| "briefcase-cli".to_string());
+
+        let token_endpoint = match session.oauth_token_endpoint.clone() {
+            Some(v) => v,
+            None => {
+                if let Some(meta) = self.db.get_remote_mcp_oauth(server_id).await? {
+                    session.oauth_token_endpoint = Some(meta.token_endpoint.clone());
+                    meta.token_endpoint
+                } else {
+                    let endpoint = Url::parse(&server.endpoint_url)
+                        .context("parse remote mcp endpoint_url")?;
+                    let d = self.oauth.discover(&endpoint).await?;
+                    self.db
+                        .upsert_remote_mcp_oauth(
+                            server_id,
+                            d.issuer.as_str(),
+                            d.authorization_endpoint.as_str(),
+                            d.token_endpoint.as_str(),
+                            d.resource.as_str(),
+                        )
+                        .await?;
+                    session.oauth_token_endpoint = Some(d.token_endpoint.as_str().to_string());
+                    d.token_endpoint.as_str().to_string()
+                }
+            }
+        };
+
+        let now = Utc::now();
+        if let Some(tok) = &session.access_token
+            && let Some(exp) = session.access_token_expires_at
+            && now + chrono::Duration::seconds(30) < exp
+        {
+            session.client.set_bearer_token(Some(tok.clone()));
+            return Ok(());
+        }
+
+        #[derive(Debug, Deserialize)]
+        struct OAuthTokenResponse {
+            access_token: String,
+            refresh_token: Option<String>,
+            token_type: String,
+            expires_in: Option<i64>,
+        }
+
+        let resp = self
+            .http
+            .post(token_endpoint)
+            .form(&[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", refresh_token.as_str()),
+                ("client_id", client_id.as_str()),
+            ])
+            .send()
+            .await
+            .context("oauth refresh request")?;
+        if !resp.status().is_success() {
+            anyhow::bail!("oauth refresh failed: {}", resp.status());
+        }
+        let tr = resp
+            .json::<OAuthTokenResponse>()
+            .await
+            .context("decode oauth token response")?;
+        let _token_type = tr.token_type;
+
+        if let Some(new_rt) = tr.refresh_token {
+            self.secrets
+                .put(&key, briefcase_core::Sensitive(new_rt.into_bytes()))
+                .await?;
+        }
+
+        let expires_at = now + chrono::Duration::seconds(tr.expires_in.unwrap_or(600));
+        session.access_token = Some(tr.access_token.clone());
+        session.access_token_expires_at = Some(expires_at);
+        session.client.set_bearer_token(Some(tr.access_token));
         Ok(())
     }
 }

@@ -53,6 +53,32 @@ pub struct DeleteMcpServerResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpOAuthStartRequest {
+    pub client_id: String,
+    pub redirect_uri: String,
+    /// OAuth scope string (space-separated). Optional; provider defaults may apply.
+    pub scope: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpOAuthStartResponse {
+    pub server_id: String,
+    pub authorization_url: String,
+    pub state: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpOAuthExchangeRequest {
+    pub code: String,
+    pub state: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpOAuthExchangeResponse {
+    pub server_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OAuthExchangeRequest {
     pub code: String,
     pub redirect_uri: String,

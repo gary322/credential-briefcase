@@ -77,9 +77,9 @@ For each task, include:
 
 ## Phase 2: OAuth PRM Discovery + Full MCP Auth Integration
 
-- [ ] 2.1 Implement OAuth discovery per RFC 9728 and MCP authorization guidance
+- [x] 2.1 Implement OAuth discovery per RFC 9728 and MCP authorization guidance
   - **Do**: add `crates/briefcase-oauth-discovery` that fetches Protected Resource Metadata and resolves authorization server metadata; cache with TTL; validate HTTPS and issuer rules.
-  - **Files**: `crates/briefcase-oauth-discovery/*`, `apps/briefcased/src/oauth.rs` (new)
+  - **Files**: `crates/briefcase-oauth-discovery/*`, `apps/briefcased/src/app.rs`, `apps/briefcased/src/remote_mcp.rs`, `apps/briefcased/src/db.rs`, `openapi/briefcased.yaml`
   - **Done when**: given a remote MCP URL, briefcased can determine auth endpoints/scopes and produce an authorization URL.
   - **Verify**: `cargo test -p briefcase-oauth-discovery`
   - _Reqs: FR-3, AC-4.2_

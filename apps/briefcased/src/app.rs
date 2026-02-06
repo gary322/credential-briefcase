@@ -8,17 +8,21 @@ use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use base64::Engine as _;
 use briefcase_api::types::{
     ApproveResponse, BudgetRecord, CallToolRequest, CallToolResponse, DeleteMcpServerResponse,
     DeleteProviderResponse, ErrorResponse, FetchVcResponse, IdentityResponse,
     ListApprovalsResponse, ListBudgetsResponse, ListMcpServersResponse, ListProvidersResponse,
-    ListReceiptsResponse, ListToolsResponse, OAuthExchangeRequest, OAuthExchangeResponse,
+    ListReceiptsResponse, ListToolsResponse, McpOAuthExchangeRequest, McpOAuthExchangeResponse,
+    McpOAuthStartRequest, McpOAuthStartResponse, OAuthExchangeRequest, OAuthExchangeResponse,
     ProviderSummary, SetBudgetRequest, UpsertMcpServerRequest, UpsertProviderRequest,
     VerifyReceiptsResponse,
 };
 use briefcase_core::{PolicyDecision, ToolCall, ToolResult};
 use chrono::Utc;
+use rand::RngCore as _;
 use serde::Deserialize;
+use sha2::Digest as _;
 use tracing::{error, info};
 use uuid::Uuid;
 
@@ -40,6 +44,7 @@ pub struct AppState {
     pub policy: Arc<CedarPolicyEngine>,
     pub risk: Arc<briefcase_risk::RiskEngine>,
     pub tools: ToolRegistry,
+    pub oauth_discovery: Arc<briefcase_oauth_discovery::OAuthDiscoveryClient>,
     pub remote_mcp: Arc<RemoteMcpManager>,
     pub secrets: Arc<dyn SecretStore>,
     pub identity_did: String,
@@ -93,7 +98,15 @@ impl AppState {
         }
         let risk = Arc::new(briefcase_risk::RiskEngine::new(classifier_url)?);
 
-        let remote_mcp = Arc::new(RemoteMcpManager::new(db.clone()));
+        let oauth_discovery = Arc::new(briefcase_oauth_discovery::OAuthDiscoveryClient::new(
+            std::time::Duration::from_secs(300),
+        )?);
+
+        let remote_mcp = Arc::new(RemoteMcpManager::new(
+            db.clone(),
+            secrets.clone(),
+            oauth_discovery.clone(),
+        )?);
 
         // Identity key seed lives in the secret store; DID lives in the DB for easy display.
         // If both exist, ensure they match to avoid signing with the wrong key.
@@ -161,6 +174,7 @@ impl AppState {
             policy,
             risk,
             tools,
+            oauth_discovery,
             remote_mcp,
             secrets,
             identity_did,
@@ -208,6 +222,11 @@ fn router(state: AppState) -> Router {
         .route("/v1/mcp/servers", get(list_mcp_servers))
         .route("/v1/mcp/servers/{id}", post(upsert_mcp_server))
         .route("/v1/mcp/servers/{id}/delete", post(delete_mcp_server))
+        .route("/v1/mcp/servers/{id}/oauth/start", post(start_mcp_oauth))
+        .route(
+            "/v1/mcp/servers/{id}/oauth/exchange",
+            post(exchange_mcp_oauth),
+        )
         .route("/v1/budgets", get(list_budgets))
         .route("/v1/budgets/{category}", post(set_budget))
         .route("/v1/providers/{id}/oauth/exchange", post(oauth_exchange))
@@ -382,6 +401,199 @@ async fn delete_mcp_server(
         .await
         .map_err(internal_error)?;
     Ok(Json(DeleteMcpServerResponse { server_id: id }))
+}
+
+async fn start_mcp_oauth(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Json(req): Json<McpOAuthStartRequest>,
+) -> Result<Json<McpOAuthStartResponse>, (StatusCode, Json<ErrorResponse>)> {
+    if !is_valid_provider_id(&id) {
+        return Err(bad_request("invalid_mcp_server_id"));
+    }
+
+    let redirect_uri = validate_oauth_redirect_uri(&req.redirect_uri)
+        .map_err(|_| bad_request("invalid_redirect_uri"))?;
+
+    let endpoint_url = state
+        .db
+        .list_remote_mcp_servers()
+        .await
+        .map_err(internal_error)?
+        .into_iter()
+        .find(|s| s.id == id)
+        .map(|s| s.endpoint_url)
+        .ok_or_else(|| not_found("unknown_mcp_server"))?;
+
+    let endpoint = url::Url::parse(&endpoint_url).map_err(internal_error)?;
+    let d = state
+        .oauth_discovery
+        .discover(&endpoint)
+        .await
+        .map_err(internal_error)?;
+
+    // Persist discovery results for refresh usage.
+    state
+        .db
+        .upsert_remote_mcp_oauth(
+            &id,
+            d.issuer.as_str(),
+            d.authorization_endpoint.as_str(),
+            d.token_endpoint.as_str(),
+            d.resource.as_str(),
+        )
+        .await
+        .map_err(internal_error)?;
+
+    // PKCE + state.
+    let state_id = Uuid::new_v4().to_string();
+    let code_verifier = {
+        let mut verifier_bytes = [0u8; 32];
+        rand::rng().fill_bytes(&mut verifier_bytes);
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(verifier_bytes)
+    };
+    let code_challenge = {
+        let digest = sha2::Sha256::digest(code_verifier.as_bytes());
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest)
+    };
+
+    let scope = req.scope.unwrap_or_default();
+
+    let mut auth_url = d.authorization_endpoint.clone();
+    auth_url
+        .query_pairs_mut()
+        .append_pair("response_type", "code")
+        .append_pair("client_id", &req.client_id)
+        .append_pair("redirect_uri", &redirect_uri)
+        .append_pair("state", &state_id)
+        .append_pair("code_challenge", &code_challenge)
+        .append_pair("code_challenge_method", "S256")
+        // Resource indicator (RFC 8707) is commonly used alongside PRM discovery.
+        .append_pair("resource", d.resource.as_str());
+    if !scope.trim().is_empty() {
+        auth_url.query_pairs_mut().append_pair("scope", &scope);
+    }
+
+    // Store session so the code_verifier never leaves the daemon.
+    state
+        .db
+        .create_oauth_session(crate::db::OAuthSessionRecord {
+            state: state_id.clone(),
+            kind: "mcp".to_string(),
+            server_id: id.clone(),
+            created_at: Utc::now(),
+            expires_at: Utc::now() + chrono::Duration::minutes(10),
+            code_verifier,
+            redirect_uri,
+            client_id: req.client_id.clone(),
+            scope: scope.clone(),
+            token_endpoint: d.token_endpoint.to_string(),
+        })
+        .await
+        .map_err(internal_error)?;
+
+    Ok(Json(McpOAuthStartResponse {
+        server_id: id,
+        authorization_url: auth_url.to_string(),
+        state: state_id,
+    }))
+}
+
+async fn exchange_mcp_oauth(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Json(req): Json<McpOAuthExchangeRequest>,
+) -> Result<Json<McpOAuthExchangeResponse>, (StatusCode, Json<ErrorResponse>)> {
+    if !is_valid_provider_id(&id) {
+        return Err(bad_request("invalid_mcp_server_id"));
+    }
+
+    let Some(sess) = state
+        .db
+        .get_oauth_session(&req.state)
+        .await
+        .map_err(internal_error)?
+    else {
+        return Err(bad_request("unknown_oauth_state"));
+    };
+
+    if sess.kind != "mcp" || sess.server_id != id {
+        return Err(bad_request("oauth_state_mismatch"));
+    }
+    if Utc::now() > sess.expires_at {
+        state
+            .db
+            .delete_oauth_session(&req.state)
+            .await
+            .map_err(internal_error)?;
+        return Err(bad_request("oauth_state_expired"));
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct OAuthTokenResponse {
+        access_token: String,
+        refresh_token: Option<String>,
+        token_type: String,
+        expires_in: Option<i64>,
+    }
+
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(internal_error)?;
+
+    let resp = http
+        .post(sess.token_endpoint.as_str())
+        .form(&[
+            ("grant_type", "authorization_code"),
+            ("code", req.code.as_str()),
+            ("redirect_uri", sess.redirect_uri.as_str()),
+            ("client_id", sess.client_id.as_str()),
+            ("code_verifier", sess.code_verifier.as_str()),
+        ])
+        .send()
+        .await
+        .map_err(internal_error)?;
+
+    if !resp.status().is_success() {
+        return Err(bad_request("oauth_exchange_failed"));
+    }
+
+    let tr = resp
+        .json::<OAuthTokenResponse>()
+        .await
+        .map_err(internal_error)?;
+    let _access_token = tr.access_token;
+    let _token_type = tr.token_type;
+    let _expires_in = tr.expires_in;
+
+    let Some(refresh_token) = tr.refresh_token else {
+        return Err(bad_request("missing_refresh_token"));
+    };
+
+    state
+        .secrets
+        .put(
+            &format!("oauth.mcp.{id}.refresh_token"),
+            briefcase_core::Sensitive(refresh_token.into_bytes()),
+        )
+        .await
+        .map_err(internal_error)?;
+
+    state
+        .db
+        .upsert_remote_mcp_oauth_client(&id, &sess.client_id, &sess.scope)
+        .await
+        .map_err(internal_error)?;
+
+    state
+        .db
+        .delete_oauth_session(&sess.state)
+        .await
+        .map_err(internal_error)?;
+
+    Ok(Json(McpOAuthExchangeResponse { server_id: id }))
 }
 
 async fn list_budgets(State(state): State<AppState>) -> Json<ListBudgetsResponse> {
@@ -1021,6 +1233,40 @@ fn normalize_mcp_endpoint_url(raw: &str) -> anyhow::Result<String> {
     Ok(s)
 }
 
+fn validate_oauth_redirect_uri(raw: &str) -> anyhow::Result<String> {
+    let u = url::Url::parse(raw).context("parse redirect_uri")?;
+
+    match u.scheme() {
+        "http" | "https" => {}
+        _ => anyhow::bail!("unsupported scheme"),
+    }
+
+    if u.host_str().is_none() {
+        anyhow::bail!("missing host");
+    }
+    if !u.username().is_empty() || u.password().is_some() {
+        anyhow::bail!("userinfo not allowed");
+    }
+    if u.fragment().is_some() {
+        anyhow::bail!("fragment not allowed");
+    }
+
+    // Insecure HTTP is only allowed for local redirect handlers.
+    if u.scheme() == "http" {
+        let host = u.host().context("missing host")?;
+        let is_loopback = match host {
+            url::Host::Domain(d) => d.eq_ignore_ascii_case("localhost"),
+            url::Host::Ipv4(ip) => ip.is_loopback(),
+            url::Host::Ipv6(ip) => ip.is_loopback(),
+        };
+        if !is_loopback {
+            anyhow::bail!("http redirect_uri is only allowed for localhost");
+        }
+    }
+
+    Ok(u.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1144,6 +1390,211 @@ mod tests {
             let _ = axum::serve(listener, app).await;
         });
         Ok((addr, st, handle))
+    }
+
+    #[derive(Clone)]
+    struct MockOAuthMcpState {
+        token_calls: Arc<tokio::sync::Mutex<u64>>,
+    }
+
+    async fn start_mock_oauth_protected_mcp()
+    -> anyhow::Result<(SocketAddr, MockOAuthMcpState, tokio::task::JoinHandle<()>)> {
+        use axum::body::Bytes;
+        use axum::extract::{Form, State as AxumState};
+        use axum::http::{HeaderMap, StatusCode};
+        use axum::response::IntoResponse;
+        use axum::routing::{get, post};
+        use axum::{Json, Router};
+        use briefcase_mcp::{
+            CallToolParams, CallToolResult, ContentBlock, JsonRpcMessage, ListToolsParams,
+            ListToolsResult, McpConnection, McpHandler, McpServerConfig, Tool,
+        };
+        use std::sync::Arc;
+
+        #[derive(Clone)]
+        struct MockServer {
+            addr: SocketAddr,
+            token_calls: Arc<tokio::sync::Mutex<u64>>,
+            conn: Arc<tokio::sync::Mutex<McpConnection>>,
+        }
+
+        #[derive(Clone)]
+        struct Handler;
+
+        #[async_trait::async_trait]
+        impl McpHandler for Handler {
+            async fn list_tools(
+                &self,
+                _params: ListToolsParams,
+            ) -> anyhow::Result<ListToolsResult> {
+                Ok(ListToolsResult {
+                    tools: vec![Tool {
+                        name: "hello".to_string(),
+                        title: Some("Remote Hello".to_string()),
+                        description: Some(
+                            "Returns the provided text (oauth protected).".to_string(),
+                        ),
+                        input_schema: serde_json::json!({
+                            "type": "object",
+                            "properties": {
+                                "text": { "type": "string", "maxLength": 128 }
+                            },
+                            "required": ["text"],
+                            "additionalProperties": false
+                        }),
+                    }],
+                    next_cursor: None,
+                })
+            }
+
+            async fn call_tool(&self, params: CallToolParams) -> anyhow::Result<CallToolResult> {
+                if params.name != "hello" {
+                    anyhow::bail!("unknown tool");
+                }
+                let text = params
+                    .arguments
+                    .as_ref()
+                    .and_then(|v| v.get("text"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                Ok(CallToolResult {
+                    content: vec![ContentBlock::Text {
+                        text: format!("remote:{text}"),
+                    }],
+                    structured_content: None,
+                    is_error: None,
+                    meta: None,
+                })
+            }
+        }
+
+        async fn prm(AxumState(st): AxumState<MockServer>) -> Json<serde_json::Value> {
+            Json(serde_json::json!({
+                "authorization_servers": [format!("http://{}/as", st.addr)],
+                "resource": format!("http://{}/mcp", st.addr),
+                "scopes_supported": ["mcp.read"]
+            }))
+        }
+
+        async fn as_meta(AxumState(st): AxumState<MockServer>) -> Json<serde_json::Value> {
+            Json(serde_json::json!({
+                "issuer": format!("http://{}/as", st.addr),
+                "authorization_endpoint": format!("http://{}/as/authorize", st.addr),
+                "token_endpoint": format!("http://{}/as/token", st.addr),
+                "scopes_supported": ["mcp.read"]
+            }))
+        }
+
+        #[derive(Debug, serde::Deserialize)]
+        struct TokenForm {
+            grant_type: String,
+            refresh_token: Option<String>,
+            code: Option<String>,
+            redirect_uri: Option<String>,
+            client_id: Option<String>,
+            code_verifier: Option<String>,
+        }
+
+        async fn token(
+            AxumState(st): AxumState<MockServer>,
+            Form(body): Form<TokenForm>,
+        ) -> (StatusCode, Json<serde_json::Value>) {
+            *st.token_calls.lock().await += 1;
+
+            match body.grant_type.as_str() {
+                "authorization_code" => {
+                    if body.code.is_none()
+                        || body.redirect_uri.is_none()
+                        || body.client_id.is_none()
+                        || body.code_verifier.is_none()
+                    {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(serde_json::json!({"error":"invalid_request"})),
+                        );
+                    }
+                    (
+                        StatusCode::OK,
+                        Json(serde_json::json!({
+                            "access_token": "at_code",
+                            "refresh_token": "rt_mcp",
+                            "token_type": "Bearer",
+                            "expires_in": 600
+                        })),
+                    )
+                }
+                "refresh_token" => {
+                    if body.refresh_token.as_deref() != Some("rt_mcp") {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(serde_json::json!({"error":"invalid_grant"})),
+                        );
+                    }
+                    (
+                        StatusCode::OK,
+                        Json(serde_json::json!({
+                            "access_token": "at_mcp",
+                            "token_type": "Bearer",
+                            "expires_in": 600
+                        })),
+                    )
+                }
+                _ => (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error":"unsupported_grant"})),
+                ),
+            }
+        }
+
+        async fn mcp(
+            AxumState(st): AxumState<MockServer>,
+            headers: HeaderMap,
+            body: Bytes,
+        ) -> impl IntoResponse {
+            let ok = headers
+                .get("authorization")
+                .and_then(|h| h.to_str().ok())
+                .map(|v| v == "Bearer at_mcp")
+                .unwrap_or(false);
+            if !ok {
+                return StatusCode::UNAUTHORIZED.into_response();
+            }
+
+            let msg: JsonRpcMessage = match serde_json::from_slice(&body) {
+                Ok(m) => m,
+                Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+            };
+
+            let mut conn = st.conn.lock().await;
+            match conn.handle_message(msg).await {
+                Some(resp) => (StatusCode::OK, axum::Json(resp)).into_response(),
+                None => StatusCode::ACCEPTED.into_response(),
+            }
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+
+        let token_calls = Arc::new(tokio::sync::Mutex::new(0));
+        let handler = Arc::new(Handler);
+        let cfg = McpServerConfig::default_for_binary("mock-oauth-mcp", "0.0.0");
+        let conn = Arc::new(tokio::sync::Mutex::new(McpConnection::new(cfg, handler)));
+        let app = Router::new()
+            .route("/.well-known/oauth-protected-resource", get(prm))
+            .route("/as/.well-known/oauth-authorization-server", get(as_meta))
+            .route("/as/token", post(token))
+            .route("/mcp", post(mcp))
+            .with_state(MockServer {
+                addr,
+                token_calls: token_calls.clone(),
+                conn,
+            });
+
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        Ok((addr, MockOAuthMcpState { token_calls }, handle))
     }
 
     async fn start_mock_provider()
@@ -1664,6 +2115,88 @@ mod tests {
 
         daemon_task.abort();
         remote_task.abort();
+        provider_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn remote_mcp_oauth_discovery_and_refresh_enables_calls() -> anyhow::Result<()> {
+        let (provider_addr, _provider_state, provider_task) = start_mock_provider().await?;
+        let provider_base_url = format!("http://{provider_addr}");
+
+        let (secure_addr, oauth_state, secure_task) = start_mock_oauth_protected_mcp().await?;
+        let secure_endpoint = format!("http://{secure_addr}/mcp");
+
+        let (_daemon_base, client, daemon_task) = start_daemon(provider_base_url).await?;
+
+        client
+            .upsert_mcp_server("secure1", secure_endpoint.clone())
+            .await?;
+
+        let started = client
+            .mcp_oauth_start(
+                "secure1",
+                McpOAuthStartRequest {
+                    client_id: "briefcase-cli".to_string(),
+                    redirect_uri: "http://127.0.0.1/callback".to_string(),
+                    scope: Some("mcp.read".to_string()),
+                },
+            )
+            .await?;
+        assert!(started.authorization_url.contains("/as/authorize"));
+        assert!(!started.state.is_empty());
+
+        client
+            .mcp_oauth_exchange(
+                "secure1",
+                McpOAuthExchangeRequest {
+                    code: "code_mock".to_string(),
+                    state: started.state,
+                },
+            )
+            .await?;
+
+        // List tools should now succeed (daemon refreshes using stored refresh token).
+        let tools = client.list_tools().await?.tools;
+        assert!(tools.iter().any(|t| t.id == "mcp_secure1__hello"));
+
+        // Call requires approval due to category=remote.
+        let resp = client
+            .call_tool(CallToolRequest {
+                call: ToolCall {
+                    tool_id: "mcp_secure1__hello".to_string(),
+                    args: serde_json::json!({ "text": "hi" }),
+                    context: ToolCallContext::new(),
+                    approval_token: None,
+                },
+            })
+            .await?;
+        let approval_id = match resp {
+            CallToolResponse::ApprovalRequired { approval } => approval.id,
+            _ => anyhow::bail!("expected approval_required"),
+        };
+        let approved = client.approve(&approval_id).await?;
+
+        let resp = client
+            .call_tool(CallToolRequest {
+                call: ToolCall {
+                    tool_id: "mcp_secure1__hello".to_string(),
+                    args: serde_json::json!({ "text": "hi" }),
+                    context: ToolCallContext::new(),
+                    approval_token: Some(approved.approval_token),
+                },
+            })
+            .await?;
+        assert!(matches!(resp, CallToolResponse::Ok { .. }));
+
+        let token_calls = *oauth_state.token_calls.lock().await;
+        assert_eq!(
+            token_calls, 2,
+            "expected code exchange + refresh token grant"
+        );
+
+        daemon_task.abort();
+        secure_task.abort();
         provider_task.abort();
         Ok(())
     }

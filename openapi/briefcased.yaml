@@ -115,6 +115,44 @@ components:
         server_id:
           type: string
 
+    McpOAuthStartRequest:
+      type: object
+      required: [client_id, redirect_uri, scope]
+      properties:
+        client_id:
+          type: string
+        redirect_uri:
+          type: string
+        scope:
+          type: ["string", "null"]
+
+    McpOAuthStartResponse:
+      type: object
+      required: [server_id, authorization_url, state]
+      properties:
+        server_id:
+          type: string
+        authorization_url:
+          type: string
+        state:
+          type: string
+
+    McpOAuthExchangeRequest:
+      type: object
+      required: [code, state]
+      properties:
+        code:
+          type: string
+        state:
+          type: string
+
+    McpOAuthExchangeResponse:
+      type: object
+      required: [server_id]
+      properties:
+        server_id:
+          type: string
+
     OAuthExchangeRequest:
       type: object
       required: [code, redirect_uri, client_id, code_verifier]
@@ -597,6 +635,82 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/DeleteMcpServerResponse"
+        "401":
+          description: unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /v1/mcp/servers/{id}/oauth/start:
+    post:
+      summary: Start OAuth authorization for a remote MCP server (daemon-managed PKCE + state)
+      operationId: mcpOauthStart
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/McpOAuthStartRequest"
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/McpOAuthStartResponse"
+        "400":
+          description: bad request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "401":
+          description: unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /v1/mcp/servers/{id}/oauth/exchange:
+    post:
+      summary: Exchange OAuth authorization code for a refresh token (stored in daemon)
+      operationId: mcpOauthExchange
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/McpOAuthExchangeRequest"
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/McpOAuthExchangeResponse"
+        "400":
+          description: bad request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
         "401":
           description: unauthorized
           content:

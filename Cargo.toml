@@ -10,6 +10,7 @@ members = [
   "crates/briefcase-core",
   "crates/briefcase-identity",
   "crates/briefcase-mcp",
+  "crates/briefcase-oauth-discovery",
   "crates/briefcase-payments",
   "crates/briefcase-risk",
   "crates/briefcase-policy",

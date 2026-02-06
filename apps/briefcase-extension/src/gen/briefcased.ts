@@ -42,6 +42,14 @@ export interface paths {
     /** Delete a remote MCP server */
     post: operations["deleteMcpServer"];
   };
+  "/v1/mcp/servers/{id}/oauth/start": {
+    /** Start OAuth authorization for a remote MCP server (daemon-managed PKCE + state) */
+    post: operations["mcpOauthStart"];
+  };
+  "/v1/mcp/servers/{id}/oauth/exchange": {
+    /** Exchange OAuth authorization code for a refresh token (stored in daemon) */
+    post: operations["mcpOauthExchange"];
+  };
   "/v1/providers/{id}/oauth/exchange": {
     /** Exchange OAuth authorization code for refresh token (stored in daemon) */
     post: operations["oauthExchange"];
@@ -127,6 +135,23 @@ export interface components {
       endpoint_url: string;
     };
     DeleteMcpServerResponse: {
+      server_id: string;
+    };
+    McpOAuthStartRequest: {
+      client_id: string;
+      redirect_uri: string;
+      scope: string | null;
+    };
+    McpOAuthStartResponse: {
+      server_id: string;
+      authorization_url: string;
+      state: string;
+    };
+    McpOAuthExchangeRequest: {
+      code: string;
+      state: string;
+    };
+    McpOAuthExchangeResponse: {
       server_id: string;
     };
     OAuthExchangeRequest: {
@@ -439,6 +464,72 @@ export interface operations {
       200: {
         content: {
           "application/json": components["schemas"]["DeleteMcpServerResponse"];
+        };
+      };
+      /** @description unauthorized */
+      401: {
+        content: {
+          "application/json": components["schemas"]["ErrorResponse"];
+        };
+      };
+    };
+  };
+  /** Start OAuth authorization for a remote MCP server (daemon-managed PKCE + state) */
+  mcpOauthStart: {
+    parameters: {
+      path: {
+        id: string;
+      };
+    };
+    requestBody: {
+      content: {
+        "application/json": components["schemas"]["McpOAuthStartRequest"];
+      };
+    };
+    responses: {
+      /** @description ok */
+      200: {
+        content: {
+          "application/json": components["schemas"]["McpOAuthStartResponse"];
+        };
+      };
+      /** @description bad request */
+      400: {
+        content: {
+          "application/json": components["schemas"]["ErrorResponse"];
+        };
+      };
+      /** @description unauthorized */
+      401: {
+        content: {
+          "application/json": components["schemas"]["ErrorResponse"];
+        };
+      };
+    };
+  };
+  /** Exchange OAuth authorization code for a refresh token (stored in daemon) */
+  mcpOauthExchange: {
+    parameters: {
+      path: {
+        id: string;
+      };
+    };
+    requestBody: {
+      content: {
+        "application/json": components["schemas"]["McpOAuthExchangeRequest"];
+      };
+    };
+    responses: {
+      /** @description ok */
+      200: {
+        content: {
+          "application/json": components["schemas"]["McpOAuthExchangeResponse"];
+        };
+      };
+      /** @description bad request */
+      400: {
+        content: {
+          "application/json": components["schemas"]["ErrorResponse"];
         };
       };
       /** @description unauthorized */

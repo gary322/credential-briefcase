@@ -616,6 +616,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "briefcase-oauth-discovery"
+version = "0.1.4"
+dependencies = [
+ "anyhow",
+ "axum",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "url",
+]
+
+[[package]]
 name = "briefcase-payments"
 version = "0.1.4"
 dependencies = [
@@ -724,6 +739,7 @@ dependencies = [
  "briefcase-core",
  "briefcase-identity",
  "briefcase-mcp",
+ "briefcase-oauth-discovery",
  "briefcase-payments",
  "briefcase-policy",
  "briefcase-receipts",
