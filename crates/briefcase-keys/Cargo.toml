@@ -8,6 +8,7 @@ repository.workspace = true
 [features]
 default = []
 pkcs11 = ["dep:cryptoki", "dep:tokio"]
+tpm2 = ["dep:tempfile", "dep:tokio"]
 
 [dependencies]
 anyhow.workspace = true
@@ -15,11 +16,13 @@ async-trait.workspace = true
 base64.workspace = true
 cryptoki = { workspace = true, optional = true }
 ed25519-dalek.workspace = true
+hex.workspace = true
 p256.workspace = true
 rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+tempfile = { workspace = true, optional = true }
 thiserror.workspace = true
 tokio = { workspace = true, optional = true }
 uuid.workspace = true

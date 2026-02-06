@@ -42,3 +42,8 @@ gen:
 test-pkcs11:
   docker build -f docker/softhsm/Dockerfile -t credential-briefcase-softhsm .
   docker run --rm -v {{invocation_directory()}}:/workspace -w /workspace credential-briefcase-softhsm bash docker/softhsm/run-tests.sh
+
+# TPM2 / swtpm integration tests (Linux container).
+test-tpm2:
+  docker build -f docker/swtpm/Dockerfile -t credential-briefcase-swtpm .
+  docker run --rm -v {{invocation_directory()}}:/workspace -w /workspace credential-briefcase-swtpm bash docker/swtpm/run-tests.sh

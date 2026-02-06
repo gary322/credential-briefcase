@@ -8,6 +8,9 @@
 #[cfg(feature = "pkcs11")]
 pub mod pkcs11;
 
+#[cfg(feature = "tpm2")]
+pub mod tpm2;
+
 use std::sync::Arc;
 
 use anyhow::Context as _;

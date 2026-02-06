@@ -68,3 +68,15 @@ jobs:
 
       - name: Run PKCS#11 tests (SoftHSM)
         run: docker run --rm -v ${{ github.workspace }}:/workspace -w /workspace credential-briefcase-softhsm bash docker/softhsm/run-tests.sh
+
+  tpm2:
+    name: tpm2 (swtpm)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build swtpm test image
+        run: docker build -f docker/swtpm/Dockerfile -t credential-briefcase-swtpm .
+
+      - name: Run TPM2 tests (swtpm)
+        run: docker run --rm -v ${{ github.workspace }}:/workspace -w /workspace credential-briefcase-swtpm bash docker/swtpm/run-tests.sh

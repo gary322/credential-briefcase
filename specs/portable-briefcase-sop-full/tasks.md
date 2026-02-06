@@ -137,7 +137,7 @@ For each task, include:
   - **Done when**: CI can run sign/verify with SoftHSM.
   - **Verify**: `just test-pkcs11`
 
-- [ ] 4.3 Implement TPM backend (+ swtpm CI)
+- [x] 4.3 Implement TPM backend (+ swtpm CI)
   - **Do**: add TPM2 signer; run swtpm in CI to validate key creation/signing.
   - **Files**: `crates/briefcase-keys/src/tpm2.rs`, `docker/swtpm/*`
   - **Done when**: CI can run sign/verify via swtpm.
