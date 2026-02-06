@@ -34,6 +34,7 @@ use crate::middleware::require_auth;
 use crate::provider::ProviderClient;
 use crate::remote_mcp::RemoteMcpManager;
 use crate::tools::ToolRegistry;
+use briefcase_keys::{KeyAlgorithm, KeyHandle, SoftwareKeyManager};
 use briefcase_policy::{CedarPolicyEngine, CedarPolicyEngineOptions};
 use briefcase_receipts::{ReceiptStore, ReceiptStoreOptions};
 use briefcase_secrets::SecretStore;
@@ -112,50 +113,76 @@ impl AppState {
             oauth_discovery.clone(),
         )?);
 
-        // Identity key seed lives in the secret store; DID lives in the DB for easy display.
-        // If both exist, ensure they match to avoid signing with the wrong key.
-        let (identity_did, pop_seed) = match (
-            secrets.get("identity.ed25519_sk").await?,
-            db.identity_did().await?,
+        // Identity key is stored as an opaque handle; private bytes remain inside `SecretStore`.
+        // The DID lives in the DB for easy display. If both exist, ensure they match to avoid
+        // signing with the wrong key.
+        let keys = SoftwareKeyManager::new(secrets.clone());
+
+        let identity_handle: KeyHandle = match (
+            secrets.get("identity.key_handle").await?,
+            secrets.get("identity.ed25519_sk").await?, // legacy
         ) {
-            (Some(seed), Some(db_did)) => {
+            (Some(h), _) => {
+                KeyHandle::from_json(&h.into_inner()).context("decode identity.key_handle")?
+            }
+            (None, Some(seed)) => {
+                // Migrate legacy seed into the keys abstraction.
                 let bytes = seed.into_inner();
                 if bytes.len() != 32 {
                     anyhow::bail!("identity.ed25519_sk has wrong length");
                 }
                 let mut arr = [0u8; 32];
                 arr.copy_from_slice(&bytes);
-                let derived = briefcase_identity::DidKeyEd25519::from_secret_key_seed(arr)?;
-                if derived.did != db_did {
-                    anyhow::bail!("identity key mismatch: db DID does not match secret key");
-                }
-                (db_did, Some(arr))
-            }
-            (Some(seed), None) => {
-                let bytes = seed.into_inner();
-                if bytes.len() != 32 {
-                    anyhow::bail!("identity.ed25519_sk has wrong length");
-                }
-                let mut arr = [0u8; 32];
-                arr.copy_from_slice(&bytes);
-                let derived = briefcase_identity::DidKeyEd25519::from_secret_key_seed(arr)?;
-                db.set_identity_did(&derived.did).await?;
-                (derived.did, Some(arr))
-            }
-            (None, Some(_db_did)) => {
-                anyhow::bail!("identity secret key missing (identity.ed25519_sk)")
-            }
-            (None, None) => {
-                let id = briefcase_identity::DidKeyEd25519::generate();
-                let seed = *id.secret_key_seed;
+                let h = keys.import_ed25519_seed(arr).await?;
                 secrets
                     .put(
-                        "identity.ed25519_sk",
-                        briefcase_core::Sensitive(seed.to_vec()),
+                        "identity.key_handle",
+                        briefcase_core::Sensitive(h.to_json()?),
                     )
                     .await?;
-                db.set_identity_did(&id.did).await?;
-                (id.did, Some(seed))
+                h
+            }
+            (None, None) => {
+                let h = keys.generate(KeyAlgorithm::Ed25519).await?;
+                secrets
+                    .put(
+                        "identity.key_handle",
+                        briefcase_core::Sensitive(h.to_json()?),
+                    )
+                    .await?;
+                h
+            }
+        };
+
+        if identity_handle.algorithm != KeyAlgorithm::Ed25519 {
+            anyhow::bail!("identity key must be ed25519 for did:key v1");
+        }
+
+        let identity_signer = keys.signer(identity_handle.clone());
+        let pop_signer = Some(identity_signer.clone());
+
+        let identity_did = {
+            let pk = identity_signer.public_key_bytes().await?;
+            if pk.len() != 32 {
+                anyhow::bail!("ed25519 public key wrong length");
+            }
+            let mut pk_arr = [0u8; 32];
+            pk_arr.copy_from_slice(&pk);
+            let vk =
+                ed25519_dalek::VerifyingKey::from_bytes(&pk_arr).context("decode ed25519 pk")?;
+            let did = briefcase_identity::did_key_for_ed25519(&vk);
+
+            match db.identity_did().await? {
+                Some(db_did) => {
+                    if db_did != did {
+                        anyhow::bail!("identity key mismatch: db DID does not match signer key");
+                    }
+                    db_did
+                }
+                None => {
+                    db.set_identity_did(&did).await?;
+                    did
+                }
             }
         };
 
@@ -168,7 +195,7 @@ impl AppState {
                 None => Arc::new(briefcase_payments::HttpDemoPaymentBackend::new()?),
             };
 
-        let provider = ProviderClient::new(secrets.clone(), db.clone(), pop_seed, payments);
+        let provider = ProviderClient::new(secrets.clone(), db.clone(), pop_signer, payments);
         let tools = ToolRegistry::new(provider, db.clone());
 
         Ok(Self {

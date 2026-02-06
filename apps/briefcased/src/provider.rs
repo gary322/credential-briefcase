@@ -6,7 +6,6 @@ use base64::Engine as _;
 use briefcase_core::AuthMethod;
 use briefcase_payments::{PaymentBackend, PaymentChallenge, PaymentProof, parse_www_authenticate};
 use chrono::{DateTime, Utc};
-use ed25519_dalek::{Signer as _, SigningKey};
 use rand::RngCore as _;
 use reqwest::StatusCode;
 use serde::Deserialize;
@@ -26,7 +25,7 @@ pub struct ProviderClient {
     secrets: Arc<dyn SecretStore>,
     db: Db,
     cached: Arc<Mutex<HashMap<String, CachedToken>>>, // provider_id -> token
-    pop: Option<PopSigner>,
+    pop: Option<Arc<dyn briefcase_keys::Signer>>,
     payments: Arc<dyn PaymentBackend>,
 }
 
@@ -54,47 +53,6 @@ struct OAuthTokenResponse {
     expires_in: Option<i64>,
 }
 
-#[derive(Clone)]
-struct PopSigner {
-    signing_key: SigningKey,
-    pub_b64: String,
-}
-
-impl PopSigner {
-    fn from_seed(seed: [u8; 32]) -> Self {
-        let signing_key = SigningKey::from_bytes(&seed);
-        let pub_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .encode(signing_key.verifying_key().as_bytes());
-        Self {
-            signing_key,
-            pub_b64,
-        }
-    }
-
-    fn public_key_b64(&self) -> &str {
-        &self.pub_b64
-    }
-
-    fn sign_headers(&self, method: &str, path_and_query: &str, capability_jwt: &str) -> PopHeaders {
-        let ts = Utc::now().timestamp().to_string();
-
-        let mut nonce_bytes = [0u8; 16];
-        rand::rng().fill_bytes(&mut nonce_bytes);
-        let nonce = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(nonce_bytes);
-
-        let token_hash_b64 = {
-            let digest = Sha256::digest(capability_jwt.as_bytes());
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest)
-        };
-
-        let msg = format!("v1\n{method}\n{path_and_query}\n{ts}\n{nonce}\n{token_hash_b64}");
-        let sig = self.signing_key.sign(msg.as_bytes());
-        let sig_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sig.to_bytes());
-
-        PopHeaders { ts, nonce, sig_b64 }
-    }
-}
-
 #[derive(Debug)]
 struct PopHeaders {
     ts: String,
@@ -102,14 +60,52 @@ struct PopHeaders {
     sig_b64: String,
 }
 
+async fn pop_public_key_b64(pop: &Arc<dyn briefcase_keys::Signer>) -> anyhow::Result<String> {
+    let pk = pop
+        .public_key_bytes()
+        .await
+        .context("load pop public key")?;
+    if pk.len() != 32 {
+        anyhow::bail!("pop public key must be ed25519 (32 bytes)");
+    }
+    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(pk))
+}
+
+async fn sign_pop_headers(
+    pop: &Arc<dyn briefcase_keys::Signer>,
+    method: &str,
+    path_and_query: &str,
+    capability_jwt: &str,
+) -> anyhow::Result<PopHeaders> {
+    if pop.handle().algorithm != briefcase_keys::KeyAlgorithm::Ed25519 {
+        anyhow::bail!("pop signing key must be ed25519 for v1 pop headers");
+    }
+
+    let ts = Utc::now().timestamp().to_string();
+
+    let mut nonce_bytes = [0u8; 16];
+    rand::rng().fill_bytes(&mut nonce_bytes);
+    let nonce = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(nonce_bytes);
+
+    let token_hash_b64 = {
+        let digest = Sha256::digest(capability_jwt.as_bytes());
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest)
+    };
+
+    let msg = format!("v1\n{method}\n{path_and_query}\n{ts}\n{nonce}\n{token_hash_b64}");
+    let sig_bytes = pop.sign(msg.as_bytes()).await.context("sign pop message")?;
+    let sig_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sig_bytes);
+
+    Ok(PopHeaders { ts, nonce, sig_b64 })
+}
+
 impl ProviderClient {
     pub fn new(
         secrets: Arc<dyn SecretStore>,
         db: Db,
-        pop_seed: Option<[u8; 32]>,
+        pop: Option<Arc<dyn briefcase_keys::Signer>>,
         payments: Arc<dyn PaymentBackend>,
     ) -> Self {
-        let pop = pop_seed.map(PopSigner::from_seed);
         Self {
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(15))
@@ -230,7 +226,7 @@ impl ProviderClient {
 
         let mut req = self.http.get(url).bearer_auth(token);
         if let Some(pop) = &self.pop {
-            let h = pop.sign_headers("GET", &path_and_query, token);
+            let h = sign_pop_headers(pop, "GET", &path_and_query, token).await?;
             req = req
                 .header("x-briefcase-pop-ver", "1")
                 .header("x-briefcase-pop-ts", h.ts)
@@ -311,7 +307,8 @@ impl ProviderClient {
         let url = format!("{base_url}/token");
         let mut req = self.http.post(url).header("x-vc-jwt", vc_jwt);
         if let Some(pop) = &self.pop {
-            req = req.header("x-briefcase-pop-pub", pop.public_key_b64());
+            let pk_b64 = pop_public_key_b64(pop).await?;
+            req = req.header("x-briefcase-pop-pub", pk_b64);
         }
         let resp = req.send().await?;
         if !resp.status().is_success() {
@@ -355,7 +352,8 @@ impl ProviderClient {
         let url = format!("{base_url}/token");
         let mut req = self.http.post(url).bearer_auth(&tr.access_token);
         if let Some(pop) = &self.pop {
-            req = req.header("x-briefcase-pop-pub", pop.public_key_b64());
+            let pk_b64 = pop_public_key_b64(pop).await?;
+            req = req.header("x-briefcase-pop-pub", pk_b64);
         }
         let resp = req.send().await?;
         if !resp.status().is_success() {
@@ -371,7 +369,8 @@ impl ProviderClient {
 
         let mut req = self.http.post(token_url.clone());
         if let Some(pop) = &self.pop {
-            req = req.header("x-briefcase-pop-pub", pop.public_key_b64());
+            let pk_b64 = pop_public_key_b64(pop).await?;
+            req = req.header("x-briefcase-pop-pub", pk_b64);
         }
         let resp = req.send().await?;
 
@@ -411,7 +410,8 @@ impl ProviderClient {
         let proof = self.payments.pay(&provider_base, challenge).await?;
         let mut req = self.http.post(token_url);
         if let Some(pop) = &self.pop {
-            req = req.header("x-briefcase-pop-pub", pop.public_key_b64());
+            let pk_b64 = pop_public_key_b64(pop).await?;
+            req = req.header("x-briefcase-pop-pub", pk_b64);
         }
         let minted_via = match proof {
             PaymentProof::X402 { proof } => {

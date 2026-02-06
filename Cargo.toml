@@ -9,6 +9,7 @@ members = [
   "crates/briefcase-api",
   "crates/briefcase-core",
   "crates/briefcase-identity",
+  "crates/briefcase-keys",
   "crates/briefcase-mcp",
   "crates/briefcase-oauth-discovery",
   "crates/briefcase-payments",
@@ -49,6 +50,7 @@ hyperlocal = "0.9.1"
 jsonwebtoken = "9.3.0"
 jsonschema = "0.29.0"
 keyring = "2.3.3"
+p256 = { version = "0.13.2", features = ["ecdsa", "pkcs8"] }
 rand = "0.9.0"
 reqwest = { version = "0.12.12", default-features = false, features = ["json", "rustls-tls"] }
 rusqlite = { version = "0.32.1", features = ["bundled"] }

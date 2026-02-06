@@ -124,7 +124,7 @@ For each task, include:
 
 ## Phase 4: Hardware-Backed Key Custody + Mobile/Enterprise Signers
 
-- [ ] 4.1 Introduce `crates/briefcase-keys` signer abstraction
+- [x] 4.1 Introduce `crates/briefcase-keys` signer abstraction
   - **Do**: implement `Signer` trait + key handles; software Ed25519/P-256 backend; serialization; integrate with `briefcase-secrets`.
   - **Files**: `crates/briefcase-keys/*`, `apps/briefcased/src/app.rs`
   - **Done when**: briefcased can create and use a non-exportable key handle (software backend first) for PoP/identity.
