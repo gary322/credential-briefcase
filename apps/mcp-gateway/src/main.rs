@@ -324,10 +324,10 @@ async fn http_post(State(st): State<HttpState>, headers: HeaderMap, body: String
     }
 
     // Reject unsupported protocol version header values (spec requires 400).
-    if let Some(v) = header_str(&headers, "mcp-protocol-version") {
-        if v.trim().is_empty() {
-            return (StatusCode::BAD_REQUEST, "invalid mcp-protocol-version").into_response();
-        }
+    if let Some(v) = header_str(&headers, "mcp-protocol-version")
+        && v.trim().is_empty()
+    {
+        return (StatusCode::BAD_REQUEST, "invalid mcp-protocol-version").into_response();
     }
 
     let val: Value = match serde_json::from_str(&body) {
@@ -437,10 +437,10 @@ fn jsonrpc_http_response(resp: JsonRpcResponse, session_id: Option<&str>) -> Res
         .status(StatusCode::OK)
         .header("content-type", "application/json");
 
-    if let Some(sid) = session_id {
-        if let Ok(v) = HeaderValue::from_str(sid) {
-            builder = builder.header("mcp-session-id", v);
-        }
+    if let Some(sid) = session_id
+        && let Ok(v) = HeaderValue::from_str(sid)
+    {
+        builder = builder.header("mcp-session-id", v);
     }
 
     builder

@@ -1908,10 +1908,10 @@ mod tests {
             }
             let jwk = header.get("jwk").cloned().ok_or(StatusCode::UNAUTHORIZED)?;
 
-            if let Some(exp) = expected_jwk {
-                if &jwk != exp {
-                    return Err(StatusCode::UNAUTHORIZED);
-                }
+            if let Some(exp) = expected_jwk
+                && &jwk != exp
+            {
+                return Err(StatusCode::UNAUTHORIZED);
             }
 
             let htu = payload
