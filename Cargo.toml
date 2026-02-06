@@ -71,6 +71,6 @@ tracing-subscriber = { version = "0.3.19", features = ["env-filter", "fmt", "jso
 uuid = { version = "1.14.0", features = ["serde", "v4"] }
 tempfile = "3.16.0"
 url = "2.5.4"
-wasmtime = "38.0.0"
+wasmtime = "40.0.3"
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security_Cryptography"] }
 zeroize = { version = "1.8.1", features = ["derive"] }
