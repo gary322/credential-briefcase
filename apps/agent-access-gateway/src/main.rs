@@ -415,14 +415,15 @@ async fn token(State(st): State<AppState>, headers: HeaderMap) -> Response {
     };
 
     // OAuth access token path.
-    if let Some(bearer) = extract_bearer(&headers) {
-        if bearer.starts_with("at_") && is_valid_oauth_access(&st, bearer).await {
-            return (
-                StatusCode::OK,
-                Json(issue_capability_jwt(&st, pop_pk_b64.clone())),
-            )
-                .into_response();
-        }
+    if let Some(bearer) = extract_bearer(&headers)
+        && bearer.starts_with("at_")
+        && is_valid_oauth_access(&st, bearer).await
+    {
+        return (
+            StatusCode::OK,
+            Json(issue_capability_jwt(&st, pop_pk_b64.clone())),
+        )
+            .into_response();
     }
 
     // VC entitlement path.
