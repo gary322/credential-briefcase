@@ -23,4 +23,8 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           # Currently transitively pulled in via `keyring` on Linux (secret-service/zbus).
           # We track these, but do not block CI on "unmaintained" advisories.
-          ignore: RUSTSEC-2024-0388,RUSTSEC-2024-0384
+          # NOTE: `audit-check` splits `ignore` on whitespace; commas will be passed through
+          # to `cargo audit` and fail with "malformed advisory ID".
+          ignore: |
+            RUSTSEC-2024-0388
+            RUSTSEC-2024-0384
