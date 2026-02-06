@@ -1,7 +1,10 @@
 use std::path::Path;
 
 use anyhow::Context as _;
-use briefcase_core::{ApprovalRequest, util::sha256_hex};
+use briefcase_core::{
+    ApprovalRequest, ToolEgressPolicy, ToolFilesystemPolicy, ToolLimits, ToolManifest,
+    ToolRuntimeKind, util::sha256_hex,
+};
 use chrono::{DateTime, Datelike as _, Duration, TimeZone as _, Utc};
 use rusqlite::{OptionalExtension, params};
 use tokio_rusqlite::Connection;
@@ -158,6 +161,16 @@ impl Db {
 
                     CREATE INDEX IF NOT EXISTS oauth_sessions_expires_idx ON oauth_sessions(expires_at_rfc3339);
                     CREATE INDEX IF NOT EXISTS oauth_sessions_server_idx ON oauth_sessions(server_id);
+
+                    CREATE TABLE IF NOT EXISTS tool_manifests (
+                      tool_id                       TEXT PRIMARY KEY,
+                      runtime                       TEXT NOT NULL,
+                      allowed_hosts_json            TEXT NOT NULL,
+                      allowed_http_path_prefixes_json TEXT NOT NULL,
+                      allowed_fs_path_prefixes_json TEXT NOT NULL,
+                      max_output_bytes              INTEGER NOT NULL,
+                      updated_at_rfc3339            TEXT NOT NULL
+                    );
                     "#,
                 )?;
                 Ok(())
@@ -985,6 +998,136 @@ impl Db {
                 }
 
                 Ok(status == "approved")
+            })
+            .await
+            .map_err(Into::into)
+    }
+
+    pub async fn upsert_tool_manifest(&self, manifest: &ToolManifest) -> anyhow::Result<()> {
+        let tool_id = manifest.tool_id.clone();
+        let runtime = match manifest.runtime {
+            ToolRuntimeKind::Builtin => "builtin",
+            ToolRuntimeKind::Wasm => "wasm",
+            ToolRuntimeKind::RemoteMcp => "remote_mcp",
+        }
+        .to_string();
+        let allowed_hosts_json = serde_json::to_string(&manifest.egress.allowed_hosts)?;
+        let allowed_http_path_prefixes_json =
+            serde_json::to_string(&manifest.egress.allowed_http_path_prefixes)?;
+        let allowed_fs_path_prefixes_json =
+            serde_json::to_string(&manifest.filesystem.allowed_path_prefixes)?;
+        let max_output_bytes_i64 =
+            i64::try_from(manifest.limits.max_output_bytes).unwrap_or(i64::MAX);
+        let updated_at = Utc::now().to_rfc3339();
+
+        self.conn
+            .call(move |conn| {
+                conn.execute(
+                    r#"
+                    INSERT INTO tool_manifests(
+                      tool_id,
+                      runtime,
+                      allowed_hosts_json,
+                      allowed_http_path_prefixes_json,
+                      allowed_fs_path_prefixes_json,
+                      max_output_bytes,
+                      updated_at_rfc3339
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                    ON CONFLICT(tool_id) DO UPDATE SET
+                      runtime=excluded.runtime,
+                      allowed_hosts_json=excluded.allowed_hosts_json,
+                      allowed_http_path_prefixes_json=excluded.allowed_http_path_prefixes_json,
+                      allowed_fs_path_prefixes_json=excluded.allowed_fs_path_prefixes_json,
+                      max_output_bytes=excluded.max_output_bytes,
+                      updated_at_rfc3339=excluded.updated_at_rfc3339
+                    "#,
+                    params![
+                        tool_id,
+                        runtime,
+                        allowed_hosts_json,
+                        allowed_http_path_prefixes_json,
+                        allowed_fs_path_prefixes_json,
+                        max_output_bytes_i64,
+                        updated_at
+                    ],
+                )?;
+                Ok(())
+            })
+            .await?;
+        Ok(())
+    }
+
+    pub async fn get_tool_manifest(&self, tool_id: &str) -> anyhow::Result<Option<ToolManifest>> {
+        let tool_id = tool_id.to_string();
+        self.conn
+            .call(move |conn| {
+                let row: Option<(String, String, String, String, String, i64)> = conn
+                    .query_row(
+                        r#"
+                        SELECT tool_id, runtime, allowed_hosts_json, allowed_http_path_prefixes_json, allowed_fs_path_prefixes_json, max_output_bytes
+                        FROM tool_manifests
+                        WHERE tool_id=?1
+                        "#,
+                        params![tool_id],
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+                    )
+                    .optional()?;
+
+                let Some((tool_id, runtime_s, allowed_hosts_json, allowed_http_paths_json, allowed_fs_paths_json, max_output_bytes_i64)) = row else {
+                    return Ok(None);
+                };
+
+                let runtime = match runtime_s.as_str() {
+                    "builtin" => ToolRuntimeKind::Builtin,
+                    "wasm" => ToolRuntimeKind::Wasm,
+                    "remote_mcp" => ToolRuntimeKind::RemoteMcp,
+                    _other => {
+                        // Fail-closed: treat unknown runtime values as "missing manifest".
+                        return Ok(None);
+                    }
+                };
+
+                let allowed_hosts: Vec<String> =
+                    serde_json::from_str(&allowed_hosts_json).map_err(|e| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            2,
+                            rusqlite::types::Type::Text,
+                            Box::new(e),
+                        )
+                    })?;
+                let allowed_http_path_prefixes: Vec<String> =
+                    serde_json::from_str(&allowed_http_paths_json).map_err(|e| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            3,
+                            rusqlite::types::Type::Text,
+                            Box::new(e),
+                        )
+                    })?;
+                let allowed_path_prefixes: Vec<String> =
+                    serde_json::from_str(&allowed_fs_paths_json).map_err(|e| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            4,
+                            rusqlite::types::Type::Text,
+                            Box::new(e),
+                        )
+                    })?;
+                let max_output_bytes_u64 = u64::try_from(max_output_bytes_i64)
+                    .unwrap_or(0);
+
+                Ok(Some(ToolManifest {
+                    tool_id,
+                    runtime,
+                    egress: ToolEgressPolicy {
+                        allowed_hosts,
+                        allowed_http_path_prefixes,
+                    },
+                    filesystem: ToolFilesystemPolicy {
+                        allowed_path_prefixes,
+                    },
+                    limits: ToolLimits {
+                        max_output_bytes: max_output_bytes_u64,
+                    },
+                }))
             })
             .await
             .map_err(Into::into)

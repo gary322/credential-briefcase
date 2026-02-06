@@ -13,6 +13,7 @@ members = [
   "crates/briefcase-oauth-discovery",
   "crates/briefcase-payments",
   "crates/briefcase-risk",
+  "crates/briefcase-sandbox",
   "crates/briefcase-policy",
   "crates/briefcase-receipts",
   "crates/briefcase-secrets",
@@ -65,4 +66,5 @@ tracing-subscriber = { version = "0.3.19", features = ["env-filter", "fmt", "jso
 uuid = { version = "1.14.0", features = ["serde", "v4"] }
 tempfile = "3.16.0"
 url = "2.5.4"
+wasmtime = "38.0.0"
 zeroize = { version = "1.8.1", features = ["derive"] }

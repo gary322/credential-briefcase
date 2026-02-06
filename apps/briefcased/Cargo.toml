@@ -39,8 +39,12 @@ briefcase-payments = { path = "../../crates/briefcase-payments" }
 briefcase-policy = { path = "../../crates/briefcase-policy" }
 briefcase-receipts = { path = "../../crates/briefcase-receipts" }
 briefcase-risk = { path = "../../crates/briefcase-risk" }
+briefcase-sandbox = { path = "../../crates/briefcase-sandbox" }
 briefcase-secrets = { path = "../../crates/briefcase-secrets" }
 
 [dev-dependencies]
 async-trait.workspace = true
 tempfile.workspace = true
+
+[build-dependencies]
+wat = "1.244.0"

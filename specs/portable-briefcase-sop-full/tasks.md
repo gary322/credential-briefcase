@@ -99,27 +99,27 @@ For each task, include:
 
 ## Phase 3: Strong Tool Isolation (Sandbox + Egress Allowlists)
 
-- [ ] 3.1 Create WASM-first sandbox runtime
+- [x] 3.1 Create WASM-first sandbox runtime
   - **Do**: add `crates/briefcase-sandbox` using `wasmtime` with memory/time limits; design host-call surface.
   - **Files**: `crates/briefcase-sandbox/*`
   - **Done when**: a sample tool runs in sandbox and can call `host.http_request` with enforced allowlist.
   - **Verify**: `cargo test -p briefcase-sandbox`
   - _Reqs: FR-7, AC-5.1_
 
-- [ ] 3.2 Add per-tool manifest (allowed domains/paths, quotas)
+- [x] 3.2 Add per-tool manifest (allowed domains/paths, quotas)
   - **Do**: add manifest schema, store in DB, and enforce at runtime; deny-by-default.
   - **Files**: `crates/briefcase-core/src/tool_manifest.rs` (new), `apps/briefcased/src/db.rs`, `apps/briefcased/src/tools.rs`
   - **Done when**: tool calls that attempt disallowed egress/filesystem access fail closed and are receipted.
   - **Verify**: `cargo test -p briefcased sandbox_*`
   - _Reqs: AC-5.2_
 
-- [ ] 3.3 Migrate “connector execution” into sandboxed path
+- [x] 3.3 Migrate “connector execution” into sandboxed path
   - **Do**: move remote HTTP/MCP connector logic behind host calls so sandboxed tools never see raw tokens.
   - **Files**: `apps/briefcased/src/provider.rs`, `crates/briefcase-sandbox/*`
   - **Done when**: sandboxed tools can trigger provider calls without access to secrets; receipts include sandbox provenance.
   - **Verify**: e2e test.
 
-- [ ] 3.4 Quality checkpoint
+- [x] 3.4 Quality checkpoint
   - **Verify**: `cargo fmt --check` + `cargo clippy --all-targets --all-features -- -D warnings` + `cargo test --all`
 
 ## Phase 4: Hardware-Backed Key Custody + Mobile/Enterprise Signers

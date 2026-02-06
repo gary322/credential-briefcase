@@ -18,7 +18,10 @@ use briefcase_api::types::{
     ProviderSummary, SetBudgetRequest, UpsertMcpServerRequest, UpsertProviderRequest,
     VerifyReceiptsResponse,
 };
-use briefcase_core::{PolicyDecision, ToolCall, ToolResult};
+use briefcase_core::{
+    PolicyDecision, ToolCall, ToolEgressPolicy, ToolFilesystemPolicy, ToolLimits, ToolManifest,
+    ToolResult, ToolRuntimeKind,
+};
 use chrono::Utc;
 use rand::RngCore as _;
 use serde::Deserialize;
@@ -65,6 +68,7 @@ impl AppState {
         // rejects dangerous URL forms (userinfo, non-loopback http, etc).
         let provider_base_url = normalize_base_url(&provider_base_url)?;
         db.upsert_provider("demo", &provider_base_url).await?;
+        seed_default_tool_manifests(&db, &provider_base_url).await?;
 
         let receipts = ReceiptStore::open(ReceiptStoreOptions::new(db_path.to_path_buf())).await?;
 
@@ -677,6 +681,18 @@ async fn call_tool_impl(state: &AppState, call: ToolCall) -> anyhow::Result<Call
         ResolvedTool::Remote(s) => s.as_ref(),
     };
 
+    let runtime = match &tool {
+        ResolvedTool::Remote(_) => "remote_mcp".to_string(),
+        ResolvedTool::Local(_) => match state.db.get_tool_manifest(&call.tool_id).await? {
+            Some(m) => match m.runtime {
+                briefcase_core::ToolRuntimeKind::Builtin => "builtin".to_string(),
+                briefcase_core::ToolRuntimeKind::Wasm => "wasm".to_string(),
+                briefcase_core::ToolRuntimeKind::RemoteMcp => "remote_mcp".to_string(),
+            },
+            None => "builtin".to_string(),
+        },
+    };
+
     // Validate inputs early. We treat invalid args as denied.
     let validate_res = match &tool {
         ResolvedTool::Local(t) => t.validate_args(&call.args),
@@ -711,6 +727,7 @@ async fn call_tool_impl(state: &AppState, call: ToolCall) -> anyhow::Result<Call
                 .append(serde_json::json!({
                     "kind": "tool_call",
                     "tool_id": call.tool_id,
+                    "runtime": runtime.as_str(),
                     "decision": "deny",
                     "reason": reason,
                     "ts": Utc::now().to_rfc3339(),
@@ -733,6 +750,7 @@ async fn call_tool_impl(state: &AppState, call: ToolCall) -> anyhow::Result<Call
                     .append(serde_json::json!({
                         "kind": "tool_call",
                         "tool_id": call.tool_id,
+                        "runtime": runtime.as_str(),
                         "decision": "approval_required",
                         "approval_id": approval.id,
                         "ts": Utc::now().to_rfc3339(),
@@ -768,6 +786,7 @@ async fn call_tool_impl(state: &AppState, call: ToolCall) -> anyhow::Result<Call
                 .append(serde_json::json!({
                     "kind": "tool_call",
                     "tool_id": call.tool_id,
+                    "runtime": runtime.as_str(),
                     "decision": "approval_required",
                     "approval_id": approval.id,
                     "reason": reason,
@@ -796,10 +815,30 @@ async fn call_tool_impl(state: &AppState, call: ToolCall) -> anyhow::Result<Call
     }
 
     let exec = match &tool {
-        ResolvedTool::Local(t) => t
-            .execute(&call.args)
-            .await
-            .map_err(|e| anyhow::anyhow!(e.to_string())),
+        ResolvedTool::Local(t) => match t.execute(&call.args).await {
+            Ok(v) => Ok(v),
+            Err(crate::tools::ToolRuntimeError::SandboxViolation(reason)) => {
+                let mut reason = reason;
+                if reason.len() > 200 {
+                    reason.truncate(200);
+                }
+                state
+                    .receipts
+                    .append(serde_json::json!({
+                        "kind": "tool_call",
+                        "tool_id": call.tool_id,
+                        "runtime": runtime.as_str(),
+                        "decision": "deny",
+                        "reason": format!("sandbox_violation:{reason}"),
+                        "ts": Utc::now().to_rfc3339(),
+                    }))
+                    .await?;
+                return Ok(CallToolResponse::Denied {
+                    reason: format!("sandbox_violation:{reason}"),
+                });
+            }
+            Err(e) => Err(anyhow::anyhow!(e.to_string())),
+        },
         ResolvedTool::Remote(_s) => state.remote_mcp.call_tool(&call.tool_id, &call.args).await,
     };
     match exec {
@@ -817,6 +856,7 @@ async fn call_tool_impl(state: &AppState, call: ToolCall) -> anyhow::Result<Call
                 .append(serde_json::json!({
                     "kind": "tool_call",
                     "tool_id": call.tool_id,
+                    "runtime": runtime.as_str(),
                     "decision": "allow",
                     "auth_method": auth_method,
                     "cost_usd": cost_usd_opt,
@@ -844,9 +884,27 @@ async fn call_tool_impl(state: &AppState, call: ToolCall) -> anyhow::Result<Call
 
             Ok(CallToolResponse::Ok { result })
         }
-        Err(e) => Ok(CallToolResponse::Error {
-            message: e.to_string(),
-        }),
+        Err(e) => {
+            let mut msg = e.to_string();
+            msg = msg.replace('\n', " ");
+            if msg.len() > 200 {
+                msg.truncate(200);
+            }
+
+            let _receipt = state
+                .receipts
+                .append(serde_json::json!({
+                    "kind": "tool_call",
+                    "tool_id": call.tool_id,
+                    "runtime": runtime.as_str(),
+                    "decision": "error",
+                    "message": msg,
+                    "ts": Utc::now().to_rfc3339(),
+                }))
+                .await?;
+
+            Ok(CallToolResponse::Error { message: msg })
+        }
     }
 }
 
@@ -1149,6 +1207,49 @@ fn is_valid_provider_id(id: &str) -> bool {
         && id
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+}
+
+async fn seed_default_tool_manifests(db: &Db, provider_base_url: &str) -> anyhow::Result<()> {
+    async fn seed_if_missing(db: &Db, manifest: ToolManifest) -> anyhow::Result<()> {
+        if db.get_tool_manifest(&manifest.tool_id).await?.is_none() {
+            db.upsert_tool_manifest(&manifest).await?;
+        }
+        Ok(())
+    }
+
+    let provider_host = url::Url::parse(provider_base_url)
+        .ok()
+        .and_then(|u| u.host_str().map(|s| s.to_string()))
+        .unwrap_or_else(|| "localhost".to_string());
+
+    seed_if_missing(db, ToolManifest::deny_all("echo", ToolRuntimeKind::Builtin)).await?;
+    seed_if_missing(
+        db,
+        ToolManifest::deny_all("note_add", ToolRuntimeKind::Builtin),
+    )
+    .await?;
+    seed_if_missing(
+        db,
+        ToolManifest::deny_all("notes_list", ToolRuntimeKind::Builtin),
+    )
+    .await?;
+    seed_if_missing(
+        db,
+        ToolManifest::deny_all("file_read", ToolRuntimeKind::Wasm),
+    )
+    .await?;
+
+    // Quote is sandboxed and needs explicit egress to the provider gateway.
+    let mut quote = ToolManifest::deny_all("quote", ToolRuntimeKind::Wasm);
+    quote.egress = ToolEgressPolicy {
+        allowed_hosts: vec![provider_host],
+        allowed_http_path_prefixes: vec!["/api/quote".to_string()],
+    };
+    quote.filesystem = ToolFilesystemPolicy::deny_all();
+    quote.limits = ToolLimits::default();
+    seed_if_missing(db, quote).await?;
+
+    Ok(())
 }
 
 fn normalize_base_url(raw: &str) -> anyhow::Result<String> {
@@ -1797,7 +1898,12 @@ mod tests {
 
     async fn start_daemon(
         provider_base_url: String,
-    ) -> anyhow::Result<(String, BriefcaseClient, tokio::task::JoinHandle<()>)> {
+    ) -> anyhow::Result<(
+        AppState,
+        String,
+        BriefcaseClient,
+        tokio::task::JoinHandle<()>,
+    )> {
         let dir = tempdir()?;
         let db_path = dir.path().join("briefcase.sqlite");
         let auth_token = "test-token";
@@ -1805,7 +1911,7 @@ mod tests {
         let secrets = Arc::new(briefcase_secrets::InMemorySecretStore::default());
         let state =
             AppState::init(&db_path, auth_token.to_string(), provider_base_url, secrets).await?;
-        let app = router(state);
+        let app = router(state.clone());
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let addr = listener.local_addr()?;
@@ -1825,7 +1931,7 @@ mod tests {
         // Keep tempdir alive by leaking it for the test duration (join handle owns no refs).
         std::mem::forget(dir);
 
-        Ok((base_url, client, handle))
+        Ok((state, base_url, client, handle))
     }
 
     #[tokio::test]
@@ -1833,7 +1939,7 @@ mod tests {
         let (provider_addr, _provider_state, provider_task) = start_mock_provider().await?;
         let provider_base_url = format!("http://{provider_addr}");
 
-        let (_daemon_base, client, daemon_task) = start_daemon(provider_base_url).await?;
+        let (_state, _daemon_base, client, daemon_task) = start_daemon(provider_base_url).await?;
 
         // Tools exist.
         let tools = client.list_tools().await?.tools;
@@ -1908,6 +2014,161 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn sandbox_manifest_denies_quote_egress() -> anyhow::Result<()> {
+        let (provider_addr, _provider_state, provider_task) = start_mock_provider().await?;
+        let provider_base_url = format!("http://{provider_addr}");
+
+        let (state, _daemon_base, client, daemon_task) = start_daemon(provider_base_url).await?;
+
+        // Deny all egress for quote.
+        let mut m =
+            briefcase_core::ToolManifest::deny_all("quote", briefcase_core::ToolRuntimeKind::Wasm);
+        m.egress.allowed_http_path_prefixes = vec!["/api/quote".to_string()];
+        state.db.upsert_tool_manifest(&m).await?;
+
+        let resp = client
+            .call_tool(CallToolRequest {
+                call: ToolCall {
+                    tool_id: "quote".to_string(),
+                    args: serde_json::json!({ "symbol": "TEST" }),
+                    context: ToolCallContext::new(),
+                    approval_token: None,
+                },
+            })
+            .await?;
+
+        let reason = match resp {
+            CallToolResponse::Denied { reason } => reason,
+            other => anyhow::bail!("expected denied, got {other:?}"),
+        };
+        assert!(
+            reason.contains("sandbox_violation"),
+            "unexpected reason: {reason}"
+        );
+
+        let receipts = client.list_receipts().await?.receipts;
+        let found = receipts.iter().any(|r| {
+            r.event
+                .get("decision")
+                .and_then(|d| d.as_str())
+                .unwrap_or_default()
+                == "deny"
+                && r.event
+                    .get("tool_id")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or_default()
+                    == "quote"
+        });
+        assert!(found, "expected a deny receipt for quote");
+
+        daemon_task.abort();
+        provider_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sandbox_fs_read_respects_manifest_and_requires_approval() -> anyhow::Result<()> {
+        use base64::Engine as _;
+
+        let (provider_addr, _provider_state, provider_task) = start_mock_provider().await?;
+        let provider_base_url = format!("http://{provider_addr}");
+
+        let (state, _daemon_base, client, daemon_task) = start_daemon(provider_base_url).await?;
+
+        // Ensure tool is surfaced.
+        let tools = client.list_tools().await?.tools;
+        assert!(tools.iter().any(|t| t.id == "file_read"));
+
+        let dir = tempdir()?;
+        let file_path = dir.path().join("hello.txt");
+        std::fs::write(&file_path, b"hello")?;
+
+        // Allow reads under this temp dir.
+        let mut m = briefcase_core::ToolManifest::deny_all(
+            "file_read",
+            briefcase_core::ToolRuntimeKind::Wasm,
+        );
+        m.filesystem.allowed_path_prefixes = vec![dir.path().to_string_lossy().to_string()];
+        state.db.upsert_tool_manifest(&m).await?;
+
+        // Requires approval (write-category tool).
+        let resp = client
+            .call_tool(CallToolRequest {
+                call: ToolCall {
+                    tool_id: "file_read".to_string(),
+                    args: serde_json::json!({ "path": file_path.to_string_lossy() }),
+                    context: ToolCallContext::new(),
+                    approval_token: None,
+                },
+            })
+            .await?;
+
+        let approval_id = match resp {
+            CallToolResponse::ApprovalRequired { approval } => approval.id,
+            other => anyhow::bail!("expected approval_required, got {other:?}"),
+        };
+        let approved = client.approve(&approval_id).await?;
+
+        // With approval, succeeds and returns file contents.
+        let resp = client
+            .call_tool(CallToolRequest {
+                call: ToolCall {
+                    tool_id: "file_read".to_string(),
+                    args: serde_json::json!({ "path": file_path.to_string_lossy() }),
+                    context: ToolCallContext::new(),
+                    approval_token: Some(approved.approval_token.clone()),
+                },
+            })
+            .await?;
+
+        let result = match resp {
+            CallToolResponse::Ok { result } => result,
+            other => anyhow::bail!("expected ok, got {other:?}"),
+        };
+
+        let data_b64 = result
+            .content
+            .get("data_b64")
+            .and_then(|v| v.as_str())
+            .context("missing data_b64")?;
+        let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(data_b64)
+            .context("decode data_b64")?;
+        assert_eq!(decoded, b"hello");
+
+        // Now deny filesystem access and ensure it fails closed even with approval token.
+        let m = briefcase_core::ToolManifest::deny_all(
+            "file_read",
+            briefcase_core::ToolRuntimeKind::Wasm,
+        );
+        state.db.upsert_tool_manifest(&m).await?;
+
+        let resp = client
+            .call_tool(CallToolRequest {
+                call: ToolCall {
+                    tool_id: "file_read".to_string(),
+                    args: serde_json::json!({ "path": file_path.to_string_lossy() }),
+                    context: ToolCallContext::new(),
+                    approval_token: Some(approved.approval_token),
+                },
+            })
+            .await?;
+
+        let reason = match resp {
+            CallToolResponse::Denied { reason } => reason,
+            other => anyhow::bail!("expected denied, got {other:?}"),
+        };
+        assert!(
+            reason.contains("sandbox_violation"),
+            "unexpected reason: {reason}"
+        );
+
+        daemon_task.abort();
+        provider_task.abort();
+        Ok(())
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn unix_socket_ipc_works() -> anyhow::Result<()> {
@@ -1959,7 +2220,7 @@ mod tests {
         let (provider_addr, provider_state, provider_task) = start_mock_provider().await?;
         let provider_base_url = format!("http://{provider_addr}");
 
-        let (_daemon_base, client, daemon_task) = start_daemon(provider_base_url).await?;
+        let (_state, _daemon_base, client, daemon_task) = start_daemon(provider_base_url).await?;
 
         // Store OAuth refresh token in the daemon.
         client
@@ -2003,7 +2264,7 @@ mod tests {
         let (provider_addr, _provider_state, provider_task) = start_mock_provider().await?;
         let provider_base_url = format!("http://{provider_addr}");
 
-        let (_daemon_base, client, daemon_task) = start_daemon(provider_base_url).await?;
+        let (_state, _daemon_base, client, daemon_task) = start_daemon(provider_base_url).await?;
 
         // Echo is allowed by default policy, but risk scoring should force approval for injectiony text.
         let resp = client
@@ -2038,7 +2299,7 @@ mod tests {
         let (remote_addr, remote_state, remote_task) = start_mock_remote_mcp().await?;
         let remote_endpoint = format!("http://{remote_addr}/mcp");
 
-        let (_daemon_base, client, daemon_task) = start_daemon(provider_base_url).await?;
+        let (_state, _daemon_base, client, daemon_task) = start_daemon(provider_base_url).await?;
 
         // Register remote MCP endpoint.
         client
@@ -2127,7 +2388,7 @@ mod tests {
         let (secure_addr, oauth_state, secure_task) = start_mock_oauth_protected_mcp().await?;
         let secure_endpoint = format!("http://{secure_addr}/mcp");
 
-        let (_daemon_base, client, daemon_task) = start_daemon(provider_base_url).await?;
+        let (_state, _daemon_base, client, daemon_task) = start_daemon(provider_base_url).await?;
 
         client
             .upsert_mcp_server("secure1", secure_endpoint.clone())
