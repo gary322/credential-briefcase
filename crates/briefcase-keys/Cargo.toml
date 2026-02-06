@@ -10,6 +10,7 @@ default = []
 apple = ["dep:tokio"]
 pkcs11 = ["dep:cryptoki", "dep:tokio"]
 tpm2 = ["dep:tempfile", "dep:tokio"]
+windows = ["dep:tokio"]
 
 [dependencies]
 anyhow.workspace = true
@@ -34,6 +35,9 @@ briefcase-secrets = { path = "../briefcase-secrets" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework.workspace = true
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true

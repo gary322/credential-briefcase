@@ -57,6 +57,14 @@ jobs:
       - name: Cargo test
         run: cargo test --all
 
+      - name: briefcase-keys (apple backend)
+        if: matrix.os == 'macos-latest'
+        run: cargo test -p briefcase-keys --features apple apple_
+
+      - name: briefcase-keys (windows backend)
+        if: matrix.os == 'windows-latest'
+        run: cargo test -p briefcase-keys --features windows windows_
+
   pkcs11:
     name: pkcs11 (SoftHSM)
     runs-on: ubuntu-latest

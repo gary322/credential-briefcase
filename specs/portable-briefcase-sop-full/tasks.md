@@ -153,7 +153,7 @@ For each task, include:
   - **Do**: implement CNG signer; detect TPM provider; fallback to software key.
   - **Files**: `crates/briefcase-keys/src/windows.rs`
   - **Done when**: Windows CI runs software fallback tests; optional hardware tests documented.
-  - **Verify**: `cargo test -p briefcase-keys windows_*`
+  - **Verify**: `cargo test -p briefcase-keys --features windows windows_`
 
 - [ ] 4.6 Integrate keys into OAuth (DPoP) and capability PoP
   - **Do**: standardize PoP on DPoP where possible; update provider gateway to verify; update daemon client to attach proofs.

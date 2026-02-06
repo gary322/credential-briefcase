@@ -14,6 +14,9 @@ pub mod apple;
 #[cfg(feature = "tpm2")]
 pub mod tpm2;
 
+#[cfg(all(feature = "windows", target_os = "windows"))]
+pub mod windows;
+
 use std::sync::Arc;
 
 use anyhow::Context as _;
