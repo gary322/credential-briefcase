@@ -44,7 +44,7 @@ impl PerRequestHeaderProvider for DpopHeaderProvider {
         let Some(tok) = ctx.auth_token.as_deref() else {
             return Ok(Vec::new());
         };
-        let proof = crate::dpop::dpop_proof_for_resource_request(
+        let proof = briefcase_dpop::dpop_proof_for_resource_request(
             self.signer.as_ref(),
             &ctx.url,
             &ctx.method,
@@ -503,7 +503,7 @@ impl RemoteMcpManager {
             let token_endpoint_url =
                 Url::parse(&token_endpoint).context("parse oauth token_endpoint url")?;
             let proof =
-                crate::dpop::dpop_proof_for_token_endpoint(signer.as_ref(), &token_endpoint_url)
+                briefcase_dpop::dpop_proof_for_token_endpoint(signer.as_ref(), &token_endpoint_url)
                     .await?;
             req = req.header("DPoP", proof);
         }

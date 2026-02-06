@@ -9,6 +9,7 @@ members = [
   "apps/mcp-gateway",
   "crates/briefcase-api",
   "crates/briefcase-core",
+  "crates/briefcase-dpop",
   "crates/briefcase-identity",
   "crates/briefcase-keys",
   "crates/briefcase-mcp",

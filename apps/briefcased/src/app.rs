@@ -670,7 +670,7 @@ async fn exchange_mcp_oauth(
             let token_endpoint_url =
                 url::Url::parse(sess.token_endpoint.as_str()).map_err(internal_error)?;
             let proof =
-                crate::dpop::dpop_proof_for_token_endpoint(signer.as_ref(), &token_endpoint_url)
+                briefcase_dpop::dpop_proof_for_token_endpoint(signer.as_ref(), &token_endpoint_url)
                     .await
                     .map_err(internal_error)?;
             reqb = reqb.header("DPoP", proof);

@@ -26,5 +26,8 @@ tracing-subscriber.workspace = true
 url.workspace = true
 uuid.workspace = true
 
+briefcase-dpop = { path = "../../crates/briefcase-dpop" }
+
 [dev-dependencies]
+p256.workspace = true
 reqwest.workspace = true

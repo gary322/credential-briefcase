@@ -2,14 +2,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::Context as _;
-use base64::Engine as _;
 use briefcase_core::AuthMethod;
 use briefcase_payments::{PaymentBackend, PaymentChallenge, PaymentProof, parse_www_authenticate};
 use chrono::{DateTime, Utc};
-use rand::RngCore as _;
 use reqwest::StatusCode;
 use serde::Deserialize;
-use sha2::{Digest as _, Sha256};
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 use url::Url;
@@ -51,52 +48,6 @@ struct OAuthTokenResponse {
     refresh_token: Option<String>,
     token_type: String,
     expires_in: Option<i64>,
-}
-
-#[derive(Debug)]
-struct PopHeaders {
-    ts: String,
-    nonce: String,
-    sig_b64: String,
-}
-
-async fn pop_public_key_b64(pop: &Arc<dyn briefcase_keys::Signer>) -> anyhow::Result<String> {
-    let pk = pop
-        .public_key_bytes()
-        .await
-        .context("load pop public key")?;
-    if pk.len() != 32 {
-        anyhow::bail!("pop public key must be ed25519 (32 bytes)");
-    }
-    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(pk))
-}
-
-async fn sign_pop_headers(
-    pop: &Arc<dyn briefcase_keys::Signer>,
-    method: &str,
-    path_and_query: &str,
-    capability_jwt: &str,
-) -> anyhow::Result<PopHeaders> {
-    if pop.handle().algorithm != briefcase_keys::KeyAlgorithm::Ed25519 {
-        anyhow::bail!("pop signing key must be ed25519 for v1 pop headers");
-    }
-
-    let ts = Utc::now().timestamp().to_string();
-
-    let mut nonce_bytes = [0u8; 16];
-    rand::rng().fill_bytes(&mut nonce_bytes);
-    let nonce = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(nonce_bytes);
-
-    let token_hash_b64 = {
-        let digest = Sha256::digest(capability_jwt.as_bytes());
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest)
-    };
-
-    let msg = format!("v1\n{method}\n{path_and_query}\n{ts}\n{nonce}\n{token_hash_b64}");
-    let sig_bytes = pop.sign(msg.as_bytes()).await.context("sign pop message")?;
-    let sig_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sig_bytes);
-
-    Ok(PopHeaders { ts, nonce, sig_b64 })
 }
 
 impl ProviderClient {
@@ -219,19 +170,16 @@ impl ProviderClient {
         let mut url = base.join("/api/quote").context("join /api/quote")?;
         url.query_pairs_mut().append_pair("symbol", symbol);
 
-        let path_and_query = match url.query() {
-            Some(q) => format!("{}?{}", url.path(), q),
-            None => url.path().to_string(),
-        };
-
-        let mut req = self.http.get(url).bearer_auth(token);
+        let mut req = self.http.get(url.clone());
         if let Some(pop) = &self.pop {
-            let h = sign_pop_headers(pop, "GET", &path_and_query, token).await?;
+            let proof =
+                briefcase_dpop::dpop_proof_for_resource_request(pop.as_ref(), &url, "GET", token)
+                    .await?;
             req = req
-                .header("x-briefcase-pop-ver", "1")
-                .header("x-briefcase-pop-ts", h.ts)
-                .header("x-briefcase-pop-nonce", h.nonce)
-                .header("x-briefcase-pop-sig", h.sig_b64);
+                .header(reqwest::header::AUTHORIZATION, format!("DPoP {token}"))
+                .header("DPoP", proof);
+        } else {
+            req = req.bearer_auth(token);
         }
 
         let resp = req.send().await?;
@@ -305,10 +253,12 @@ impl ProviderClient {
         vc_jwt: &str,
     ) -> anyhow::Result<CachedToken> {
         let url = format!("{base_url}/token");
+        let token_url = Url::parse(&url).context("parse token url")?;
         let mut req = self.http.post(url).header("x-vc-jwt", vc_jwt);
         if let Some(pop) = &self.pop {
-            let pk_b64 = pop_public_key_b64(pop).await?;
-            req = req.header("x-briefcase-pop-pub", pk_b64);
+            let proof =
+                briefcase_dpop::dpop_proof_for_token_endpoint(pop.as_ref(), &token_url).await?;
+            req = req.header("DPoP", proof);
         }
         let resp = req.send().await?;
         if !resp.status().is_success() {
@@ -350,10 +300,12 @@ impl ProviderClient {
         }
 
         let url = format!("{base_url}/token");
+        let token_url = Url::parse(&url).context("parse token url")?;
         let mut req = self.http.post(url).bearer_auth(&tr.access_token);
         if let Some(pop) = &self.pop {
-            let pk_b64 = pop_public_key_b64(pop).await?;
-            req = req.header("x-briefcase-pop-pub", pk_b64);
+            let proof =
+                briefcase_dpop::dpop_proof_for_token_endpoint(pop.as_ref(), &token_url).await?;
+            req = req.header("DPoP", proof);
         }
         let resp = req.send().await?;
         if !resp.status().is_success() {
@@ -369,8 +321,9 @@ impl ProviderClient {
 
         let mut req = self.http.post(token_url.clone());
         if let Some(pop) = &self.pop {
-            let pk_b64 = pop_public_key_b64(pop).await?;
-            req = req.header("x-briefcase-pop-pub", pk_b64);
+            let proof =
+                briefcase_dpop::dpop_proof_for_token_endpoint(pop.as_ref(), &token_url).await?;
+            req = req.header("DPoP", proof);
         }
         let resp = req.send().await?;
 
@@ -408,10 +361,12 @@ impl ProviderClient {
         }
 
         let proof = self.payments.pay(&provider_base, challenge).await?;
-        let mut req = self.http.post(token_url);
+        let mut req = self.http.post(token_url.clone());
         if let Some(pop) = &self.pop {
-            let pk_b64 = pop_public_key_b64(pop).await?;
-            req = req.header("x-briefcase-pop-pub", pk_b64);
+            // For the retry, generate a fresh DPoP proof (new jti) bound to the same key.
+            let dpop =
+                briefcase_dpop::dpop_proof_for_token_endpoint(pop.as_ref(), &token_url).await?;
+            req = req.header("DPoP", dpop);
         }
         let minted_via = match proof {
             PaymentProof::X402 { proof } => {

@@ -53,11 +53,13 @@ dependencies = [
  "anyhow",
  "axum",
  "base64",
+ "briefcase-dpop",
  "chrono",
  "clap",
  "ed25519-dalek",
  "hmac",
  "jsonwebtoken",
+ "p256",
  "rand 0.9.2",
  "reqwest",
  "serde",
@@ -622,6 +624,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "briefcase-dpop"
+version = "0.1.4"
+dependencies = [
+ "anyhow",
+ "base64",
+ "briefcase-keys",
+ "chrono",
+ "ed25519-dalek",
+ "p256",
+ "serde_json",
+ "sha2",
+ "url",
+ "uuid",
+]
+
+[[package]]
 name = "briefcase-identity"
 version = "0.1.4"
 dependencies = [
@@ -812,6 +830,7 @@ dependencies = [
  "base64",
  "briefcase-api",
  "briefcase-core",
+ "briefcase-dpop",
  "briefcase-identity",
  "briefcase-keys",
  "briefcase-mcp",

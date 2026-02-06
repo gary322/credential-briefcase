@@ -9,9 +9,9 @@ use axum::response::{IntoResponse as _, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::Engine as _;
+use briefcase_dpop::{jwk_thumbprint_b64url, verify_dpop_jwt};
 use chrono::{DateTime, Utc};
 use clap::Parser;
-use ed25519_dalek::{Signature, Verifier as _, VerifyingKey};
 use hmac::{Hmac, Mac};
 use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation};
 use rand::Rng as _;
@@ -54,7 +54,7 @@ struct AppState {
     pending_x402: Arc<Mutex<HashMap<String, PendingPayment>>>,
     pending_l402: Arc<Mutex<HashMap<String, PendingL402>>>,
     usage: Arc<Mutex<HashMap<String, i64>>>, // jti -> calls
-    used_nonces: Arc<Mutex<HashMap<String, DateTime<Utc>>>>, // `${jti}:${nonce}` -> ts
+    used_dpop_jtis: Arc<Mutex<HashMap<String, i64>>>, // `${jkt}:${jti}` -> iat
     oauth_codes: Arc<Mutex<HashMap<String, OAuthCode>>>, // code -> record
     oauth_refresh: Arc<Mutex<HashMap<String, OAuthRefresh>>>, // refresh -> record
     oauth_access: Arc<Mutex<HashMap<String, OAuthAccess>>>, // access -> record
@@ -142,8 +142,13 @@ struct CapabilityClaims {
     scope: String,
     max_calls: i64,
     cost_microusd: i64,
-    /// If set, requests must include a PoP signature verified against this Ed25519 public key.
-    pop_pk_b64: Option<String>,
+    /// If set, requests must include a valid DPoP proof whose JWK thumbprint matches `cnf.jkt`.
+    cnf: Option<CapabilityCnf>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct CapabilityCnf {
+    jkt: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -219,7 +224,7 @@ async fn main() -> anyhow::Result<()> {
         pending_x402: Arc::new(Mutex::new(HashMap::new())),
         pending_l402: Arc::new(Mutex::new(HashMap::new())),
         usage: Arc::new(Mutex::new(HashMap::new())),
-        used_nonces: Arc::new(Mutex::new(HashMap::new())),
+        used_dpop_jtis: Arc::new(Mutex::new(HashMap::new())),
         oauth_codes: Arc::new(Mutex::new(HashMap::new())),
         oauth_refresh: Arc::new(Mutex::new(HashMap::new())),
         oauth_access: Arc::new(Mutex::new(HashMap::new())),
@@ -391,27 +396,103 @@ async fn vc_issue(
     }))
 }
 
-async fn token(State(st): State<AppState>, headers: HeaderMap) -> Response {
-    // Optional PoP pubkey binding (Ed25519 public key, base64url-no-pad).
-    let pop_pk_b64 = match headers
-        .get("x-briefcase-pop-pub")
+fn expected_request_url(headers: &HeaderMap, uri: &Uri) -> Result<Url, StatusCode> {
+    let host = headers
+        .get("host")
         .and_then(|h| h.to_str().ok())
-    {
-        Some(s) if !s.is_empty() => {
-            let ok = decode_b64url(s)
-                .ok()
-                .map(|v| v.len() == 32)
-                .unwrap_or(false);
-            if !ok {
+        .ok_or(StatusCode::BAD_REQUEST)?;
+    let scheme = headers
+        .get("x-forwarded-proto")
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("http");
+
+    let pq = uri
+        .path_and_query()
+        .map(|pq| pq.as_str())
+        .unwrap_or_else(|| uri.path());
+    Url::parse(&format!("{scheme}://{host}{pq}")).map_err(|_| StatusCode::BAD_REQUEST)
+}
+
+fn prune_used_dpop_jtis(used: &mut HashMap<String, i64>) {
+    let now = Utc::now().timestamp();
+    // Capability TTL is 10 minutes; keep DPoP JTIs a bit longer.
+    let cutoff = now - (20 * 60);
+    used.retain(|_, iat| *iat >= cutoff);
+}
+
+async fn token(State(st): State<AppState>, uri: Uri, headers: HeaderMap) -> Response {
+    // Optional DPoP binding: if a valid DPoP proof is present, bind the minted capability to the
+    // proof's JWK thumbprint (cnf.jkt).
+    let cnf_jkt = if let Some(dpop) = headers.get("dpop").and_then(|h| h.to_str().ok()) {
+        let expected_url = match expected_request_url(&headers, &uri) {
+            Ok(u) => u,
+            Err(sc) => {
+                return (sc, Json(serde_json::json!({"error":"invalid_request_url"})))
+                    .into_response();
+            }
+        };
+
+        let jwk = {
+            let mut used = st.used_dpop_jtis.lock().await;
+            prune_used_dpop_jtis(&mut used);
+            match verify_dpop_jwt(dpop, "POST", &expected_url, None, None, &mut used) {
+                Ok(jwk) => jwk,
+                Err(_) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({"error":"invalid_dpop"})),
+                    )
+                        .into_response();
+                }
+            }
+        };
+
+        match jwk_thumbprint_b64url(&jwk) {
+            Ok(jkt) => Some(jkt),
+            Err(_) => {
                 return (
                     StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({"error":"invalid_pop_pubkey"})),
+                    Json(serde_json::json!({"error":"invalid_dpop_jwk"})),
                 )
                     .into_response();
             }
-            Some(s.to_string())
         }
-        _ => None,
+    } else {
+        // Backwards-compatible v1 PoP header: `x-briefcase-pop-pub` (Ed25519 x coordinate).
+        match headers
+            .get("x-briefcase-pop-pub")
+            .and_then(|h| h.to_str().ok())
+        {
+            Some(s) if !s.is_empty() => {
+                let ok = decode_b64url(s)
+                    .ok()
+                    .map(|v| v.len() == 32)
+                    .unwrap_or(false);
+                if !ok {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({"error":"invalid_pop_pubkey"})),
+                    )
+                        .into_response();
+                }
+                let jwk = serde_json::json!({
+                    "kty": "OKP",
+                    "crv": "Ed25519",
+                    "x": s,
+                });
+                match jwk_thumbprint_b64url(&jwk) {
+                    Ok(jkt) => Some(jkt),
+                    Err(_) => {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(serde_json::json!({"error":"invalid_pop_pubkey"})),
+                        )
+                            .into_response();
+                    }
+                }
+            }
+            _ => None,
+        }
     };
 
     // OAuth access token path.
@@ -421,7 +502,7 @@ async fn token(State(st): State<AppState>, headers: HeaderMap) -> Response {
     {
         return (
             StatusCode::OK,
-            Json(issue_capability_jwt(&st, pop_pk_b64.clone())),
+            Json(issue_capability_jwt(&st, cnf_jkt.clone())),
         )
             .into_response();
     }
@@ -432,7 +513,7 @@ async fn token(State(st): State<AppState>, headers: HeaderMap) -> Response {
     {
         return (
             StatusCode::OK,
-            Json(issue_capability_jwt(&st, pop_pk_b64.clone())),
+            Json(issue_capability_jwt(&st, cnf_jkt.clone())),
         )
             .into_response();
     }
@@ -441,14 +522,14 @@ async fn token(State(st): State<AppState>, headers: HeaderMap) -> Response {
     // Preferred: Authorization schemes (more standard).
     if let Some(authz) = headers.get("authorization").and_then(|h| h.to_str().ok()) {
         if let Some(proof) = authz.strip_prefix("X402 ")
-            && let Ok(tok) = issue_token_after_x402(&st, proof, pop_pk_b64.as_deref()).await
+            && let Ok(tok) = issue_token_after_x402(&st, proof, cnf_jkt.as_deref()).await
         {
             return (StatusCode::OK, Json(tok)).into_response();
         };
 
         if let Some(rest) = authz.strip_prefix("L402 ")
             && let Some((mac, pre)) = rest.split_once(':')
-            && let Ok(tok) = issue_token_after_l402(&st, mac, pre, pop_pk_b64.as_deref()).await
+            && let Ok(tok) = issue_token_after_l402(&st, mac, pre, cnf_jkt.as_deref()).await
         {
             return (StatusCode::OK, Json(tok)).into_response();
         }
@@ -456,7 +537,7 @@ async fn token(State(st): State<AppState>, headers: HeaderMap) -> Response {
 
     // Backwards compatible headers.
     if let Some(proof) = headers.get("x-payment-proof").and_then(|h| h.to_str().ok())
-        && let Ok(tok) = issue_token_after_x402(&st, proof, pop_pk_b64.as_deref()).await
+        && let Ok(tok) = issue_token_after_x402(&st, proof, cnf_jkt.as_deref()).await
     {
         return (StatusCode::OK, Json(tok)).into_response();
     }
@@ -464,7 +545,7 @@ async fn token(State(st): State<AppState>, headers: HeaderMap) -> Response {
     if let (Some(mac), Some(pre)) = (
         headers.get("x-l402-macaroon").and_then(|h| h.to_str().ok()),
         headers.get("x-l402-preimage").and_then(|h| h.to_str().ok()),
-    ) && let Ok(tok) = issue_token_after_l402(&st, mac, pre, pop_pk_b64.as_deref()).await
+    ) && let Ok(tok) = issue_token_after_l402(&st, mac, pre, cnf_jkt.as_deref()).await
     {
         return (StatusCode::OK, Json(tok)).into_response();
     }
@@ -545,16 +626,32 @@ async fn quote(
     Query(q): Query<QuoteQuery>,
     headers: HeaderMap,
 ) -> Result<(HeaderMap, Json<serde_json::Value>), StatusCode> {
-    let token = extract_bearer(&headers).ok_or(StatusCode::UNAUTHORIZED)?;
+    let token = extract_access_token(&headers).ok_or(StatusCode::UNAUTHORIZED)?;
     let claims = decode_capability(&st, token).map_err(|_| StatusCode::UNAUTHORIZED)?;
 
     if claims.scope != "quote" {
         return Err(StatusCode::FORBIDDEN);
     }
 
-    // If the capability is PoP-bound, require a DPoP-like signature for every request.
-    if let Some(pk_b64) = claims.pop_pk_b64.as_deref() {
-        verify_pop_request(&st, pk_b64, token, &uri, &headers).await?;
+    // If the capability is DPoP-bound, require a valid DPoP proof for every request.
+    if let Some(cnf) = claims.cnf.as_ref() {
+        let dpop = headers
+            .get("dpop")
+            .and_then(|h| h.to_str().ok())
+            .ok_or(StatusCode::UNAUTHORIZED)?;
+        let expected_url = expected_request_url(&headers, &uri)?;
+
+        let mut used = st.used_dpop_jtis.lock().await;
+        prune_used_dpop_jtis(&mut used);
+        verify_dpop_jwt(
+            dpop,
+            "GET",
+            &expected_url,
+            Some(token),
+            Some(&cnf.jkt),
+            &mut used,
+        )
+        .map_err(|_| StatusCode::UNAUTHORIZED)?;
     }
 
     let mut usage = st.usage.lock().await;
@@ -587,7 +684,7 @@ async fn quote(
 async fn issue_token_after_x402(
     st: &AppState,
     proof: &str,
-    pop_pk_b64: Option<&str>,
+    cnf_jkt: Option<&str>,
 ) -> anyhow::Result<TokenResponse> {
     let (payment_id, sig) = proof.split_once(':').context("invalid proof format")?;
 
@@ -605,14 +702,14 @@ async fn issue_token_after_x402(
     }
     guard.remove(payment_id);
 
-    Ok(issue_capability_jwt(st, pop_pk_b64.map(|s| s.to_string())))
+    Ok(issue_capability_jwt(st, cnf_jkt.map(|s| s.to_string())))
 }
 
 async fn issue_token_after_l402(
     st: &AppState,
     macaroon: &str,
     preimage: &str,
-    pop_pk_b64: Option<&str>,
+    cnf_jkt: Option<&str>,
 ) -> anyhow::Result<TokenResponse> {
     let mut guard = st.pending_l402.lock().await;
     let Some(p) = guard.get(macaroon) else {
@@ -622,10 +719,10 @@ async fn issue_token_after_l402(
         anyhow::bail!("invalid preimage");
     }
     guard.remove(macaroon);
-    Ok(issue_capability_jwt(st, pop_pk_b64.map(|s| s.to_string())))
+    Ok(issue_capability_jwt(st, cnf_jkt.map(|s| s.to_string())))
 }
 
-fn issue_capability_jwt(st: &AppState, pop_pk_b64: Option<String>) -> TokenResponse {
+fn issue_capability_jwt(st: &AppState, cnf_jkt: Option<String>) -> TokenResponse {
     let now = chrono::Utc::now();
     let exp = now + chrono::Duration::minutes(10);
     let claims = CapabilityClaims {
@@ -635,7 +732,7 @@ fn issue_capability_jwt(st: &AppState, pop_pk_b64: Option<String>) -> TokenRespo
         scope: "quote".to_string(),
         max_calls: st.max_calls,
         cost_microusd: st.cost_microusd,
-        pop_pk_b64,
+        cnf: cnf_jkt.map(|jkt| CapabilityCnf { jkt }),
     };
 
     let token = jsonwebtoken::encode(
@@ -665,6 +762,14 @@ fn decode_capability(st: &AppState, token: &str) -> anyhow::Result<CapabilityCla
 
 fn extract_bearer(headers: &HeaderMap) -> Option<&str> {
     let h = headers.get("authorization")?.to_str().ok()?;
+    h.strip_prefix("Bearer ")
+}
+
+fn extract_access_token(headers: &HeaderMap) -> Option<&str> {
+    let h = headers.get("authorization")?.to_str().ok()?;
+    if let Some(v) = h.strip_prefix("DPoP ") {
+        return Some(v);
+    }
     h.strip_prefix("Bearer ")
 }
 
@@ -728,11 +833,6 @@ fn decode_b64url(s: &str) -> Result<Vec<u8>, base64::DecodeError> {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(s)
 }
 
-fn sha256_b64url(msg: &[u8]) -> String {
-    let digest = Sha256::digest(msg);
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest)
-}
-
 fn www_authenticate_for_challenge(challenge: &PaymentChallenge) -> String {
     match challenge {
         PaymentChallenge::X402 {
@@ -762,89 +862,6 @@ fn payment_required_response(challenge: PaymentChallenge) -> Response {
     resp
 }
 
-async fn verify_pop_request(
-    st: &AppState,
-    pk_b64: &str,
-    token: &str,
-    uri: &Uri,
-    headers: &HeaderMap,
-) -> Result<(), StatusCode> {
-    let ver = headers
-        .get("x-briefcase-pop-ver")
-        .and_then(|h| h.to_str().ok())
-        .ok_or(StatusCode::UNAUTHORIZED)?;
-    if ver != "1" {
-        return Err(StatusCode::UNAUTHORIZED);
-    }
-
-    let ts_s = headers
-        .get("x-briefcase-pop-ts")
-        .and_then(|h| h.to_str().ok())
-        .ok_or(StatusCode::UNAUTHORIZED)?;
-    let ts: i64 = ts_s.parse().map_err(|_| StatusCode::UNAUTHORIZED)?;
-
-    let now = Utc::now().timestamp();
-    const MAX_SKEW_SECS: i64 = 120;
-    if (now - ts).abs() > MAX_SKEW_SECS {
-        return Err(StatusCode::UNAUTHORIZED);
-    }
-
-    let nonce = headers
-        .get("x-briefcase-pop-nonce")
-        .and_then(|h| h.to_str().ok())
-        .ok_or(StatusCode::UNAUTHORIZED)?;
-    if nonce.is_empty() || nonce.len() > 128 {
-        return Err(StatusCode::UNAUTHORIZED);
-    }
-
-    let sig_b64 = headers
-        .get("x-briefcase-pop-sig")
-        .and_then(|h| h.to_str().ok())
-        .ok_or(StatusCode::UNAUTHORIZED)?;
-
-    let pk_bytes: [u8; 32] = decode_b64url(pk_b64)
-        .map_err(|_| StatusCode::UNAUTHORIZED)?
-        .try_into()
-        .map_err(|_| StatusCode::UNAUTHORIZED)?;
-    let vk = VerifyingKey::from_bytes(&pk_bytes).map_err(|_| StatusCode::UNAUTHORIZED)?;
-
-    let sig_bytes: [u8; 64] = decode_b64url(sig_b64)
-        .map_err(|_| StatusCode::UNAUTHORIZED)?
-        .try_into()
-        .map_err(|_| StatusCode::UNAUTHORIZED)?;
-    let sig = Signature::from_bytes(&sig_bytes);
-
-    let token_hash_b64 = sha256_b64url(token.as_bytes());
-    let path_and_query = uri
-        .path_and_query()
-        .map(|pq| pq.as_str())
-        .unwrap_or_else(|| uri.path());
-
-    // Signature message:
-    // `v1\n<method>\n<path?query>\n<ts>\n<nonce>\n<sha256_b64url(capability_jwt)>`
-    let msg = format!("v1\nGET\n{path_and_query}\n{ts_s}\n{nonce}\n{token_hash_b64}");
-    vk.verify(msg.as_bytes(), &sig)
-        .map_err(|_| StatusCode::UNAUTHORIZED)?;
-
-    // Replay defense: `${token_hash}:${nonce}` must be unique.
-    let key = format!("{token_hash_b64}:{nonce}");
-    let now_dt = Utc::now();
-    {
-        let mut guard = st.used_nonces.lock().await;
-
-        // Opportunistic pruning. Capability TTL is 10 minutes; keep a bit longer.
-        let cutoff = now_dt - chrono::Duration::minutes(20);
-        guard.retain(|_, seen_at| *seen_at > cutoff);
-
-        if guard.contains_key(&key) {
-            return Err(StatusCode::UNAUTHORIZED);
-        }
-        guard.insert(key, now_dt);
-    }
-
-    Ok(())
-}
-
 fn hmac_b64url(secret: &[u8], msg: &[u8]) -> String {
     let mut mac = HmacSha256::new_from_slice(secret).expect("hmac key");
     mac.update(msg);
@@ -859,6 +876,136 @@ mod tests {
     use axum::routing::{get, post};
     use ed25519_dalek::{Signer as _, SigningKey};
 
+    fn b64url(bytes: &[u8]) -> String {
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+    }
+
+    fn dpop_proof_eddsa_with(
+        sk: &SigningKey,
+        htu: &Url,
+        method: &str,
+        access_token: Option<&str>,
+        iat: i64,
+        jti: &str,
+    ) -> String {
+        let mut u = htu.clone();
+        u.set_fragment(None);
+
+        let jwk = serde_json::json!({
+            "kty": "OKP",
+            "crv": "Ed25519",
+            "x": b64url(sk.verifying_key().as_bytes()),
+        });
+        let header = serde_json::json!({
+            "typ": "dpop+jwt",
+            "alg": "EdDSA",
+            "jwk": jwk,
+        });
+
+        let mut claims = serde_json::Map::new();
+        claims.insert("htu".to_string(), serde_json::Value::String(u.to_string()));
+        claims.insert(
+            "htm".to_string(),
+            serde_json::Value::String(method.to_uppercase()),
+        );
+        claims.insert("iat".to_string(), serde_json::Value::Number(iat.into()));
+        claims.insert(
+            "jti".to_string(),
+            serde_json::Value::String(jti.to_string()),
+        );
+        if let Some(at) = access_token {
+            claims.insert(
+                "ath".to_string(),
+                serde_json::Value::String(briefcase_dpop::sha256_b64url(at.as_bytes())),
+            );
+        }
+        let payload = serde_json::Value::Object(claims);
+
+        let header_b64 = b64url(&serde_json::to_vec(&header).expect("header json"));
+        let payload_b64 = b64url(&serde_json::to_vec(&payload).expect("payload json"));
+        let signing_input = format!("{header_b64}.{payload_b64}");
+        let sig = sk.sign(signing_input.as_bytes()).to_bytes();
+        let sig_b64 = b64url(&sig);
+        format!("{signing_input}.{sig_b64}")
+    }
+
+    fn dpop_proof_eddsa(
+        sk: &SigningKey,
+        htu: &Url,
+        method: &str,
+        access_token: Option<&str>,
+    ) -> String {
+        let iat = Utc::now().timestamp();
+        let jti = Uuid::new_v4().to_string();
+        dpop_proof_eddsa_with(sk, htu, method, access_token, iat, &jti)
+    }
+
+    fn dpop_proof_es256_with(
+        sk: &p256::ecdsa::SigningKey,
+        htu: &Url,
+        method: &str,
+        access_token: Option<&str>,
+        iat: i64,
+        jti: &str,
+    ) -> String {
+        let mut u = htu.clone();
+        u.set_fragment(None);
+
+        let pk = sk.verifying_key();
+        let point = pk.to_encoded_point(false);
+        let x = point.x().expect("p256 x");
+        let y = point.y().expect("p256 y");
+
+        let jwk = serde_json::json!({
+            "kty": "EC",
+            "crv": "P-256",
+            "x": b64url(x),
+            "y": b64url(y),
+        });
+        let header = serde_json::json!({
+            "typ": "dpop+jwt",
+            "alg": "ES256",
+            "jwk": jwk,
+        });
+
+        let mut claims = serde_json::Map::new();
+        claims.insert("htu".to_string(), serde_json::Value::String(u.to_string()));
+        claims.insert(
+            "htm".to_string(),
+            serde_json::Value::String(method.to_uppercase()),
+        );
+        claims.insert("iat".to_string(), serde_json::Value::Number(iat.into()));
+        claims.insert(
+            "jti".to_string(),
+            serde_json::Value::String(jti.to_string()),
+        );
+        if let Some(at) = access_token {
+            claims.insert(
+                "ath".to_string(),
+                serde_json::Value::String(briefcase_dpop::sha256_b64url(at.as_bytes())),
+            );
+        }
+        let payload = serde_json::Value::Object(claims);
+
+        let header_b64 = b64url(&serde_json::to_vec(&header).expect("header json"));
+        let payload_b64 = b64url(&serde_json::to_vec(&payload).expect("payload json"));
+        let signing_input = format!("{header_b64}.{payload_b64}");
+        let sig: p256::ecdsa::Signature = sk.sign(signing_input.as_bytes());
+        let sig_b64 = b64url(&sig.to_bytes());
+        format!("{signing_input}.{sig_b64}")
+    }
+
+    fn dpop_proof_es256(
+        sk: &p256::ecdsa::SigningKey,
+        htu: &Url,
+        method: &str,
+        access_token: Option<&str>,
+    ) -> String {
+        let iat = Utc::now().timestamp();
+        let jti = Uuid::new_v4().to_string();
+        dpop_proof_es256_with(sk, htu, method, access_token, iat, &jti)
+    }
+
     async fn start_test_server() -> anyhow::Result<(String, tokio::task::JoinHandle<()>)> {
         let st = AppState {
             secret: b"test-secret".to_vec(),
@@ -867,7 +1014,7 @@ mod tests {
             pending_x402: Arc::new(Mutex::new(HashMap::new())),
             pending_l402: Arc::new(Mutex::new(HashMap::new())),
             usage: Arc::new(Mutex::new(HashMap::new())),
-            used_nonces: Arc::new(Mutex::new(HashMap::new())),
+            used_dpop_jtis: Arc::new(Mutex::new(HashMap::new())),
             oauth_codes: Arc::new(Mutex::new(HashMap::new())),
             oauth_refresh: Arc::new(Mutex::new(HashMap::new())),
             oauth_access: Arc::new(Mutex::new(HashMap::new())),
@@ -903,13 +1050,12 @@ mod tests {
         // Generate a deterministic client keypair.
         let seed = [7u8; 32];
         let sk = SigningKey::from_bytes(&seed);
-        let pk_b64 =
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sk.verifying_key().as_bytes());
+        let token_url = Url::parse(&format!("{base_url}/token"))?;
 
         // Request a token: expect a 402 challenge.
         let resp = http
-            .post(format!("{base_url}/token"))
-            .header("x-briefcase-pop-pub", &pk_b64)
+            .post(token_url.as_str())
+            .header("DPoP", dpop_proof_eddsa(&sk, &token_url, "POST", None))
             .send()
             .await?;
         assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
@@ -940,8 +1086,8 @@ mod tests {
 
         // Token after payment: should be PoP-bound.
         let cap = http
-            .post(format!("{base_url}/token"))
-            .header("x-briefcase-pop-pub", &pk_b64)
+            .post(token_url.as_str())
+            .header("DPoP", dpop_proof_eddsa(&sk, &token_url, "POST", None))
             .header(reqwest::header::AUTHORIZATION, format!("X402 {proof}"))
             .send()
             .await?
@@ -951,40 +1097,118 @@ mod tests {
             .token;
 
         // Without PoP headers, quote is rejected.
+        let quote_url = Url::parse(&format!("{base_url}/api/quote?symbol=TEST"))?;
         let resp = http
-            .get(format!("{base_url}/api/quote?symbol=TEST"))
+            .get(quote_url.as_str())
             .bearer_auth(&cap)
             .send()
             .await?;
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 
-        // With correct PoP headers, quote succeeds.
-        let ts = Utc::now().timestamp().to_string();
-        let nonce = "nonce123".to_string();
-        let token_hash_b64 = sha256_b64url(cap.as_bytes());
-        let msg = format!("v1\nGET\n/api/quote?symbol=TEST\n{ts}\n{nonce}\n{token_hash_b64}");
-        let sig_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .encode(sk.sign(msg.as_bytes()).to_bytes());
+        // With correct DPoP proof, quote succeeds.
+        let iat = Utc::now().timestamp();
+        let jti = "replay1";
+        let dpop = dpop_proof_eddsa_with(&sk, &quote_url, "GET", Some(&cap), iat, jti);
 
         let resp = http
-            .get(format!("{base_url}/api/quote?symbol=TEST"))
-            .bearer_auth(&cap)
-            .header("x-briefcase-pop-ver", "1")
-            .header("x-briefcase-pop-ts", &ts)
-            .header("x-briefcase-pop-nonce", &nonce)
-            .header("x-briefcase-pop-sig", &sig_b64)
+            .get(quote_url.as_str())
+            .header(reqwest::header::AUTHORIZATION, format!("DPoP {cap}"))
+            .header("DPoP", &dpop)
             .send()
             .await?;
         assert_eq!(resp.status(), StatusCode::OK);
 
-        // Replay the same nonce: rejected.
+        // Replay the same DPoP proof: rejected.
         let resp = http
-            .get(format!("{base_url}/api/quote?symbol=TEST"))
-            .bearer_auth(&cap)
-            .header("x-briefcase-pop-ver", "1")
-            .header("x-briefcase-pop-ts", &ts)
-            .header("x-briefcase-pop-nonce", &nonce)
-            .header("x-briefcase-pop-sig", &sig_b64)
+            .get(quote_url.as_str())
+            .header(reqwest::header::AUTHORIZATION, format!("DPoP {cap}"))
+            .header("DPoP", &dpop)
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pop_binding_accepts_es256_and_prevents_replay() -> anyhow::Result<()> {
+        let (base_url, handle) = start_test_server().await?;
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()?;
+
+        // Deterministic P-256 private key.
+        let seed = [1u8; 32];
+        let secret = p256::SecretKey::from_slice(&seed).expect("p256 secret");
+        let sk = p256::ecdsa::SigningKey::from(secret);
+
+        let token_url = Url::parse(&format!("{base_url}/token"))?;
+
+        // Request a token: expect a 402 challenge.
+        let resp = http
+            .post(token_url.as_str())
+            .header("DPoP", dpop_proof_es256(&sk, &token_url, "POST", None))
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+        let ch = resp.json::<PaymentChallenge>().await?;
+        let PaymentChallenge::X402 {
+            payment_id,
+            payment_url,
+            ..
+        } = ch
+        else {
+            anyhow::bail!("expected x402 challenge");
+        };
+
+        // Pay.
+        let pay_url = if payment_url.starts_with("http") {
+            payment_url
+        } else {
+            format!("{base_url}{payment_url}")
+        };
+        let proof = http
+            .post(pay_url)
+            .json(&PayRequest { payment_id })
+            .send()
+            .await?
+            .json::<PayResponse>()
+            .await?
+            .proof;
+
+        // Token after payment: should be PoP-bound.
+        let cap = http
+            .post(token_url.as_str())
+            .header("DPoP", dpop_proof_es256(&sk, &token_url, "POST", None))
+            .header(reqwest::header::AUTHORIZATION, format!("X402 {proof}"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<TokenResponse>()
+            .await?
+            .token;
+
+        let quote_url = Url::parse(&format!("{base_url}/api/quote?symbol=TEST"))?;
+
+        // With correct DPoP proof, quote succeeds.
+        let iat = Utc::now().timestamp();
+        let jti = "replay_es256_1";
+        let dpop = dpop_proof_es256_with(&sk, &quote_url, "GET", Some(&cap), iat, jti);
+
+        let resp = http
+            .get(quote_url.as_str())
+            .header(reqwest::header::AUTHORIZATION, format!("DPoP {cap}"))
+            .header("DPoP", &dpop)
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Replay the same DPoP proof: rejected.
+        let resp = http
+            .get(quote_url.as_str())
+            .header(reqwest::header::AUTHORIZATION, format!("DPoP {cap}"))
+            .header("DPoP", &dpop)
             .send()
             .await?;
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
