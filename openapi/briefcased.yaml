@@ -85,12 +85,14 @@ components:
 
     McpServerSummary:
       type: object
-      required: [id, endpoint_url]
+      required: [id, endpoint_url, has_oauth_refresh]
       properties:
         id:
           type: string
         endpoint_url:
           type: string
+        has_oauth_refresh:
+          type: boolean
 
     ListMcpServersResponse:
       type: object

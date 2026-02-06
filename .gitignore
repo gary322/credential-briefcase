@@ -5,6 +5,9 @@
 # Node (if added later)
 node_modules
 
+# Browser extension build output
+apps/briefcase-extension/extension/dist
+
 # OS / editors
 .DS_Store
 .idea
@@ -15,4 +18,3 @@ node_modules
 
 # Logs
 *.log
-

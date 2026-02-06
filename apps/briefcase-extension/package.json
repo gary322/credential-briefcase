@@ -6,14 +6,16 @@
   "type": "module",
   "scripts": {
     "gen": "openapi-typescript ../../openapi/briefcased.yaml -o src/gen/briefcased.ts",
+    "build": "node scripts/build.mjs",
     "lint": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run"
   },
   "devDependencies": {
+    "@types/chrome": "^0.0.268",
     "@types/node": "^20.11.30",
+    "esbuild": "^0.24.0",
     "openapi-typescript": "^6.7.6",
     "typescript": "^5.4.5",
     "vitest": "^1.6.0"
   }
 }
-

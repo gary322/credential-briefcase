@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Credential Briefcase</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <main>
+      <h1>Credential Briefcase</h1>
+      <div id="status" class="status"></div>
+
+      <section class="card">
+        <h2>Add Remote MCP Server</h2>
+        <form id="add-server-form">
+          <label>
+            Server ID
+            <input id="server-id" name="server_id" type="text" required maxlength="64" />
+          </label>
+          <label>
+            Endpoint URL
+            <input
+              id="endpoint-url"
+              name="endpoint_url"
+              type="url"
+              required
+              placeholder="https://example.com/mcp"
+            />
+          </label>
+          <button type="submit">Add Server</button>
+        </form>
+      </section>
+
+      <section class="card">
+        <h2>Servers</h2>
+        <div id="servers" class="servers"></div>
+      </section>
+    </main>
+
+    <script type="module" src="dist/popup.js"></script>
+  </body>
+</html>
+

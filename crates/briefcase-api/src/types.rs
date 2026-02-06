@@ -35,6 +35,7 @@ pub struct DeleteProviderResponse {
 pub struct McpServerSummary {
     pub id: String,
     pub endpoint_url: String,
+    pub has_oauth_refresh: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

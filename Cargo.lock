@@ -2811,6 +2811,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "native-messaging-host"
+version = "0.1.4"
+dependencies = [
+ "anyhow",
+ "axum",
+ "briefcase-api",
+ "clap",
+ "directories",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "new_debug_unreachable"
 version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"

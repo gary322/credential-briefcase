@@ -388,13 +388,21 @@ async fn delete_provider(
 
 async fn list_mcp_servers(State(state): State<AppState>) -> Json<ListMcpServersResponse> {
     let rows = state.db.list_remote_mcp_servers().await.unwrap_or_default();
-    let servers = rows
-        .into_iter()
-        .map(|r| briefcase_api::types::McpServerSummary {
+    let mut servers = Vec::new();
+    for r in rows {
+        let has_oauth_refresh = state
+            .secrets
+            .get(&format!("oauth.mcp.{}.refresh_token", r.id))
+            .await
+            .ok()
+            .flatten()
+            .is_some();
+        servers.push(briefcase_api::types::McpServerSummary {
             id: r.id,
             endpoint_url: r.endpoint_url,
-        })
-        .collect::<Vec<_>>();
+            has_oauth_refresh,
+        });
+    }
     Json(ListMcpServersResponse { servers })
 }
 
@@ -416,9 +424,16 @@ async fn upsert_mcp_server(
         .await
         .map_err(internal_error)?;
 
+    let has_oauth_refresh = state
+        .secrets
+        .get(&format!("oauth.mcp.{id}.refresh_token"))
+        .await
+        .map_err(internal_error)?
+        .is_some();
     Ok(Json(briefcase_api::types::McpServerSummary {
         id,
         endpoint_url,
+        has_oauth_refresh,
     }))
 }
 
@@ -3081,6 +3096,61 @@ mod tests {
             token_calls, 2,
             "expected code exchange + refresh token grant"
         );
+
+        daemon_task.abort();
+        secure_task.abort();
+        provider_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn list_mcp_servers_reflects_oauth_connection_status() -> anyhow::Result<()> {
+        let (provider_addr, _provider_state, provider_task) = start_mock_provider().await?;
+        let provider_base_url = format!("http://{provider_addr}");
+
+        let (secure_addr, _oauth_state, secure_task) = start_mock_oauth_protected_mcp().await?;
+        let secure_endpoint = format!("http://{secure_addr}/mcp");
+
+        let (_state, _daemon_base, client, daemon_task) = start_daemon(provider_base_url).await?;
+
+        client
+            .upsert_mcp_server("secure_status1", secure_endpoint.clone())
+            .await?;
+
+        let before = client.list_mcp_servers().await?.servers;
+        let b = before
+            .iter()
+            .find(|s| s.id == "secure_status1")
+            .context("server missing from list")?;
+        assert!(!b.has_oauth_refresh, "expected oauth disconnected");
+
+        let started = client
+            .mcp_oauth_start(
+                "secure_status1",
+                McpOAuthStartRequest {
+                    client_id: "briefcase-cli".to_string(),
+                    redirect_uri: "http://127.0.0.1/callback".to_string(),
+                    scope: Some("mcp.read".to_string()),
+                },
+            )
+            .await?;
+
+        client
+            .mcp_oauth_exchange(
+                "secure_status1",
+                McpOAuthExchangeRequest {
+                    code: "code_mock".to_string(),
+                    state: started.state,
+                },
+            )
+            .await?;
+
+        let after = client.list_mcp_servers().await?.servers;
+        let a = after
+            .iter()
+            .find(|s| s.id == "secure_status1")
+            .context("server missing from list")?;
+        assert!(a.has_oauth_refresh, "expected oauth connected");
 
         daemon_task.abort();
         secure_task.abort();

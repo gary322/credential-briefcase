@@ -127,6 +127,7 @@ export interface components {
     McpServerSummary: {
       id: string;
       endpoint_url: string;
+      has_oauth_refresh: boolean;
     };
     ListMcpServersResponse: {
       servers: components["schemas"]["McpServerSummary"][];

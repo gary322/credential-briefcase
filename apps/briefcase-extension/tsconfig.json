@@ -5,9 +5,8 @@
     "moduleResolution": "Bundler",
     "strict": true,
     "noEmit": true,
-    "types": ["node"],
+    "types": ["node", "chrome"],
     "skipLibCheck": true
   },
   "include": ["src/**/*.ts", "vitest.config.ts"]
 }
-

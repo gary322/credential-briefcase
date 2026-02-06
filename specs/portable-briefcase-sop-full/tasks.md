@@ -90,7 +90,7 @@ For each task, include:
   - **Done when**: integration tests pass for DPoP-bound token flow against stub provider.
   - **Verify**: `cargo test -p briefcased oauth_dpop_*`
 
-- [ ] 2.3 Add extension-driven OAuth UX (no secrets in extension)
+- [x] 2.3 Add extension-driven OAuth UX (no secrets in extension)
   - **Do**: daemon exposes onboarding state; extension opens auth URL and returns code; daemon exchanges for tokens; refresh tokens stored only in daemon secrets store.
   - **Files**: `apps/briefcase-extension/*`, `apps/native-messaging-host/*`, `apps/briefcased/src/app.rs`
   - **Done when**: OAuth onboarding can be completed without CLI copy/paste; refresh token never leaves daemon.
