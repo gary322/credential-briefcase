@@ -83,6 +83,38 @@ components:
         provider_id:
           type: string
 
+    McpServerSummary:
+      type: object
+      required: [id, endpoint_url]
+      properties:
+        id:
+          type: string
+        endpoint_url:
+          type: string
+
+    ListMcpServersResponse:
+      type: object
+      required: [servers]
+      properties:
+        servers:
+          type: array
+          items:
+            $ref: "#/components/schemas/McpServerSummary"
+
+    UpsertMcpServerRequest:
+      type: object
+      required: [endpoint_url]
+      properties:
+        endpoint_url:
+          type: string
+
+    DeleteMcpServerResponse:
+      type: object
+      required: [server_id]
+      properties:
+        server_id:
+          type: string
+
     OAuthExchangeRequest:
       type: object
       required: [code, redirect_uri, client_id, code_verifier]
@@ -488,6 +520,90 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
 
+  /v1/mcp/servers:
+    get:
+      summary: List remote MCP servers
+      operationId: listMcpServers
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ListMcpServersResponse"
+        "401":
+          description: unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /v1/mcp/servers/{id}:
+    post:
+      summary: Upsert a remote MCP server endpoint
+      operationId: upsertMcpServer
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpsertMcpServerRequest"
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/McpServerSummary"
+        "400":
+          description: bad request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "401":
+          description: unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /v1/mcp/servers/{id}/delete:
+    post:
+      summary: Delete a remote MCP server
+      operationId: deleteMcpServer
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeleteMcpServerResponse"
+        "401":
+          description: unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
   /v1/providers/{id}/oauth/exchange:
     post:
       summary: Exchange OAuth authorization code for refresh token (stored in daemon)
@@ -767,4 +883,3 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
-

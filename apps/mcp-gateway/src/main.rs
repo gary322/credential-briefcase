@@ -1,14 +1,29 @@
+use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::Context as _;
+use axum::Router;
+use axum::extract::State;
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::routing::post;
 use briefcase_api::types::{CallToolRequest, CallToolResponse};
 use briefcase_api::{BriefcaseClient, DaemonEndpoint};
 use briefcase_core::{ToolCall, ToolCallContext};
+use briefcase_mcp::{
+    CallToolParams, CallToolResult, ContentBlock, JsonRpcError, JsonRpcId, JsonRpcMessage,
+    JsonRpcRequest, JsonRpcResponse, ListToolsParams, ListToolsResult, McpConnection, McpHandler,
+    McpServerConfig, Tool,
+};
 use clap::Parser;
 use directories::ProjectDirs;
-use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
-use tracing::{error, info, warn};
+use tokio::sync::Mutex;
+use tower_http::trace::TraceLayer;
+use tracing::info;
 use uuid::Uuid;
 
 #[derive(Debug, Parser)]
@@ -33,32 +48,101 @@ struct Args {
     /// Override the daemon auth token (otherwise read from <data_dir>/auth_token).
     #[arg(long, env = "BRIEFCASE_AUTH_TOKEN")]
     auth_token: Option<String>,
+
+    /// Listen on HTTP using MCP Streamable HTTP transport.
+    #[arg(long, env = "BRIEFCASE_MCP_HTTP_ADDR")]
+    http_addr: Option<SocketAddr>,
+
+    /// HTTP path for MCP Streamable HTTP endpoint.
+    #[arg(long, env = "BRIEFCASE_MCP_HTTP_PATH", default_value = "/mcp")]
+    http_path: String,
+
+    /// Disable stdio transport (use HTTP only).
+    #[arg(long, env = "BRIEFCASE_MCP_NO_STDIO", default_value_t = false)]
+    no_stdio: bool,
 }
 
-#[derive(Debug, Deserialize)]
-struct RpcRequest {
-    jsonrpc: String,
-    id: Option<serde_json::Value>,
-    method: String,
-    params: Option<serde_json::Value>,
+struct GatewayHandler {
+    client: BriefcaseClient,
 }
 
-#[derive(Debug, Serialize)]
-struct RpcResponse {
-    jsonrpc: &'static str,
-    id: Option<serde_json::Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    result: Option<serde_json::Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<RpcError>,
+#[async_trait::async_trait]
+impl McpHandler for GatewayHandler {
+    async fn list_tools(&self, _params: ListToolsParams) -> anyhow::Result<ListToolsResult> {
+        let list = self.client.list_tools().await?;
+        let tools = list
+            .tools
+            .into_iter()
+            .map(|t| Tool {
+                name: t.id,
+                title: Some(t.name),
+                description: Some(t.description),
+                input_schema: t.input_schema,
+            })
+            .collect::<Vec<_>>();
+        Ok(ListToolsResult {
+            tools,
+            next_cursor: None,
+        })
+    }
+
+    async fn call_tool(&self, params: CallToolParams) -> anyhow::Result<CallToolResult> {
+        let args = params.arguments.unwrap_or_else(|| serde_json::json!({}));
+        let call = ToolCall {
+            tool_id: params.name,
+            args,
+            context: ToolCallContext::new(),
+            approval_token: None,
+        };
+
+        let resp = self.client.call_tool(CallToolRequest { call }).await?;
+        Ok(match resp {
+            CallToolResponse::Ok { result } => {
+                let pretty = serde_json::to_string_pretty(&result.content)
+                    .unwrap_or_else(|_| result.content.to_string());
+                CallToolResult {
+                    content: vec![ContentBlock::Text { text: pretty }],
+                    structured_content: Some(result.content),
+                    is_error: Some(false),
+                    meta: Some(serde_json::json!({ "provenance": result.provenance })),
+                }
+            }
+            CallToolResponse::ApprovalRequired { approval } => CallToolResult {
+                content: vec![ContentBlock::Text {
+                    text: format!(
+                        "Approval required for tool `{}`: {}. Approval ID: {}. Approve via `briefcase approvals approve {}`.",
+                        approval.tool_id, approval.reason, approval.id, approval.id
+                    ),
+                }],
+                structured_content: None,
+                is_error: Some(true),
+                meta: Some(serde_json::json!({ "approval": approval })),
+            },
+            CallToolResponse::Denied { reason } => CallToolResult {
+                content: vec![ContentBlock::Text {
+                    text: format!("Denied: {reason}"),
+                }],
+                structured_content: None,
+                is_error: Some(true),
+                meta: None,
+            },
+            CallToolResponse::Error { message } => CallToolResult {
+                content: vec![ContentBlock::Text {
+                    text: format!("Error: {message}"),
+                }],
+                structured_content: None,
+                is_error: Some(true),
+                meta: None,
+            },
+        })
+    }
 }
 
-#[derive(Debug, Serialize)]
-struct RpcError {
-    code: i64,
-    message: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    data: Option<serde_json::Value>,
+#[derive(Clone)]
+struct HttpState {
+    cfg: McpServerConfig,
+    handler: Arc<dyn McpHandler>,
+    sessions: Arc<Mutex<HashMap<String, McpConnection>>>,
 }
 
 #[tokio::main]
@@ -102,11 +186,38 @@ async fn main() -> anyhow::Result<()> {
     client.health().await.context("connect to daemon")?;
     info!("connected to briefcased");
 
-    run_rpc_loop(client).await?;
+    let handler: Arc<dyn McpHandler> = Arc::new(GatewayHandler { client });
+    let cfg =
+        McpServerConfig::default_for_binary("briefcase-mcp-gateway", env!("CARGO_PKG_VERSION"));
+
+    let http_task = if let Some(addr) = args.http_addr {
+        let st = HttpState {
+            cfg: cfg.clone(),
+            handler: handler.clone(),
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+        };
+        let path = args.http_path.clone();
+        Some(tokio::spawn(
+            async move { serve_http(addr, path, st).await },
+        ))
+    } else {
+        None
+    };
+
+    if !args.no_stdio {
+        run_stdio(cfg, handler).await?;
+    }
+
+    if let Some(t) = http_task {
+        t.await.context("http task join")??;
+    }
+
     Ok(())
 }
 
-async fn run_rpc_loop(client: BriefcaseClient) -> anyhow::Result<()> {
+async fn run_stdio(cfg: McpServerConfig, handler: Arc<dyn McpHandler>) -> anyhow::Result<()> {
+    let mut conn = McpConnection::new(cfg, handler);
+
     let stdin = tokio::io::stdin();
     let mut lines = BufReader::new(stdin).lines();
     let mut stdout = tokio::io::stdout();
@@ -115,185 +226,230 @@ async fn run_rpc_loop(client: BriefcaseClient) -> anyhow::Result<()> {
         if line.trim().is_empty() {
             continue;
         }
-        let req: RpcRequest = match serde_json::from_str(&line) {
-            Ok(r) => r,
+
+        let val: Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
             Err(e) => {
-                error!(error = %e, "invalid json");
+                let resp = JsonRpcResponse::err(
+                    JsonRpcId::Null,
+                    JsonRpcError {
+                        code: -32700,
+                        message: "parse error".to_string(),
+                        data: Some(serde_json::json!({ "detail": e.to_string() })),
+                    },
+                );
+                write_jsonrpc(&mut stdout, &resp).await?;
                 continue;
             }
         };
 
-        let resp = handle_rpc(&client, req).await;
-        let out = serde_json::to_string(&resp)?;
-        stdout.write_all(out.as_bytes()).await?;
-        stdout.write_all(b"\n").await?;
-        stdout.flush().await?;
+        if val.is_array() {
+            let resp = JsonRpcResponse::err(
+                JsonRpcId::Null,
+                JsonRpcError {
+                    code: -32600,
+                    message: "batching not supported".to_string(),
+                    data: None,
+                },
+            );
+            write_jsonrpc(&mut stdout, &resp).await?;
+            continue;
+        }
+
+        let msg: JsonRpcMessage = match serde_json::from_value(val) {
+            Ok(m) => m,
+            Err(e) => {
+                let resp = JsonRpcResponse::err(
+                    JsonRpcId::Null,
+                    JsonRpcError {
+                        code: -32600,
+                        message: "invalid request".to_string(),
+                        data: Some(serde_json::json!({ "detail": e.to_string() })),
+                    },
+                );
+                write_jsonrpc(&mut stdout, &resp).await?;
+                continue;
+            }
+        };
+
+        if let Some(resp) = conn.handle_message(msg).await {
+            write_jsonrpc(&mut stdout, &resp).await?;
+        }
     }
 
     Ok(())
 }
 
-async fn handle_rpc(client: &BriefcaseClient, req: RpcRequest) -> RpcResponse {
-    // Minimal MCP-like JSON-RPC surface:
-    // - initialize
-    // - tools/list
-    // - tools/call
-    if req.jsonrpc != "2.0" {
-        return RpcResponse {
-            jsonrpc: "2.0",
-            id: req.id,
-            result: None,
-            error: Some(RpcError {
+async fn write_jsonrpc(
+    stdout: &mut tokio::io::Stdout,
+    resp: &JsonRpcResponse,
+) -> anyhow::Result<()> {
+    let out = serde_json::to_string(resp)?;
+    stdout.write_all(out.as_bytes()).await?;
+    stdout.write_all(b"\n").await?;
+    stdout.flush().await?;
+    Ok(())
+}
+
+async fn serve_http(addr: SocketAddr, path: String, st: HttpState) -> anyhow::Result<()> {
+    let app = Router::new()
+        .route(&path, post(http_post).delete(http_delete).get(http_get))
+        .layer(TraceLayer::new_for_http())
+        .with_state(st);
+
+    info!(addr = %addr, path = %path, "starting MCP HTTP server");
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("bind {addr}"))?;
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+async fn http_get() -> impl IntoResponse {
+    // Optional SSE stream is not implemented for this gateway (no server-initiated messages).
+    (StatusCode::METHOD_NOT_ALLOWED, "sse not supported")
+}
+
+async fn http_delete(State(st): State<HttpState>, headers: HeaderMap) -> impl IntoResponse {
+    let Some(sid) = header_str(&headers, "mcp-session-id") else {
+        return (StatusCode::BAD_REQUEST, "missing mcp-session-id").into_response();
+    };
+    st.sessions.lock().await.remove(sid);
+    StatusCode::ACCEPTED.into_response()
+}
+
+async fn http_post(State(st): State<HttpState>, headers: HeaderMap, body: String) -> Response {
+    if let Err((code, msg)) = validate_origin(&headers) {
+        return (code, msg).into_response();
+    }
+
+    // Reject unsupported protocol version header values (spec requires 400).
+    if let Some(v) = header_str(&headers, "mcp-protocol-version") {
+        if v.trim().is_empty() {
+            return (StatusCode::BAD_REQUEST, "invalid mcp-protocol-version").into_response();
+        }
+    }
+
+    let val: Value = match serde_json::from_str(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            let resp = JsonRpcResponse::err(
+                JsonRpcId::Null,
+                JsonRpcError {
+                    code: -32700,
+                    message: "parse error".to_string(),
+                    data: Some(serde_json::json!({ "detail": e.to_string() })),
+                },
+            );
+            return jsonrpc_http_response(resp, None);
+        }
+    };
+
+    if val.is_array() {
+        let resp = JsonRpcResponse::err(
+            JsonRpcId::Null,
+            JsonRpcError {
                 code: -32600,
-                message: "invalid jsonrpc version".to_string(),
+                message: "batching not supported".to_string(),
                 data: None,
-            }),
+            },
+        );
+        return jsonrpc_http_response(resp, None);
+    }
+
+    let msg: JsonRpcMessage = match serde_json::from_value(val) {
+        Ok(m) => m,
+        Err(e) => {
+            let resp = JsonRpcResponse::err(
+                JsonRpcId::Null,
+                JsonRpcError {
+                    code: -32600,
+                    message: "invalid request".to_string(),
+                    data: Some(serde_json::json!({ "detail": e.to_string() })),
+                },
+            );
+            return jsonrpc_http_response(resp, None);
+        }
+    };
+
+    // Initialize starts a new session.
+    if let JsonRpcMessage::Request(JsonRpcRequest { method, .. }) = &msg
+        && method == "initialize"
+    {
+        let sid = Uuid::new_v4().to_string();
+        let mut conn = McpConnection::new(st.cfg.clone(), st.handler.clone());
+        let resp = conn.handle_message(msg).await;
+        st.sessions.lock().await.insert(sid.clone(), conn);
+        return match resp {
+            Some(r) => jsonrpc_http_response(r, Some(&sid)),
+            None => StatusCode::ACCEPTED.into_response(),
         };
     }
 
-    match req.method.as_str() {
-        "initialize" => RpcResponse {
-            jsonrpc: "2.0",
-            id: req.id,
-            result: Some(serde_json::json!({
-                "serverInfo": { "name": "briefcase-mcp-gateway", "version": env!("CARGO_PKG_VERSION") },
-                "capabilities": { "tools": {} },
-            })),
-            error: None,
-        },
-        "tools/list" => match client.list_tools().await {
-            Ok(list) => {
-                let tools = list
-                    .tools
-                    .into_iter()
-                    .map(|t| {
-                        serde_json::json!({
-                            "name": t.id,
-                            "description": t.description,
-                            "inputSchema": t.input_schema,
-                        })
-                    })
-                    .collect::<Vec<_>>();
+    // Other messages require a session.
+    let Some(sid) = header_str(&headers, "mcp-session-id") else {
+        return (StatusCode::BAD_REQUEST, "missing mcp-session-id").into_response();
+    };
 
-                RpcResponse {
-                    jsonrpc: "2.0",
-                    id: req.id,
-                    result: Some(serde_json::json!({ "tools": tools })),
-                    error: None,
-                }
-            }
-            Err(e) => RpcResponse {
-                jsonrpc: "2.0",
-                id: req.id,
-                result: None,
-                error: Some(RpcError {
-                    code: -32000,
-                    message: "daemon_error".to_string(),
-                    data: Some(serde_json::json!({ "detail": e.to_string() })),
-                }),
-            },
-        },
-        "tools/call" => {
-            let Some(params) = req.params else {
-                return RpcResponse {
-                    jsonrpc: "2.0",
-                    id: req.id,
-                    result: None,
-                    error: Some(RpcError {
-                        code: -32602,
-                        message: "missing params".to_string(),
-                        data: None,
-                    }),
-                };
-            };
+    let mut sessions = st.sessions.lock().await;
+    let Some(conn) = sessions.get_mut(sid) else {
+        return (StatusCode::NOT_FOUND, "unknown mcp-session-id").into_response();
+    };
 
-            let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
-            let arguments = params
-                .get("arguments")
-                .cloned()
-                .unwrap_or(serde_json::json!({}));
-
-            let call = ToolCall {
-                tool_id: name.to_string(),
-                args: arguments,
-                context: ToolCallContext {
-                    request_id: Uuid::new_v4(),
-                    agent_id: None,
-                    session_id: None,
-                },
-                approval_token: None,
-            };
-
-            match client.call_tool(CallToolRequest { call }).await {
-                Ok(CallToolResponse::Ok { result }) => RpcResponse {
-                    jsonrpc: "2.0",
-                    id: req.id,
-                    result: Some(serde_json::json!({
-                        "content": [
-                            { "type": "text", "text": serde_json::to_string_pretty(&result.content).unwrap_or_else(|_| result.content.to_string()) }
-                        ],
-                        "meta": {
-                            "provenance": result.provenance
-                        }
-                    })),
-                    error: None,
-                },
-                Ok(CallToolResponse::ApprovalRequired { approval }) => RpcResponse {
-                    jsonrpc: "2.0",
-                    id: req.id,
-                    result: Some(serde_json::json!({
-                        "content": [
-                            { "type": "text", "text": format!("Approval required for tool `{}`: {}. Approval ID: {}. Approve via `briefcase approvals approve {}`.", approval.tool_id, approval.reason, approval.id, approval.id) }
-                        ]
-                    })),
-                    error: None,
-                },
-                Ok(CallToolResponse::Denied { reason }) => RpcResponse {
-                    jsonrpc: "2.0",
-                    id: req.id,
-                    result: None,
-                    error: Some(RpcError {
-                        code: -32001,
-                        message: "denied".to_string(),
-                        data: Some(serde_json::json!({ "reason": reason })),
-                    }),
-                },
-                Ok(CallToolResponse::Error { message }) => RpcResponse {
-                    jsonrpc: "2.0",
-                    id: req.id,
-                    result: None,
-                    error: Some(RpcError {
-                        code: -32000,
-                        message: "tool_error".to_string(),
-                        data: Some(serde_json::json!({ "message": message })),
-                    }),
-                },
-                Err(e) => RpcResponse {
-                    jsonrpc: "2.0",
-                    id: req.id,
-                    result: None,
-                    error: Some(RpcError {
-                        code: -32000,
-                        message: "daemon_error".to_string(),
-                        data: Some(serde_json::json!({ "detail": e.to_string() })),
-                    }),
-                },
-            }
+    match msg {
+        JsonRpcMessage::Notification(_) => {
+            conn.handle_message(msg).await;
+            StatusCode::ACCEPTED.into_response()
         }
-        m => {
-            warn!(method = %m, "unknown method");
-            RpcResponse {
-                jsonrpc: "2.0",
-                id: req.id,
-                result: None,
-                error: Some(RpcError {
-                    code: -32601,
-                    message: "method not found".to_string(),
-                    data: None,
-                }),
-            }
+        _ => match conn.handle_message(msg).await {
+            Some(r) => jsonrpc_http_response(r, Some(sid)),
+            None => StatusCode::ACCEPTED.into_response(),
+        },
+    }
+}
+
+fn validate_origin(headers: &HeaderMap) -> Result<(), (StatusCode, &'static str)> {
+    let Some(origin) = headers
+        .get("origin")
+        .and_then(|h| h.to_str().ok())
+        .filter(|s| !s.trim().is_empty())
+    else {
+        return Ok(());
+    };
+
+    let u = url::Url::parse(origin).map_err(|_| (StatusCode::FORBIDDEN, "invalid origin"))?;
+    let host = u.host().ok_or((StatusCode::FORBIDDEN, "invalid origin"))?;
+    let is_loopback = match host {
+        url::Host::Domain(d) => d.eq_ignore_ascii_case("localhost"),
+        url::Host::Ipv4(ip) => ip.is_loopback(),
+        url::Host::Ipv6(ip) => ip.is_loopback(),
+    };
+    if !is_loopback {
+        return Err((StatusCode::FORBIDDEN, "origin not allowed"));
+    }
+
+    Ok(())
+}
+
+fn jsonrpc_http_response(resp: JsonRpcResponse, session_id: Option<&str>) -> Response {
+    let body = serde_json::to_string(&resp).unwrap_or_else(|_| "{}".to_string());
+    let mut builder = Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/json");
+
+    if let Some(sid) = session_id {
+        if let Ok(v) = HeaderValue::from_str(sid) {
+            builder = builder.header("mcp-session-id", v);
         }
     }
+
+    builder
+        .body(axum::body::Body::from(body))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    headers.get(name).and_then(|h| h.to_str().ok())
 }
 
 fn resolve_data_dir(cli: Option<&Path>) -> anyhow::Result<PathBuf> {

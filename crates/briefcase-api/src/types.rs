@@ -32,6 +32,27 @@ pub struct DeleteProviderResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpServerSummary {
+    pub id: String,
+    pub endpoint_url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListMcpServersResponse {
+    pub servers: Vec<McpServerSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpsertMcpServerRequest {
+    pub endpoint_url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeleteMcpServerResponse {
+    pub server_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OAuthExchangeRequest {
     pub code: String,
     pub redirect_uri: String,

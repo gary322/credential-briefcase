@@ -14,11 +14,12 @@ use serde::de::DeserializeOwned;
 use thiserror::Error;
 
 use crate::types::{
-    ApproveResponse, BudgetRecord, CallToolRequest, CallToolResponse, DeleteProviderResponse,
-    ErrorResponse, FetchVcResponse, IdentityResponse, ListApprovalsResponse, ListBudgetsResponse,
-    ListProvidersResponse, ListReceiptsResponse, ListToolsResponse, OAuthExchangeRequest,
-    OAuthExchangeResponse, ProviderSummary, SetBudgetRequest, UpsertProviderRequest,
-    VerifyReceiptsResponse,
+    ApproveResponse, BudgetRecord, CallToolRequest, CallToolResponse, DeleteMcpServerResponse,
+    DeleteProviderResponse, ErrorResponse, FetchVcResponse, IdentityResponse,
+    ListApprovalsResponse, ListBudgetsResponse, ListMcpServersResponse, ListProvidersResponse,
+    ListReceiptsResponse, ListToolsResponse, McpServerSummary, OAuthExchangeRequest,
+    OAuthExchangeResponse, ProviderSummary, SetBudgetRequest, UpsertMcpServerRequest,
+    UpsertProviderRequest, VerifyReceiptsResponse,
 };
 
 #[derive(Debug, Clone)]
@@ -95,6 +96,33 @@ impl BriefcaseClient {
     ) -> Result<DeleteProviderResponse, BriefcaseClientError> {
         self.post_json(
             &format!("/v1/providers/{provider_id}/delete"),
+            serde_json::json!({}),
+        )
+        .await
+    }
+
+    pub async fn list_mcp_servers(&self) -> Result<ListMcpServersResponse, BriefcaseClientError> {
+        self.get_json("/v1/mcp/servers").await
+    }
+
+    pub async fn upsert_mcp_server(
+        &self,
+        server_id: &str,
+        endpoint_url: String,
+    ) -> Result<McpServerSummary, BriefcaseClientError> {
+        self.post_json(
+            &format!("/v1/mcp/servers/{server_id}"),
+            UpsertMcpServerRequest { endpoint_url },
+        )
+        .await
+    }
+
+    pub async fn delete_mcp_server(
+        &self,
+        server_id: &str,
+    ) -> Result<DeleteMcpServerResponse, BriefcaseClientError> {
+        self.post_json(
+            &format!("/v1/mcp/servers/{server_id}/delete"),
             serde_json::json!({}),
         )
         .await

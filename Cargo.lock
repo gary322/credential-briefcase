@@ -598,6 +598,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "briefcase-mcp"
+version = "0.1.4"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bytes",
+ "http",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "url",
+ "uuid",
+]
+
+[[package]]
 name = "briefcase-payments"
 version = "0.1.4"
 dependencies = [
@@ -699,11 +717,13 @@ name = "briefcased"
 version = "0.1.4"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
  "base64",
  "briefcase-api",
  "briefcase-core",
  "briefcase-identity",
+ "briefcase-mcp",
  "briefcase-payments",
  "briefcase-policy",
  "briefcase-receipts",
@@ -2213,15 +2233,20 @@ name = "mcp-gateway"
 version = "0.1.4"
 dependencies = [
  "anyhow",
+ "async-trait",
+ "axum",
  "briefcase-api",
  "briefcase-core",
+ "briefcase-mcp",
  "clap",
  "directories",
  "serde",
  "serde_json",
  "tokio",
+ "tower-http",
  "tracing",
  "tracing-subscriber",
+ "url",
  "uuid",
 ]
 

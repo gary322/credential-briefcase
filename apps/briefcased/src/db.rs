@@ -12,6 +12,12 @@ pub struct Db {
     conn: Connection,
 }
 
+#[derive(Debug, Clone)]
+pub struct RemoteMcpServerRecord {
+    pub id: String,
+    pub endpoint_url: String,
+}
+
 impl Db {
     pub async fn open(path: &Path) -> anyhow::Result<Self> {
         if let Some(parent) = path.parent() {
@@ -82,6 +88,12 @@ impl Db {
                       expires_at_rfc3339    TEXT NOT NULL,
                       created_at_rfc3339    TEXT NOT NULL
                     );
+
+                    CREATE TABLE IF NOT EXISTS remote_mcp_servers (
+                      id                TEXT PRIMARY KEY,
+                      endpoint_url      TEXT NOT NULL,
+                      created_at_rfc3339 TEXT NOT NULL
+                    );
                     "#,
                 )?;
                 Ok(())
@@ -147,6 +159,59 @@ impl Db {
                     let category: String = row.get(0)?;
                     let daily: i64 = row.get(1)?;
                     Ok((category, daily))
+                })?;
+                Ok(rows.collect::<Result<Vec<_>, _>>()?)
+            })
+            .await?;
+        Ok(rows)
+    }
+
+    pub async fn upsert_remote_mcp_server(
+        &self,
+        id: &str,
+        endpoint_url: &str,
+    ) -> anyhow::Result<()> {
+        let id = id.to_string();
+        let endpoint_url = endpoint_url.to_string();
+        let created_at = Utc::now().to_rfc3339();
+        self.conn
+            .call(move |conn| {
+                conn.execute(
+                    r#"
+                    INSERT INTO remote_mcp_servers(id, endpoint_url, created_at_rfc3339)
+                    VALUES (?1, ?2, ?3)
+                    ON CONFLICT(id) DO UPDATE SET endpoint_url=excluded.endpoint_url
+                    "#,
+                    params![id, endpoint_url, created_at],
+                )?;
+                Ok(())
+            })
+            .await?;
+        Ok(())
+    }
+
+    pub async fn delete_remote_mcp_server(&self, id: &str) -> anyhow::Result<()> {
+        let id = id.to_string();
+        self.conn
+            .call(move |conn| {
+                conn.execute("DELETE FROM remote_mcp_servers WHERE id=?1", params![id])?;
+                Ok(())
+            })
+            .await?;
+        Ok(())
+    }
+
+    pub async fn list_remote_mcp_servers(&self) -> anyhow::Result<Vec<RemoteMcpServerRecord>> {
+        let rows = self
+            .conn
+            .call(|conn| {
+                let mut stmt = conn
+                    .prepare("SELECT id, endpoint_url FROM remote_mcp_servers ORDER BY id ASC")?;
+                let rows = stmt.query_map([], |row| {
+                    Ok(RemoteMcpServerRecord {
+                        id: row.get::<_, String>(0)?,
+                        endpoint_url: row.get::<_, String>(1)?,
+                    })
                 })?;
                 Ok(rows.collect::<Result<Vec<_>, _>>()?)
             })

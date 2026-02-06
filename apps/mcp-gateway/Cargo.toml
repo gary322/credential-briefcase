@@ -7,14 +7,19 @@ repository.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+async-trait.workspace = true
+axum.workspace = true
 clap.workspace = true
 directories.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+tower-http.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+url.workspace = true
 uuid.workspace = true
 
 briefcase-api = { path = "../../crates/briefcase-api" }
 briefcase-core = { path = "../../crates/briefcase-core" }
+briefcase-mcp = { path = "../../crates/briefcase-mcp" }

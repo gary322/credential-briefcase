@@ -12,8 +12,10 @@ use base64::Engine as _;
 
 mod app;
 mod db;
+mod firewall;
 mod middleware;
 mod provider;
+mod remote_mcp;
 mod tools;
 
 #[derive(Debug, Clone, Parser)]

@@ -55,6 +55,10 @@ enum Command {
         #[command(subcommand)]
         cmd: ProvidersCommand,
     },
+    Mcp {
+        #[command(subcommand)]
+        cmd: McpCommand,
+    },
     Budgets {
         #[command(subcommand)]
         cmd: BudgetsCommand,
@@ -108,6 +112,21 @@ enum ProvidersCommand {
         #[arg(long, default_value = "demo")]
         id: String,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum McpCommand {
+    Servers {
+        #[command(subcommand)]
+        cmd: McpServersCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum McpServersCommand {
+    List,
+    Upsert { id: String, endpoint_url: String },
+    Delete { id: String },
 }
 
 #[derive(Debug, Subcommand)]
@@ -177,6 +196,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Tools { cmd } => handle_tools(&client, cmd).await?,
         Command::Identity { cmd } => handle_identity(&client, cmd).await?,
         Command::Providers { cmd } => handle_providers(&client, cmd).await?,
+        Command::Mcp { cmd } => handle_mcp(&client, cmd).await?,
         Command::Budgets { cmd } => handle_budgets(&client, cmd).await?,
         Command::Approvals { cmd } => handle_approvals(&client, cmd).await?,
         Command::Receipts { cmd } => handle_receipts(&client, cmd).await?,
@@ -232,6 +252,31 @@ async fn handle_providers(client: &BriefcaseClient, cmd: ProvidersCommand) -> an
                 r.provider_id, r.expires_at_rfc3339
             );
         }
+    }
+    Ok(())
+}
+
+async fn handle_mcp(client: &BriefcaseClient, cmd: McpCommand) -> anyhow::Result<()> {
+    match cmd {
+        McpCommand::Servers { cmd } => match cmd {
+            McpServersCommand::List => {
+                let servers = client.list_mcp_servers().await?.servers;
+                for s in servers {
+                    println!("{} endpoint_url={}", s.id, s.endpoint_url);
+                }
+            }
+            McpServersCommand::Upsert { id, endpoint_url } => {
+                let s = client.upsert_mcp_server(&id, endpoint_url).await?;
+                println!(
+                    "mcp_server_upsert: id={} endpoint_url={}",
+                    s.id, s.endpoint_url
+                );
+            }
+            McpServersCommand::Delete { id } => {
+                let r = client.delete_mcp_server(&id).await?;
+                println!("mcp_server_delete: id={}", r.server_id);
+            }
+        },
     }
     Ok(())
 }

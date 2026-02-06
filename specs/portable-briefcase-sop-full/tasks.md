@@ -45,34 +45,34 @@ For each task, include:
 
 ## Phase 1: Full MCP Compliance + Remote MCP Routing
 
-- [ ] 1.1 Implement `crates/briefcase-mcp` (protocol + transports)
+- [x] 1.1 Implement `crates/briefcase-mcp` (protocol + transports)
   - **Do**: implement MCP message types and both server+client primitives; support stdio transport and HTTP transport(s) required by spec; add conformance test harness.
   - **Files**: `crates/briefcase-mcp/*`, `apps/mcp-gateway/*`, `apps/briefcased/*`
   - **Done when**: `mcp-gateway` passes conformance tests for `initialize`, `tools/list`, `tools/call`, error handling, and transport framing.
   - **Verify**: `cargo test -p briefcase-mcp`
   - _Reqs: FR-1_
 
-- [ ] 1.2 Upgrade `apps/mcp-gateway` to spec-compliant behavior
+- [x] 1.2 Upgrade `apps/mcp-gateway` to spec-compliant behavior
   - **Do**: replace the minimal JSON-lines loop with `briefcase-mcp` server implementation; add HTTP transport; ensure no batching assumptions.
   - **Files**: `apps/mcp-gateway/src/main.rs`
   - **Done when**: gateway supports both stdio and HTTP transports; behavior matches conformance harness.
   - **Verify**: `cargo test -p mcp-gateway`
   - _Reqs: FR-1, AC-4.1_
 
-- [ ] 1.3 Add remote MCP registry and proxying in `briefcased`
+- [x] 1.3 Add remote MCP registry and proxying in `briefcased`
   - **Do**: add DB tables for remote MCP servers; implement MCP client connections; implement “tool catalog” aggregation and routing.
   - **Files**: `apps/briefcased/src/db.rs`, `apps/briefcased/src/mcp_client.rs` (new), `apps/briefcased/src/app.rs`
   - **Done when**: remote MCP tools can be listed and called through the gateway; receipts reflect remote provenance.
   - **Verify**: `cargo test -p briefcased`
   - _Reqs: FR-2, AC-4.3_
 
-- [ ] 1.4 Add remote MCP stub servers for integration tests
+- [x] 1.4 Add remote MCP stub servers for integration tests
   - **Do**: implement local test servers for each transport and auth mode.
   - **Files**: `tests/mcp_stub/*` or `apps/mcp-stub/*`
   - **Done when**: CI runs an e2e test: agent->gateway->briefcased->remote MCP and validates policy/receipts.
   - **Verify**: `cargo test -p briefcased e2e_remote_mcp_*`
 
-- [ ] 1.5 Quality checkpoint
+- [x] 1.5 Quality checkpoint
   - **Verify**: `cargo fmt --check` + `cargo clippy --all-targets --all-features -- -D warnings` + `cargo test --all`
 
 ## Phase 2: OAuth PRM Discovery + Full MCP Auth Integration

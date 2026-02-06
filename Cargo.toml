@@ -9,6 +9,7 @@ members = [
   "crates/briefcase-api",
   "crates/briefcase-core",
   "crates/briefcase-identity",
+  "crates/briefcase-mcp",
   "crates/briefcase-payments",
   "crates/briefcase-risk",
   "crates/briefcase-policy",

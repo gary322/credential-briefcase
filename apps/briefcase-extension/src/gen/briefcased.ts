@@ -30,6 +30,18 @@ export interface paths {
     /** Delete provider */
     post: operations["deleteProvider"];
   };
+  "/v1/mcp/servers": {
+    /** List remote MCP servers */
+    get: operations["listMcpServers"];
+  };
+  "/v1/mcp/servers/{id}": {
+    /** Upsert a remote MCP server endpoint */
+    post: operations["upsertMcpServer"];
+  };
+  "/v1/mcp/servers/{id}/delete": {
+    /** Delete a remote MCP server */
+    post: operations["deleteMcpServer"];
+  };
   "/v1/providers/{id}/oauth/exchange": {
     /** Exchange OAuth authorization code for refresh token (stored in daemon) */
     post: operations["oauthExchange"];
@@ -103,6 +115,19 @@ export interface components {
     };
     DeleteProviderResponse: {
       provider_id: string;
+    };
+    McpServerSummary: {
+      id: string;
+      endpoint_url: string;
+    };
+    ListMcpServersResponse: {
+      servers: components["schemas"]["McpServerSummary"][];
+    };
+    UpsertMcpServerRequest: {
+      endpoint_url: string;
+    };
+    DeleteMcpServerResponse: {
+      server_id: string;
     };
     OAuthExchangeRequest: {
       code: string;
@@ -342,6 +367,78 @@ export interface operations {
       200: {
         content: {
           "application/json": components["schemas"]["DeleteProviderResponse"];
+        };
+      };
+      /** @description unauthorized */
+      401: {
+        content: {
+          "application/json": components["schemas"]["ErrorResponse"];
+        };
+      };
+    };
+  };
+  /** List remote MCP servers */
+  listMcpServers: {
+    responses: {
+      /** @description ok */
+      200: {
+        content: {
+          "application/json": components["schemas"]["ListMcpServersResponse"];
+        };
+      };
+      /** @description unauthorized */
+      401: {
+        content: {
+          "application/json": components["schemas"]["ErrorResponse"];
+        };
+      };
+    };
+  };
+  /** Upsert a remote MCP server endpoint */
+  upsertMcpServer: {
+    parameters: {
+      path: {
+        id: string;
+      };
+    };
+    requestBody: {
+      content: {
+        "application/json": components["schemas"]["UpsertMcpServerRequest"];
+      };
+    };
+    responses: {
+      /** @description ok */
+      200: {
+        content: {
+          "application/json": components["schemas"]["McpServerSummary"];
+        };
+      };
+      /** @description bad request */
+      400: {
+        content: {
+          "application/json": components["schemas"]["ErrorResponse"];
+        };
+      };
+      /** @description unauthorized */
+      401: {
+        content: {
+          "application/json": components["schemas"]["ErrorResponse"];
+        };
+      };
+    };
+  };
+  /** Delete a remote MCP server */
+  deleteMcpServer: {
+    parameters: {
+      path: {
+        id: string;
+      };
+    };
+    responses: {
+      /** @description ok */
+      200: {
+        content: {
+          "application/json": components["schemas"]["DeleteMcpServerResponse"];
         };
       };
       /** @description unauthorized */

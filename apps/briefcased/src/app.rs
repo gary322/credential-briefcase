@@ -9,10 +9,11 @@ use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use briefcase_api::types::{
-    ApproveResponse, BudgetRecord, CallToolRequest, CallToolResponse, DeleteProviderResponse,
-    ErrorResponse, FetchVcResponse, IdentityResponse, ListApprovalsResponse, ListBudgetsResponse,
-    ListProvidersResponse, ListReceiptsResponse, ListToolsResponse, OAuthExchangeRequest,
-    OAuthExchangeResponse, ProviderSummary, SetBudgetRequest, UpsertProviderRequest,
+    ApproveResponse, BudgetRecord, CallToolRequest, CallToolResponse, DeleteMcpServerResponse,
+    DeleteProviderResponse, ErrorResponse, FetchVcResponse, IdentityResponse,
+    ListApprovalsResponse, ListBudgetsResponse, ListMcpServersResponse, ListProvidersResponse,
+    ListReceiptsResponse, ListToolsResponse, OAuthExchangeRequest, OAuthExchangeResponse,
+    ProviderSummary, SetBudgetRequest, UpsertMcpServerRequest, UpsertProviderRequest,
     VerifyReceiptsResponse,
 };
 use briefcase_core::{PolicyDecision, ToolCall, ToolResult};
@@ -24,6 +25,7 @@ use uuid::Uuid;
 use crate::db::Db;
 use crate::middleware::require_auth;
 use crate::provider::ProviderClient;
+use crate::remote_mcp::RemoteMcpManager;
 use crate::tools::ToolRegistry;
 use briefcase_policy::{CedarPolicyEngine, CedarPolicyEngineOptions};
 use briefcase_receipts::{ReceiptStore, ReceiptStoreOptions};
@@ -38,6 +40,7 @@ pub struct AppState {
     pub policy: Arc<CedarPolicyEngine>,
     pub risk: Arc<briefcase_risk::RiskEngine>,
     pub tools: ToolRegistry,
+    pub remote_mcp: Arc<RemoteMcpManager>,
     pub secrets: Arc<dyn SecretStore>,
     pub identity_did: String,
 }
@@ -89,6 +92,8 @@ impl AppState {
             }
         }
         let risk = Arc::new(briefcase_risk::RiskEngine::new(classifier_url)?);
+
+        let remote_mcp = Arc::new(RemoteMcpManager::new(db.clone()));
 
         // Identity key seed lives in the secret store; DID lives in the DB for easy display.
         // If both exist, ensure they match to avoid signing with the wrong key.
@@ -156,6 +161,7 @@ impl AppState {
             policy,
             risk,
             tools,
+            remote_mcp,
             secrets,
             identity_did,
         })
@@ -199,6 +205,9 @@ fn router(state: AppState) -> Router {
         .route("/v1/providers", get(list_providers))
         .route("/v1/providers/{id}", post(upsert_provider))
         .route("/v1/providers/{id}/delete", post(delete_provider))
+        .route("/v1/mcp/servers", get(list_mcp_servers))
+        .route("/v1/mcp/servers/{id}", post(upsert_mcp_server))
+        .route("/v1/mcp/servers/{id}/delete", post(delete_mcp_server))
         .route("/v1/budgets", get(list_budgets))
         .route("/v1/budgets/{category}", post(set_budget))
         .route("/v1/providers/{id}/oauth/exchange", post(oauth_exchange))
@@ -225,9 +234,10 @@ async fn health() -> Json<serde_json::Value> {
 }
 
 async fn list_tools(State(state): State<AppState>) -> Json<ListToolsResponse> {
-    Json(ListToolsResponse {
-        tools: state.tools.specs(),
-    })
+    let mut tools = state.tools.specs();
+    tools.extend(state.remote_mcp.list_tool_specs().await);
+    tools.sort_by(|a, b| a.id.cmp(&b.id));
+    Json(ListToolsResponse { tools })
 }
 
 async fn get_identity(State(state): State<AppState>) -> Json<IdentityResponse> {
@@ -326,6 +336,54 @@ async fn delete_provider(
     Ok(Json(DeleteProviderResponse { provider_id: id }))
 }
 
+async fn list_mcp_servers(State(state): State<AppState>) -> Json<ListMcpServersResponse> {
+    let rows = state.db.list_remote_mcp_servers().await.unwrap_or_default();
+    let servers = rows
+        .into_iter()
+        .map(|r| briefcase_api::types::McpServerSummary {
+            id: r.id,
+            endpoint_url: r.endpoint_url,
+        })
+        .collect::<Vec<_>>();
+    Json(ListMcpServersResponse { servers })
+}
+
+async fn upsert_mcp_server(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Json(req): Json<UpsertMcpServerRequest>,
+) -> Result<Json<briefcase_api::types::McpServerSummary>, (StatusCode, Json<ErrorResponse>)> {
+    if !is_valid_provider_id(&id) {
+        return Err(bad_request("invalid_mcp_server_id"));
+    }
+
+    let endpoint_url = normalize_mcp_endpoint_url(&req.endpoint_url)
+        .map_err(|_| bad_request("invalid_endpoint_url"))?;
+
+    state
+        .db
+        .upsert_remote_mcp_server(&id, &endpoint_url)
+        .await
+        .map_err(internal_error)?;
+
+    Ok(Json(briefcase_api::types::McpServerSummary {
+        id,
+        endpoint_url,
+    }))
+}
+
+async fn delete_mcp_server(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<DeleteMcpServerResponse>, (StatusCode, Json<ErrorResponse>)> {
+    state
+        .db
+        .delete_remote_mcp_server(&id)
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(DeleteMcpServerResponse { server_id: id }))
+}
+
 async fn list_budgets(State(state): State<AppState>) -> Json<ListBudgetsResponse> {
     let rows = state.db.list_budgets().await.unwrap_or_default();
     let budgets = rows
@@ -377,17 +435,42 @@ async fn call_tool(
 }
 
 async fn call_tool_impl(state: &AppState, call: ToolCall) -> anyhow::Result<CallToolResponse> {
-    let tool = match state.tools.get(&call.tool_id) {
-        Some(t) => t,
-        None => {
-            return Ok(CallToolResponse::Denied {
-                reason: "unknown_tool".to_string(),
-            });
+    enum ResolvedTool {
+        Local(Arc<crate::tools::ToolRuntime>),
+        Remote(Box<briefcase_core::ToolSpec>),
+    }
+
+    let tool = if RemoteMcpManager::is_remote_tool_id(&call.tool_id) {
+        match state.remote_mcp.resolve_tool_spec(&call.tool_id).await? {
+            Some(spec) => ResolvedTool::Remote(Box::new(spec)),
+            None => {
+                return Ok(CallToolResponse::Denied {
+                    reason: "unknown_tool".to_string(),
+                });
+            }
+        }
+    } else {
+        match state.tools.get(&call.tool_id) {
+            Some(t) => ResolvedTool::Local(t),
+            None => {
+                return Ok(CallToolResponse::Denied {
+                    reason: "unknown_tool".to_string(),
+                });
+            }
         }
     };
 
+    let spec = match &tool {
+        ResolvedTool::Local(t) => &t.spec,
+        ResolvedTool::Remote(s) => s.as_ref(),
+    };
+
     // Validate inputs early. We treat invalid args as denied.
-    if let Err(e) = tool.validate_args(&call.args) {
+    let validate_res = match &tool {
+        ResolvedTool::Local(t) => t.validate_args(&call.args),
+        ResolvedTool::Remote(s) => validate_args_against_schema(&s.input_schema, &call.args),
+    };
+    if let Err(e) = validate_res {
         return Ok(CallToolResponse::Denied {
             reason: format!("invalid_args: {e}"),
         });
@@ -408,7 +491,7 @@ async fn call_tool_impl(state: &AppState, call: ToolCall) -> anyhow::Result<Call
     }
 
     // Cedar policy: allow/deny/require-approval.
-    let decision = state.policy.decide("local-user", &tool.spec)?;
+    let decision = state.policy.decide("local-user", spec)?;
     match &decision {
         PolicyDecision::Deny { reason } => {
             state
@@ -485,11 +568,11 @@ async fn call_tool_impl(state: &AppState, call: ToolCall) -> anyhow::Result<Call
     }
 
     // Budget gate (category-based daily limit).
-    let cost_microusd: i64 = (tool.spec.cost.estimated_usd * 1_000_000.0).round() as i64;
+    let cost_microusd: i64 = (spec.cost.estimated_usd * 1_000_000.0).round() as i64;
     if cost_microusd > 0
         && !state
             .db
-            .budget_allows(tool.spec.category.as_str(), cost_microusd)
+            .budget_allows(spec.category.as_str(), cost_microusd)
             .await?
         && call.approval_token.is_none()
     {
@@ -500,14 +583,20 @@ async fn call_tool_impl(state: &AppState, call: ToolCall) -> anyhow::Result<Call
         return Ok(CallToolResponse::ApprovalRequired { approval });
     }
 
-    let exec = tool.execute(&call.args).await;
+    let exec = match &tool {
+        ResolvedTool::Local(t) => t
+            .execute(&call.args)
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string())),
+        ResolvedTool::Remote(_s) => state.remote_mcp.call_tool(&call.tool_id, &call.args).await,
+    };
     match exec {
         Ok((content, auth_method, cost_usd_opt, source)) => {
             if let Some(cost_usd) = cost_usd_opt {
                 let amount_microusd = (cost_usd * 1_000_000.0).round() as i64;
                 state
                     .db
-                    .record_spend(tool.spec.category.as_str(), amount_microusd)
+                    .record_spend(spec.category.as_str(), amount_microusd)
                     .await?;
             }
 
@@ -519,12 +608,20 @@ async fn call_tool_impl(state: &AppState, call: ToolCall) -> anyhow::Result<Call
                     "decision": "allow",
                     "auth_method": auth_method,
                     "cost_usd": cost_usd_opt,
+                    "source": source.as_str(),
                     "ts": Utc::now().to_rfc3339(),
                 }))
                 .await?;
 
+            let content = match &tool {
+                ResolvedTool::Local(t) => t.apply_output_firewall(content),
+                ResolvedTool::Remote(s) => {
+                    crate::firewall::apply_output_firewall(&s.output_firewall, content)
+                }
+            };
+
             let result = ToolResult {
-                content: tool.apply_output_firewall(content),
+                content,
                 provenance: briefcase_core::Provenance {
                     source,
                     cost_usd: cost_usd_opt,
@@ -539,6 +636,28 @@ async fn call_tool_impl(state: &AppState, call: ToolCall) -> anyhow::Result<Call
             message: e.to_string(),
         }),
     }
+}
+
+fn validate_args_against_schema(
+    schema: &serde_json::Value,
+    args: &serde_json::Value,
+) -> anyhow::Result<()> {
+    let validator =
+        jsonschema::validator_for(schema).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    if validator.is_valid(args) {
+        return Ok(());
+    }
+
+    let msg = validator
+        .iter_errors(args)
+        .take(5)
+        .map(|e| e.to_string())
+        .collect::<Vec<_>>()
+        .join("; ");
+    if !msg.is_empty() {
+        anyhow::bail!("{msg}");
+    }
+    anyhow::bail!("invalid_args");
 }
 
 async fn oauth_exchange(
@@ -863,6 +982,45 @@ fn normalize_base_url(raw: &str) -> anyhow::Result<String> {
     Ok(s)
 }
 
+fn normalize_mcp_endpoint_url(raw: &str) -> anyhow::Result<String> {
+    let u = url::Url::parse(raw).context("parse url")?;
+    match u.scheme() {
+        "http" | "https" => {}
+        _ => anyhow::bail!("unsupported scheme"),
+    }
+
+    if u.host_str().is_none() {
+        anyhow::bail!("missing host");
+    }
+
+    if !u.username().is_empty() || u.password().is_some() {
+        anyhow::bail!("userinfo not allowed");
+    }
+
+    if u.query().is_some() || u.fragment().is_some() {
+        anyhow::bail!("query/fragment not allowed in endpoint_url");
+    }
+
+    // Insecure HTTP is only allowed for local development targets.
+    if u.scheme() == "http" {
+        let host = u.host().context("missing host")?;
+        let is_loopback = match host {
+            url::Host::Domain(d) => d.eq_ignore_ascii_case("localhost"),
+            url::Host::Ipv4(ip) => ip.is_loopback(),
+            url::Host::Ipv6(ip) => ip.is_loopback(),
+        };
+        if !is_loopback {
+            anyhow::bail!("http endpoint_url is only allowed for localhost");
+        }
+    }
+
+    let mut s = u.to_string();
+    while s.ends_with('/') {
+        s.pop();
+    }
+    Ok(s)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -873,9 +1031,119 @@ mod tests {
     use tempfile::tempdir;
 
     #[derive(Clone)]
+    struct MockRemoteMcpState {
+        list_calls: Arc<tokio::sync::Mutex<u64>>,
+        tool_calls: Arc<tokio::sync::Mutex<u64>>,
+    }
+
+    #[derive(Clone)]
     struct MockProviderState {
         paid: Arc<tokio::sync::Mutex<bool>>,
         pay_calls: Arc<tokio::sync::Mutex<u64>>,
+    }
+
+    async fn start_mock_remote_mcp()
+    -> anyhow::Result<(SocketAddr, MockRemoteMcpState, tokio::task::JoinHandle<()>)> {
+        use axum::Router;
+        use axum::body::Bytes;
+        use axum::extract::State as AxumState;
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+        use axum::routing::post;
+        use briefcase_mcp::{
+            CallToolParams, CallToolResult, ContentBlock, JsonRpcMessage, ListToolsParams,
+            ListToolsResult, McpConnection, McpHandler, McpServerConfig, Tool,
+        };
+        use std::sync::Arc;
+
+        #[derive(Clone)]
+        struct MockServer {
+            conn: Arc<tokio::sync::Mutex<McpConnection>>,
+        }
+
+        #[derive(Clone)]
+        struct Handler {
+            st: MockRemoteMcpState,
+        }
+
+        #[async_trait::async_trait]
+        impl McpHandler for Handler {
+            async fn list_tools(
+                &self,
+                _params: ListToolsParams,
+            ) -> anyhow::Result<ListToolsResult> {
+                *self.st.list_calls.lock().await += 1;
+                Ok(ListToolsResult {
+                    tools: vec![Tool {
+                        name: "hello".to_string(),
+                        title: Some("Remote Hello".to_string()),
+                        description: Some("Returns the provided text (remote).".to_string()),
+                        input_schema: serde_json::json!({
+                            "type": "object",
+                            "properties": {
+                                "text": { "type": "string", "maxLength": 128 }
+                            },
+                            "required": ["text"],
+                            "additionalProperties": false
+                        }),
+                    }],
+                    next_cursor: None,
+                })
+            }
+
+            async fn call_tool(&self, params: CallToolParams) -> anyhow::Result<CallToolResult> {
+                *self.st.tool_calls.lock().await += 1;
+                if params.name != "hello" {
+                    anyhow::bail!("unknown tool");
+                }
+                let text = params
+                    .arguments
+                    .as_ref()
+                    .and_then(|v| v.get("text"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                Ok(CallToolResult {
+                    content: vec![ContentBlock::Text {
+                        text: format!("remote:{text}"),
+                    }],
+                    structured_content: None,
+                    is_error: None,
+                    meta: None,
+                })
+            }
+        }
+
+        async fn mcp(AxumState(st): AxumState<MockServer>, body: Bytes) -> impl IntoResponse {
+            let msg: JsonRpcMessage = match serde_json::from_slice(&body) {
+                Ok(m) => m,
+                Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+            };
+
+            let mut conn = st.conn.lock().await;
+            match conn.handle_message(msg).await {
+                Some(resp) => (StatusCode::OK, axum::Json(resp)).into_response(),
+                None => StatusCode::ACCEPTED.into_response(),
+            }
+        }
+
+        let st = MockRemoteMcpState {
+            list_calls: Arc::new(tokio::sync::Mutex::new(0)),
+            tool_calls: Arc::new(tokio::sync::Mutex::new(0)),
+        };
+        let handler = Arc::new(Handler { st: st.clone() });
+        let cfg = McpServerConfig::default_for_binary("mock-remote-mcp", "0.0.0");
+        let conn = Arc::new(tokio::sync::Mutex::new(McpConnection::new(cfg, handler)));
+
+        let app = Router::new()
+            .route("/mcp", post(mcp))
+            .with_state(MockServer { conn });
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        Ok((addr, st, handle))
     }
 
     async fn start_mock_provider()
@@ -1306,6 +1574,96 @@ mod tests {
         );
 
         daemon_task.abort();
+        provider_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn remote_mcp_routing_requires_approval_and_executes_after_approval() -> anyhow::Result<()>
+    {
+        let (provider_addr, _provider_state, provider_task) = start_mock_provider().await?;
+        let provider_base_url = format!("http://{provider_addr}");
+
+        let (remote_addr, remote_state, remote_task) = start_mock_remote_mcp().await?;
+        let remote_endpoint = format!("http://{remote_addr}/mcp");
+
+        let (_daemon_base, client, daemon_task) = start_daemon(provider_base_url).await?;
+
+        // Register remote MCP endpoint.
+        client
+            .upsert_mcp_server("remote1", remote_endpoint.clone())
+            .await?;
+
+        // Remote tool is surfaced via /v1/tools.
+        let tools = client.list_tools().await?.tools;
+        assert!(tools.iter().any(|t| t.id == "mcp_remote1__hello"));
+
+        // Invalid args are denied (no remote call).
+        let resp = client
+            .call_tool(CallToolRequest {
+                call: ToolCall {
+                    tool_id: "mcp_remote1__hello".to_string(),
+                    args: serde_json::json!({}),
+                    context: ToolCallContext::new(),
+                    approval_token: None,
+                },
+            })
+            .await?;
+        assert!(matches!(resp, CallToolResponse::Denied { .. }));
+
+        // Policy requires approval for remote tools by default.
+        let resp = client
+            .call_tool(CallToolRequest {
+                call: ToolCall {
+                    tool_id: "mcp_remote1__hello".to_string(),
+                    args: serde_json::json!({ "text": "hi" }),
+                    context: ToolCallContext::new(),
+                    approval_token: None,
+                },
+            })
+            .await?;
+
+        let approval_id = match resp {
+            CallToolResponse::ApprovalRequired { approval } => approval.id,
+            _ => anyhow::bail!("expected approval_required"),
+        };
+
+        let tool_calls = *remote_state.tool_calls.lock().await;
+        assert_eq!(tool_calls, 0, "remote tool should not run before approval");
+
+        let approved = client.approve(&approval_id).await?;
+
+        let resp = client
+            .call_tool(CallToolRequest {
+                call: ToolCall {
+                    tool_id: "mcp_remote1__hello".to_string(),
+                    args: serde_json::json!({ "text": "hi" }),
+                    context: ToolCallContext::new(),
+                    approval_token: Some(approved.approval_token),
+                },
+            })
+            .await?;
+
+        let result = match resp {
+            CallToolResponse::Ok { result } => result,
+            _ => anyhow::bail!("expected ok"),
+        };
+        assert_eq!(result.provenance.source, "remote_mcp:remote1");
+        assert_eq!(
+            result
+                .content
+                .get("content")
+                .and_then(|v| v.get(0))
+                .and_then(|v| v.get("text"))
+                .and_then(|v| v.as_str()),
+            Some("remote:hi")
+        );
+
+        let tool_calls = *remote_state.tool_calls.lock().await;
+        assert_eq!(tool_calls, 1);
+
+        daemon_task.abort();
+        remote_task.abort();
         provider_task.abort();
         Ok(())
     }
