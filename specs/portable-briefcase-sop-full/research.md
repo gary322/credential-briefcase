@@ -8,7 +8,7 @@ created: 2026-02-06T13:58:08+00:00
 
 ## Goal
 
-Implement full sop.txt briefcase (extension, mobile signer, hardware keys, remote MCP routing, real x402/L402, revocation, AI policy compiler, enterprise control plane)
+Implement the full portable credential-briefcase system (extension, mobile signer, hardware keys, remote MCP routing, real x402/L402, revocation, AI policy compiler, enterprise control plane)
 
 ## Executive summary
 
@@ -38,7 +38,7 @@ Implement full sop.txt briefcase (extension, mobile signer, hardware keys, remot
 - **Cross-platform**: macOS/Linux/Windows CI must stay green; extension/mobile builds gated with platform-appropriate CI.
 - **Protocol correctness**: full MCP compliance (2025-06+), OAuth discovery (RFC 9728), DPoP (RFC 8707) where used.
 
-## Big gaps vs sop.txt (work to do)
+## Big gaps vs target system (work to do)
 
 - **Browser extension**: secure UX for onboarding, approvals, receipts; safe bridging to the local daemon.
 - **Mobile signer**: hardware-backed signing + out-of-band approvals; pairing and secure transport.
@@ -78,11 +78,11 @@ Implement full sop.txt briefcase (extension, mobile signer, hardware keys, remot
 
 ## External research (optional)
 
-- MCP Authorization spec (2025-06-18): OAuth 2.1 + discovery via RFC 9728, DPoP via RFC 8707. (source: `sop.txt` links)
-- MCP transports (2025-03-26+, 2025-11-25): stdio + SSE + streamable HTTP; batching removed in 2025-06. (source: `sop.txt` links)
-- x402: HTTP 402 micropayment flow with standardized headers/fields; reference implementations exist. (source: `sop.txt` links)
-- L402: LSAT-style macaroon + invoice; verify preimage; bind to API requests. (source: `sop.txt` links)
-- VC/DID: W3C VC Data Model 2.0; status checking required for revocation. (source: `sop.txt` links)
+- MCP Authorization spec (2025-06-18): OAuth 2.1 + discovery via RFC 9728, DPoP via RFC 8707.
+- MCP transports (2025-03-26+, 2025-11-25): stdio + SSE + streamable HTTP; batching removed in 2025-06.
+- x402: HTTP 402 micropayment flow with standardized headers/fields; reference implementations exist.
+- L402: LSAT-style macaroon + invoice; verify preimage; bind to API requests.
+- VC/DID: W3C VC Data Model 2.0; status checking required for revocation.
 
 ## Open questions
 
@@ -93,8 +93,6 @@ Implement full sop.txt briefcase (extension, mobile signer, hardware keys, remot
 
 ## Sources
 
-- `sop.txt`
 - `docs/ARCHITECTURE.md`
 - `docs/THREAT_MODEL.md`
 - `docs/CAPABILITY_TOKENS.md`
-- MCP spec links referenced by `sop.txt`

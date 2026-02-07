@@ -5,7 +5,7 @@
 //! - `apps/briefcased` (MCP client for remote routing, in later phases)
 //!
 //! The implementation targets the MCP spec transports and lifecycle behaviors
-//! referenced in `sop.txt` (stdio + streamable HTTP).
+//! needed by this repo (stdio + streamable HTTP).
 
 mod http_client;
 mod jsonrpc;

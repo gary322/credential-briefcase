@@ -8,5 +8,4 @@ We pledge to make participation in our community a harassment-free experience fo
 
 ## Enforcement
 
-For reports, contact the maintainers via `security@YOURDOMAIN.example` (replace in your fork).
-
+For reports, contact the maintainers via `gary@alien.international`.

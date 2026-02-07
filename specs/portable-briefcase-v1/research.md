@@ -8,7 +8,7 @@ created: 2026-02-06T10:02:10+00:00
 
 ## Goal
 
-Ship v1 credential briefcase per sop.txt (secrets, OAuth, VC, payments rails, UI)
+Ship v1 credential briefcase per the repo architecture docs (secrets, OAuth, VC, payments rails, UI)
 
 ## Executive summary
 
@@ -51,7 +51,7 @@ Ship v1 credential briefcase per sop.txt (secrets, OAuth, VC, payments rails, UI
 
 ## External research (optional)
 
-- `sop.txt` — the end-to-end architecture, auth strategy selection (VC > OAuth > payment), and the "LLM is untrusted" premise.
+- `docs/ARCHITECTURE.md` — end-to-end architecture and security invariants.
 
 ## Open questions
 
@@ -61,6 +61,5 @@ Ship v1 credential briefcase per sop.txt (secrets, OAuth, VC, payments rails, UI
 
 ## Sources
 
-- `sop.txt`
 - `docs/ARCHITECTURE.md`
 - `docs/THREAT_MODEL.md`

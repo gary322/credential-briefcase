@@ -2,7 +2,7 @@
 
 ## Goal
 
-Ship an open-source, production-grade reference implementation of the `sop.txt` "credential briefcase" architecture where an untrusted LLM can use tools without ever receiving raw secrets, while all tool execution is policy/budget gated and auditable.
+Ship an open-source, production-grade reference implementation of the "credential briefcase" architecture where an untrusted LLM can use tools without ever receiving raw secrets, while all tool execution is policy/budget gated and auditable.
 
 ## Users / personas
 
@@ -101,4 +101,3 @@ Acceptance criteria
   - payment-based tool call
   - OAuth login + VC issuance + tool call without payment
   - approvals + receipts verification
-

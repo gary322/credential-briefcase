@@ -235,7 +235,7 @@ impl ProviderClient {
     }
 
     async fn fetch_token(&self, provider_id: &str, base_url: &str) -> anyhow::Result<CachedToken> {
-        // Auth strategy selection order (per sop.txt):
+        // Auth strategy selection order:
         // VC entitlement > OAuth refresh token > micropayment fallback.
         if let Some((vc_jwt, expires_at)) = self.db.get_vc(provider_id).await?
             && Utc::now() < expires_at

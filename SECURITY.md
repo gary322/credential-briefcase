@@ -4,7 +4,7 @@
 
 Please do not open public issues for suspected security vulnerabilities.
 
-Email: `security@YOURDOMAIN.example` (replace this in your fork)
+Email: `gary@alien.international`
 
 Include:
 
@@ -16,4 +16,3 @@ Include:
 ## Supported Versions
 
 This project is currently in early development. Only the latest `main` branch is supported.
-

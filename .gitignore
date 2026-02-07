@@ -31,3 +31,6 @@ docker/lightning-regtest/.data
 apps/briefcase-mobile-signer/android/.gradle
 apps/briefcase-mobile-signer/android/**/build
 apps/briefcase-mobile-signer/android/local.properties
+
+# Local notes / removed docs
+sop.txt

@@ -2,7 +2,7 @@
 
 ## Goal
 
-Ship the full `sop.txt` credential-briefcase system as an open-source, production-ready codebase:
+Ship the full credential-briefcase system as an open-source, production-ready codebase:
 
 - the LLM/agent runtime is untrusted and never receives raw secrets,
 - a local (or enterprise-managed) Briefcase owns credentials, keys, payments, policy enforcement, and audit receipts,
