@@ -9,7 +9,7 @@ android {
     compileSdk = 34
 
     defaultConfig {
-        applicationId = "com.credentialbriefcase.mobile-signer"
+        applicationId = "com.credentialbriefcase.mobilesigner"
         minSdk = 26
         targetSdk = 34
         versionCode = 1
