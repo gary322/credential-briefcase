@@ -11,6 +11,7 @@ use tracing::info;
 use base64::Engine as _;
 
 mod app;
+mod control_plane;
 mod db;
 mod firewall;
 mod middleware;

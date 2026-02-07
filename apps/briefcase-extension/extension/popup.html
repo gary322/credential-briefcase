@@ -19,6 +19,7 @@
           <button class="tab" data-tab="providers" type="button">Providers</button>
           <button class="tab" data-tab="approvals" type="button">Approvals</button>
           <button class="tab" data-tab="alerts" type="button">Alerts</button>
+          <button class="tab" data-tab="enterprise" type="button">Enterprise</button>
           <button class="tab" data-tab="receipts" type="button">Receipts</button>
           <button class="tab" data-tab="budgets" type="button">Budgets</button>
           <button class="tab" data-tab="policy" type="button">Policy</button>
@@ -104,6 +105,61 @@
             <button id="refresh-alerts" class="small" type="button">Refresh</button>
           </div>
           <div id="alerts" class="list"></div>
+        </section>
+      </section>
+
+      <section id="tab-enterprise" class="tabpane hidden">
+        <section class="card">
+          <h2>Enroll Device</h2>
+          <p class="hint">
+            Connect this briefcase to an enterprise control plane. Policy bundles are verified and
+            enforced locally; the agent never receives raw secrets.
+          </p>
+          <form id="cp-enroll-form">
+            <label>
+              Control Plane Base URL
+              <input
+                id="cp-base-url"
+                name="base_url"
+                type="url"
+                required
+                placeholder="https://control-plane.example.com"
+              />
+            </label>
+            <label>
+              Admin Token
+              <input
+                id="cp-admin-token"
+                name="admin_token"
+                type="password"
+                required
+                placeholder="Bearer token"
+              />
+            </label>
+            <label>
+              Device Name
+              <input
+                id="cp-device-name"
+                name="device_name"
+                type="text"
+                required
+                maxlength="128"
+                placeholder="laptop-1"
+              />
+            </label>
+            <button type="submit">Enroll</button>
+          </form>
+        </section>
+
+        <section class="card">
+          <div class="card-head">
+            <h2>Status</h2>
+            <div class="right">
+              <button id="cp-sync" class="small" type="button">Sync now</button>
+              <button id="cp-refresh" class="small" type="button">Refresh</button>
+            </div>
+          </div>
+          <div id="cp-status" class="list"></div>
         </section>
       </section>
 

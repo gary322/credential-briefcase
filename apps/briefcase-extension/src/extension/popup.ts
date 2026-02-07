@@ -91,6 +91,24 @@ type AiAnomaly = {
   ts_rfc3339: string | null;
 };
 
+type ControlPlaneStatusResponse =
+  | { status: "not_enrolled" }
+  | {
+      status: "enrolled";
+      base_url: string;
+      device_id: string;
+      policy_signing_pubkey_b64: string;
+      last_policy_bundle_id: number | null;
+      last_receipt_upload_id: number;
+      last_sync_at_rfc3339: string | null;
+      last_error: string | null;
+      updated_at_rfc3339: string;
+    };
+
+type ControlPlaneSyncResponse =
+  | { status: "not_enrolled" }
+  | { status: "synced"; policy_applied: boolean; receipts_uploaded: number };
+
 let lastPolicyProposal: PolicyProposal | null = null;
 
 function el<T extends HTMLElement>(id: string): T {
@@ -458,6 +476,61 @@ async function loadAlerts(): Promise<void> {
   }
 }
 
+function renderControlPlaneStatus(res: ControlPlaneStatusResponse): void {
+  const root = el<HTMLDivElement>("cp-status");
+  root.innerHTML = "";
+
+  if (res.status === "not_enrolled") {
+    const p = document.createElement("p");
+    p.className = "status";
+    p.innerText = "Not enrolled.";
+    root.appendChild(p);
+    return;
+  }
+
+  const box = mkItem();
+  box.appendChild(mkRowLeftRight("enrolled", mkPill(true, "yes", "no")));
+
+  const base = document.createElement("div");
+  base.className = "url";
+  base.innerText = `base_url: ${res.base_url}`;
+  box.appendChild(base);
+
+  const dev = document.createElement("div");
+  dev.className = "url";
+  dev.innerText = `device_id: ${res.device_id}`;
+  box.appendChild(dev);
+
+  const bundle = document.createElement("div");
+  bundle.className = "url";
+  bundle.innerText = `last_bundle_id: ${res.last_policy_bundle_id ?? "-"}`;
+  box.appendChild(bundle);
+
+  const receipts = document.createElement("div");
+  receipts.className = "url";
+  receipts.innerText = `last_receipt_upload_id: ${res.last_receipt_upload_id}`;
+  box.appendChild(receipts);
+
+  const sync = document.createElement("div");
+  sync.className = "url";
+  sync.innerText = `last_sync_at: ${res.last_sync_at_rfc3339 ?? "-"}`;
+  box.appendChild(sync);
+
+  if (res.last_error) {
+    const err = document.createElement("div");
+    err.className = "url";
+    err.innerText = `last_error: ${res.last_error}`;
+    box.appendChild(err);
+  }
+
+  root.appendChild(box);
+}
+
+async function loadControlPlaneStatus(): Promise<void> {
+  const res = await rpc<ControlPlaneStatusResponse>("control_plane_status");
+  renderControlPlaneStatus(res);
+}
+
 function receiptTitle(r: ReceiptRecord): string {
   if (!r.event || typeof r.event !== "object") return `receipt:${r.id}`;
   const e = r.event as Record<string, unknown>;
@@ -684,6 +757,7 @@ function setupTabs(): void {
         startApprovalsPolling();
       }
       if (tab === "alerts") await loadAlerts();
+      if (tab === "enterprise") await loadControlPlaneStatus();
       if (tab === "receipts") await loadReceipts();
       if (tab === "budgets") await loadBudgets();
       if (tab === "policy") await loadPolicy();
@@ -729,6 +803,29 @@ function setupActions(): void {
     setStatus("Refreshing...");
     loadAlerts()
       .then(() => setStatus(""))
+      .catch((e) => setStatus(errorMessage(e)));
+  });
+
+  el<HTMLButtonElement>("cp-refresh").addEventListener("click", () => {
+    setStatus("Refreshing...");
+    loadControlPlaneStatus()
+      .then(() => setStatus(""))
+      .catch((e) => setStatus(errorMessage(e)));
+  });
+
+  el<HTMLButtonElement>("cp-sync").addEventListener("click", () => {
+    setStatus("Syncing...");
+    rpc<ControlPlaneSyncResponse>("control_plane_sync", {})
+      .then((r) => {
+        if (r.status === "not_enrolled") {
+          setStatus("Not enrolled.");
+          return;
+        }
+        setStatus(
+          `Sync complete. receipts_uploaded=${r.receipts_uploaded} policy_applied=${r.policy_applied}`,
+        );
+      })
+      .then(() => loadControlPlaneStatus())
       .catch((e) => setStatus(errorMessage(e)));
   });
 
@@ -825,6 +922,32 @@ function setupActions(): void {
     rpc("upsert_provider", { provider_id, base_url })
       .then(() => loadProviders())
       .then(() => setStatus("Provider added."))
+      .catch((e) => setStatus(errorMessage(e)));
+  });
+
+  el<HTMLFormElement>("cp-enroll-form").addEventListener("submit", (ev) => {
+    ev.preventDefault();
+    const base_url = el<HTMLInputElement>("cp-base-url").value.trim();
+    const admin_token_el = el<HTMLInputElement>("cp-admin-token");
+    const admin_token = admin_token_el.value.trim();
+    const device_name = el<HTMLInputElement>("cp-device-name").value.trim();
+    if (!base_url || !admin_token || !device_name) {
+      setStatus("Error: missing base_url, admin_token, or device_name");
+      return;
+    }
+
+    setStatus("Enrolling...");
+    rpc<ControlPlaneStatusResponse>("control_plane_enroll", {
+      base_url,
+      admin_token,
+      device_name,
+    })
+      .then(() => {
+        // Avoid keeping the token in the DOM longer than needed.
+        admin_token_el.value = "";
+      })
+      .then(() => loadControlPlaneStatus())
+      .then(() => setStatus("Enrolled."))
       .catch((e) => setStatus(errorMessage(e)));
   });
 

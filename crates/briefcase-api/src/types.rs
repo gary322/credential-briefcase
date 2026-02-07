@@ -8,6 +8,41 @@ pub struct IdentityResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ControlPlaneStatusResponse {
+    NotEnrolled,
+    Enrolled {
+        base_url: String,
+        device_id: Uuid,
+        policy_signing_pubkey_b64: String,
+        last_policy_bundle_id: Option<i64>,
+        last_receipt_upload_id: i64,
+        last_sync_at_rfc3339: Option<String>,
+        last_error: Option<String>,
+        updated_at_rfc3339: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ControlPlaneEnrollRequest {
+    pub base_url: String,
+    /// Admin bearer token for `/v1/admin/*` endpoints. This is used only for enrollment and is
+    /// never persisted in the daemon.
+    pub admin_token: String,
+    pub device_name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ControlPlaneSyncResponse {
+    NotEnrolled,
+    Synced {
+        policy_applied: bool,
+        receipts_uploaded: usize,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderSummary {
     pub id: String,
     pub base_url: String,

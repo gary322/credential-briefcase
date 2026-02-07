@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use anyhow::Context as _;
@@ -107,6 +108,18 @@ pub struct PolicyProposalRecord {
     pub proposed_policy_hash_hex: String,
     pub diff_json: String,
     pub approval_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ControlPlaneRecord {
+    pub base_url: String,
+    pub device_id: Uuid,
+    pub policy_signing_pubkey_b64: String,
+    pub last_policy_bundle_id: Option<i64>,
+    pub last_receipt_upload_id: i64,
+    pub last_sync_at: Option<DateTime<Utc>>,
+    pub last_error: Option<String>,
+    pub updated_at: DateTime<Utc>,
 }
 
 impl Db {
@@ -275,6 +288,18 @@ impl Db {
                       allowed_fs_path_prefixes_json TEXT NOT NULL,
                       max_output_bytes              INTEGER NOT NULL,
                       updated_at_rfc3339            TEXT NOT NULL
+                    );
+
+                    CREATE TABLE IF NOT EXISTS control_plane (
+                      id                         INTEGER PRIMARY KEY CHECK (id = 1),
+                      base_url                    TEXT NOT NULL,
+                      device_id                   TEXT NOT NULL,
+                      policy_signing_pubkey_b64   TEXT NOT NULL,
+                      last_policy_bundle_id       INTEGER,
+                      last_receipt_upload_id      INTEGER NOT NULL DEFAULT 0,
+                      last_sync_at_rfc3339        TEXT,
+                      last_error                  TEXT,
+                      updated_at_rfc3339          TEXT NOT NULL
                     );
                     "#,
                 )?;
@@ -1272,6 +1297,273 @@ impl Db {
             return Ok(p);
         }
         self.upsert_policy(default_policy_text).await
+    }
+
+    pub async fn control_plane(&self) -> anyhow::Result<Option<ControlPlaneRecord>> {
+        self.conn
+            .call(|conn| {
+                #[derive(Debug)]
+                struct ControlPlaneRow {
+                    base_url: String,
+                    device_id: String,
+                    policy_signing_pubkey_b64: String,
+                    last_policy_bundle_id: Option<i64>,
+                    last_receipt_upload_id: i64,
+                    last_sync_at_rfc3339: Option<String>,
+                    last_error: Option<String>,
+                    updated_at_rfc3339: String,
+                }
+
+                let row: Option<ControlPlaneRow> = conn
+                    .query_row(
+                        r#"
+                        SELECT
+                          base_url,
+                          device_id,
+                          policy_signing_pubkey_b64,
+                          last_policy_bundle_id,
+                          last_receipt_upload_id,
+                          last_sync_at_rfc3339,
+                          last_error,
+                          updated_at_rfc3339
+                        FROM control_plane
+                        WHERE id=1
+                        "#,
+                        [],
+                        |r| {
+                            Ok(ControlPlaneRow {
+                                base_url: r.get(0)?,
+                                device_id: r.get(1)?,
+                                policy_signing_pubkey_b64: r.get(2)?,
+                                last_policy_bundle_id: r.get(3)?,
+                                last_receipt_upload_id: r.get(4)?,
+                                last_sync_at_rfc3339: r.get(5)?,
+                                last_error: r.get(6)?,
+                                updated_at_rfc3339: r.get(7)?,
+                            })
+                        },
+                    )
+                    .optional()?;
+
+                let Some(row) = row else {
+                    return Ok(None);
+                };
+
+                let device_id = Uuid::parse_str(&row.device_id).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        1,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })?;
+
+                let last_sync_at = match row.last_sync_at_rfc3339 {
+                    Some(s) => Some(s.parse::<DateTime<Utc>>().map_err(|e| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            5,
+                            rusqlite::types::Type::Text,
+                            Box::new(e),
+                        )
+                    })?),
+                    None => None,
+                };
+
+                let updated_at = row
+                    .updated_at_rfc3339
+                    .parse::<DateTime<Utc>>()
+                    .map_err(|e| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            7,
+                            rusqlite::types::Type::Text,
+                            Box::new(e),
+                        )
+                    })?;
+
+                Ok(Some(ControlPlaneRecord {
+                    base_url: row.base_url,
+                    device_id,
+                    policy_signing_pubkey_b64: row.policy_signing_pubkey_b64,
+                    last_policy_bundle_id: row.last_policy_bundle_id,
+                    last_receipt_upload_id: row.last_receipt_upload_id,
+                    last_sync_at,
+                    last_error: row.last_error,
+                    updated_at,
+                }))
+            })
+            .await
+            .map_err(Into::into)
+    }
+
+    pub async fn upsert_control_plane_enrollment(
+        &self,
+        base_url: &str,
+        device_id: Uuid,
+        policy_signing_pubkey_b64: &str,
+        last_policy_bundle_id: Option<i64>,
+    ) -> anyhow::Result<()> {
+        let base_url = base_url.to_string();
+        let device_id = device_id.to_string();
+        let policy_signing_pubkey_b64 = policy_signing_pubkey_b64.to_string();
+        let updated_at = Utc::now().to_rfc3339();
+
+        self.conn
+            .call(move |conn| {
+                conn.execute(
+                    r#"
+                    INSERT INTO control_plane(
+                      id,
+                      base_url,
+                      device_id,
+                      policy_signing_pubkey_b64,
+                      last_policy_bundle_id,
+                      last_receipt_upload_id,
+                      last_sync_at_rfc3339,
+                      last_error,
+                      updated_at_rfc3339
+                    ) VALUES (1, ?1, ?2, ?3, ?4, 0, NULL, NULL, ?5)
+                    ON CONFLICT(id) DO UPDATE SET
+                      base_url=excluded.base_url,
+                      device_id=excluded.device_id,
+                      policy_signing_pubkey_b64=excluded.policy_signing_pubkey_b64,
+                      last_policy_bundle_id=excluded.last_policy_bundle_id,
+                      last_receipt_upload_id=0,
+                      last_sync_at_rfc3339=NULL,
+                      last_error=NULL,
+                      updated_at_rfc3339=excluded.updated_at_rfc3339
+                    "#,
+                    params![
+                        base_url,
+                        device_id,
+                        policy_signing_pubkey_b64,
+                        last_policy_bundle_id,
+                        updated_at,
+                    ],
+                )?;
+                Ok(())
+            })
+            .await?;
+        Ok(())
+    }
+
+    pub async fn delete_control_plane_enrollment(&self) -> anyhow::Result<()> {
+        self.conn
+            .call(|conn| {
+                conn.execute("DELETE FROM control_plane WHERE id=1", [])?;
+                Ok(())
+            })
+            .await?;
+        Ok(())
+    }
+
+    pub async fn update_control_plane_sync_status(
+        &self,
+        last_sync_at: DateTime<Utc>,
+        last_error: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let last_sync_at = last_sync_at.to_rfc3339();
+        let last_error = last_error.map(|s| s.to_string());
+        let updated_at = Utc::now().to_rfc3339();
+        self.conn
+            .call(move |conn| {
+                conn.execute(
+                    "UPDATE control_plane SET last_sync_at_rfc3339=?1, last_error=?2, updated_at_rfc3339=?3 WHERE id=1",
+                    params![last_sync_at, last_error, updated_at],
+                )?;
+                Ok(())
+            })
+            .await?;
+        Ok(())
+    }
+
+    pub async fn set_control_plane_last_policy_bundle_id(
+        &self,
+        bundle_id: i64,
+    ) -> anyhow::Result<()> {
+        let updated_at = Utc::now().to_rfc3339();
+        self.conn
+            .call(move |conn| {
+                conn.execute(
+                    "UPDATE control_plane SET last_policy_bundle_id=?1, updated_at_rfc3339=?2 WHERE id=1",
+                    params![bundle_id, updated_at],
+                )?;
+                Ok(())
+            })
+            .await?;
+        Ok(())
+    }
+
+    pub async fn set_control_plane_last_receipt_upload_id(
+        &self,
+        receipt_id: i64,
+    ) -> anyhow::Result<()> {
+        let updated_at = Utc::now().to_rfc3339();
+        self.conn
+            .call(move |conn| {
+                conn.execute(
+                    "UPDATE control_plane SET last_receipt_upload_id=?1, updated_at_rfc3339=?2 WHERE id=1",
+                    params![receipt_id, updated_at],
+                )?;
+                Ok(())
+            })
+            .await?;
+        Ok(())
+    }
+
+    pub async fn apply_policy_and_budgets(
+        &self,
+        policy_text: &str,
+        budgets: &BTreeMap<String, i64>,
+    ) -> anyhow::Result<PolicyRecord> {
+        let policy_text = policy_text.to_string();
+        let policy_hash_hex = sha256_hex(policy_text.as_bytes());
+        let updated_at = Utc::now();
+
+        let policy_text_db = policy_text.clone();
+        let policy_hash_hex_db = policy_hash_hex.clone();
+        let updated_at_db = updated_at.to_rfc3339();
+        let budgets_db = budgets.clone();
+
+        self.conn
+            .call(move |conn| {
+                let tx = conn.transaction()?;
+
+                tx.execute(
+                    r#"
+                    INSERT INTO policy(id, policy_text, policy_hash_hex, updated_at_rfc3339)
+                    VALUES (1, ?1, ?2, ?3)
+                    ON CONFLICT(id) DO UPDATE SET
+                      policy_text=excluded.policy_text,
+                      policy_hash_hex=excluded.policy_hash_hex,
+                      updated_at_rfc3339=excluded.updated_at_rfc3339
+                    "#,
+                    params![policy_text_db, policy_hash_hex_db, updated_at_db],
+                )?;
+
+                for (cat, limit) in budgets_db {
+                    if limit < 0 {
+                        continue;
+                    }
+                    tx.execute(
+                        r#"
+                        INSERT INTO budgets(category, daily_limit_microusd)
+                        VALUES (?1, ?2)
+                        ON CONFLICT(category) DO UPDATE SET
+                          daily_limit_microusd=excluded.daily_limit_microusd
+                        "#,
+                        params![cat, limit],
+                    )?;
+                }
+
+                tx.commit()?;
+                Ok(())
+            })
+            .await?;
+
+        Ok(PolicyRecord {
+            policy_text,
+            policy_hash_hex,
+            updated_at,
+        })
     }
 
     pub async fn create_policy_proposal(

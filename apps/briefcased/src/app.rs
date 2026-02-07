@@ -11,8 +11,9 @@ use axum::{Json, Router};
 use base64::Engine as _;
 use briefcase_api::types::{
     AiAnomaliesResponse, AiAnomaly, AiAnomalyKind, AiSeverity, ApproveResponse, BudgetRecord,
-    CallToolRequest, CallToolResponse, DeleteMcpServerResponse, DeleteProviderResponse,
-    ErrorResponse, FetchVcResponse, IdentityResponse, ListApprovalsResponse, ListBudgetsResponse,
+    CallToolRequest, CallToolResponse, ControlPlaneEnrollRequest, ControlPlaneStatusResponse,
+    ControlPlaneSyncResponse, DeleteMcpServerResponse, DeleteProviderResponse, ErrorResponse,
+    FetchVcResponse, IdentityResponse, ListApprovalsResponse, ListBudgetsResponse,
     ListMcpServersResponse, ListProvidersResponse, ListReceiptsResponse, ListToolsResponse,
     McpOAuthExchangeRequest, McpOAuthExchangeResponse, McpOAuthStartRequest, McpOAuthStartResponse,
     OAuthExchangeRequest, OAuthExchangeResponse, ProviderSummary, RevokeMcpOAuthResponse,
@@ -309,10 +310,13 @@ pub async fn serve_tcp(addr: SocketAddr, state: AppState) -> anyhow::Result<()> 
         .with_context(|| format!("bind tcp {addr}"))?;
     let local_addr = listener.local_addr()?;
     info!(addr = %local_addr, "briefcased listening");
-    axum::serve(listener, router(state))
+    let control_plane_worker = crate::control_plane::spawn_control_plane_worker(state.clone());
+    let app = router(state);
+    axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await
         .context("serve tcp")?;
+    control_plane_worker.abort();
     Ok(())
 }
 
@@ -327,10 +331,13 @@ pub async fn serve_unix(path: PathBuf, state: AppState) -> anyhow::Result<()> {
     let listener = tokio::net::UnixListener::bind(&path)
         .with_context(|| format!("bind unix socket {}", path.display()))?;
     info!(path = %path.display(), "briefcased listening");
-    axum::serve(listener, router(state))
+    let control_plane_worker = crate::control_plane::spawn_control_plane_worker(state.clone());
+    let app = router(state);
+    axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await
         .context("serve unix")?;
+    control_plane_worker.abort();
     Ok(())
 }
 
@@ -364,6 +371,9 @@ fn router(state: AppState) -> Router {
             "/v1/policy/proposals/{id}/apply",
             post(crate::policy_compiler::policy_apply),
         )
+        .route("/v1/control-plane", get(get_control_plane_status))
+        .route("/v1/control-plane/enroll", post(control_plane_enroll))
+        .route("/v1/control-plane/sync", post(control_plane_sync))
         .route("/v1/providers/{id}/oauth/exchange", post(oauth_exchange))
         .route("/v1/providers/{id}/vc/fetch", post(fetch_vc))
         .route("/v1/tools", get(list_tools))
@@ -1118,6 +1128,79 @@ async fn set_budget(
         category,
         daily_limit_microusd: req.daily_limit_microusd,
     }))
+}
+
+async fn get_control_plane_status(
+    State(state): State<AppState>,
+) -> Result<Json<ControlPlaneStatusResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let rec = crate::control_plane::status(&state)
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(control_plane_status_from_record(rec)))
+}
+
+async fn control_plane_enroll(
+    State(state): State<AppState>,
+    Json(req): Json<ControlPlaneEnrollRequest>,
+) -> Result<Json<ControlPlaneStatusResponse>, (StatusCode, Json<ErrorResponse>)> {
+    if req.base_url.trim().is_empty() {
+        return Err(bad_request("missing_base_url"));
+    }
+    if req.admin_token.trim().is_empty() {
+        return Err(bad_request("missing_admin_token"));
+    }
+    if req.device_name.trim().is_empty() {
+        return Err(bad_request("missing_device_name"));
+    }
+
+    let rec = crate::control_plane::enroll(
+        &state,
+        req.base_url.trim(),
+        req.admin_token.trim(),
+        req.device_name.trim(),
+    )
+    .await
+    .map_err(internal_error)?;
+
+    Ok(Json(control_plane_status_from_record(Some(rec))))
+}
+
+async fn control_plane_sync(
+    State(state): State<AppState>,
+) -> Result<Json<ControlPlaneSyncResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let enrolled = crate::control_plane::status(&state)
+        .await
+        .map_err(internal_error)?
+        .is_some();
+    if !enrolled {
+        return Ok(Json(ControlPlaneSyncResponse::NotEnrolled));
+    }
+
+    let out = crate::control_plane::sync_once(&state)
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(ControlPlaneSyncResponse::Synced {
+        policy_applied: out.policy_applied,
+        receipts_uploaded: out.receipts_uploaded,
+    }))
+}
+
+fn control_plane_status_from_record(
+    rec: Option<crate::db::ControlPlaneRecord>,
+) -> ControlPlaneStatusResponse {
+    match rec {
+        None => ControlPlaneStatusResponse::NotEnrolled,
+        Some(r) => ControlPlaneStatusResponse::Enrolled {
+            base_url: r.base_url,
+            device_id: r.device_id,
+            policy_signing_pubkey_b64: r.policy_signing_pubkey_b64,
+            last_policy_bundle_id: r.last_policy_bundle_id,
+            last_receipt_upload_id: r.last_receipt_upload_id,
+            last_sync_at_rfc3339: r.last_sync_at.map(|t| t.to_rfc3339()),
+            last_error: r.last_error,
+            updated_at_rfc3339: r.updated_at.to_rfc3339(),
+        },
+    }
 }
 
 async fn call_tool(
@@ -2721,6 +2804,7 @@ mod tests {
     use briefcase_api::types::CallToolRequest;
     use briefcase_api::{BriefcaseClient, BriefcaseClientError, DaemonEndpoint};
     use briefcase_core::ToolCallContext;
+    use ed25519_dalek::Signer as _;
     use tempfile::tempdir;
 
     mod signer_sim {
@@ -3907,6 +3991,169 @@ mod tests {
         let handle = tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
+        Ok((addr, st, handle))
+    }
+
+    #[derive(Clone)]
+    struct MockControlPlaneState {
+        admin_token: String,
+        device_token: String,
+        signing_key: ed25519_dalek::SigningKey,
+        bundle: Arc<tokio::sync::Mutex<briefcase_control_plane_api::types::PolicyBundle>>,
+        receipts: Arc<tokio::sync::Mutex<Vec<briefcase_core::ReceiptRecord>>>,
+    }
+
+    async fn start_mock_control_plane(
+        initial_bundle: briefcase_control_plane_api::types::PolicyBundle,
+    ) -> anyhow::Result<(
+        SocketAddr,
+        MockControlPlaneState,
+        tokio::task::JoinHandle<()>,
+    )> {
+        use axum::extract::{Path as AxumPath, State as AxumState};
+        use axum::http::{HeaderMap, StatusCode};
+        use axum::routing::{get, post};
+        use axum::{Json, Router};
+        use base64::Engine as _;
+        use briefcase_control_plane_api::types::{
+            DevicePolicyResponse, EnrollDeviceRequest, EnrollDeviceResponse, SignedPolicyBundle,
+            UploadReceiptsRequest, UploadReceiptsResponse,
+        };
+
+        fn unauthorized() -> (StatusCode, Json<briefcase_control_plane_api::ErrorResponse>) {
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(briefcase_control_plane_api::ErrorResponse {
+                    code: "unauthorized".to_string(),
+                    message: "unauthorized".to_string(),
+                }),
+            )
+        }
+
+        async fn health() -> Json<briefcase_control_plane_api::HealthResponse> {
+            Json(briefcase_control_plane_api::HealthResponse {
+                status: "ok".to_string(),
+                ts: Utc::now().to_rfc3339(),
+            })
+        }
+
+        async fn enroll_device(
+            AxumState(st): AxumState<MockControlPlaneState>,
+            headers: HeaderMap,
+            Json(req): Json<EnrollDeviceRequest>,
+        ) -> Result<
+            Json<EnrollDeviceResponse>,
+            (StatusCode, Json<briefcase_control_plane_api::ErrorResponse>),
+        > {
+            let ok = headers
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|h| h.to_str().ok())
+                .and_then(|v| v.strip_prefix("Bearer "))
+                .map(|t| t == st.admin_token)
+                .unwrap_or(false);
+            if !ok {
+                return Err(unauthorized());
+            }
+
+            // The control plane issues a signed policy bundle and a device token.
+            let bundle = st.bundle.lock().await.clone();
+            let bytes = serde_json::to_vec(&bundle).map_err(|_| unauthorized())?;
+            let sig = st.signing_key.sign(&bytes);
+            let signature_b64 =
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sig.to_bytes());
+
+            let pk = st.signing_key.verifying_key().to_bytes();
+            let policy_signing_pubkey_b64 =
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(pk);
+
+            Ok(Json(EnrollDeviceResponse {
+                device_id: req.device_id,
+                device_token: st.device_token.clone(),
+                policy_signing_pubkey_b64,
+                policy_bundle: SignedPolicyBundle {
+                    bundle,
+                    signature_b64,
+                },
+            }))
+        }
+
+        async fn device_get_policy(
+            AxumState(st): AxumState<MockControlPlaneState>,
+            AxumPath(_device_id): AxumPath<uuid::Uuid>,
+            headers: HeaderMap,
+        ) -> Result<
+            Json<DevicePolicyResponse>,
+            (StatusCode, Json<briefcase_control_plane_api::ErrorResponse>),
+        > {
+            let ok = headers
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|h| h.to_str().ok())
+                .and_then(|v| v.strip_prefix("Bearer "))
+                .map(|t| t == st.device_token)
+                .unwrap_or(false);
+            if !ok {
+                return Err(unauthorized());
+            }
+
+            let bundle = st.bundle.lock().await.clone();
+            let bytes = serde_json::to_vec(&bundle).map_err(|_| unauthorized())?;
+            let sig = st.signing_key.sign(&bytes);
+            let signature_b64 =
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sig.to_bytes());
+            Ok(Json(DevicePolicyResponse {
+                policy_bundle: SignedPolicyBundle {
+                    bundle,
+                    signature_b64,
+                },
+            }))
+        }
+
+        async fn device_upload_receipts(
+            AxumState(st): AxumState<MockControlPlaneState>,
+            AxumPath(_device_id): AxumPath<uuid::Uuid>,
+            headers: HeaderMap,
+            Json(req): Json<UploadReceiptsRequest>,
+        ) -> Result<
+            Json<UploadReceiptsResponse>,
+            (StatusCode, Json<briefcase_control_plane_api::ErrorResponse>),
+        > {
+            let ok = headers
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|h| h.to_str().ok())
+                .and_then(|v| v.strip_prefix("Bearer "))
+                .map(|t| t == st.device_token)
+                .unwrap_or(false);
+            if !ok {
+                return Err(unauthorized());
+            }
+
+            let stored = req.receipts.len();
+            st.receipts.lock().await.extend(req.receipts);
+            Ok(Json(UploadReceiptsResponse { stored }))
+        }
+
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[42u8; 32]);
+        let st = MockControlPlaneState {
+            admin_token: "admin".to_string(),
+            device_token: "device-token".to_string(),
+            signing_key,
+            bundle: Arc::new(tokio::sync::Mutex::new(initial_bundle)),
+            receipts: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+        };
+
+        let app = Router::new()
+            .route("/health", get(health))
+            .route("/v1/admin/devices/enroll", post(enroll_device))
+            .route("/v1/devices/{id}/policy", get(device_get_policy))
+            .route("/v1/devices/{id}/receipts", post(device_upload_receipts))
+            .with_state(st.clone());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
         Ok((addr, st, handle))
     }
 
@@ -5406,6 +5653,198 @@ mod tests {
         daemon_task.abort();
         secure_task.abort();
         provider_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn control_plane_enroll_and_sync_applies_policy_and_uploads_receipts()
+    -> anyhow::Result<()> {
+        use std::collections::BTreeMap;
+
+        let (provider_addr, _provider_state, provider_task) = start_mock_provider().await?;
+        let provider_base_url = format!("http://{provider_addr}");
+
+        let (state, _daemon_base, client, daemon_task) = start_daemon(provider_base_url).await?;
+
+        let default_policy =
+            briefcase_policy::CedarPolicyEngineOptions::default_policies().policy_text;
+        let mut budgets1 = BTreeMap::new();
+        budgets1.insert("read".to_string(), 12_345);
+
+        let bundle1 = briefcase_control_plane_api::types::PolicyBundle {
+            bundle_id: 1,
+            policy_text: format!("{default_policy}\n// bundle 1\n"),
+            budgets: budgets1,
+            updated_at_rfc3339: Utc::now().to_rfc3339(),
+        };
+
+        let (cp_addr, cp_state, cp_task) = start_mock_control_plane(bundle1).await?;
+        let cp_base_url = format!("http://{cp_addr}");
+
+        let st = client.control_plane_status().await?;
+        assert!(
+            matches!(
+                st,
+                briefcase_api::types::ControlPlaneStatusResponse::NotEnrolled
+            ),
+            "expected not enrolled status: {st:?}"
+        );
+
+        let enrolled = client
+            .control_plane_enroll(briefcase_api::types::ControlPlaneEnrollRequest {
+                base_url: cp_base_url.clone(),
+                admin_token: "admin".to_string(),
+                device_name: "laptop-1".to_string(),
+            })
+            .await?;
+
+        match enrolled {
+            briefcase_api::types::ControlPlaneStatusResponse::Enrolled {
+                base_url,
+                device_id: _,
+                ..
+            } => {
+                assert_eq!(base_url, cp_base_url);
+            }
+            other => anyhow::bail!("expected enrolled status, got {other:?}"),
+        };
+
+        let pol1 = client.policy_get().await?;
+        assert!(
+            pol1.policy_text.contains("// bundle 1"),
+            "expected bundle 1 policy text"
+        );
+
+        let read_budget = client
+            .list_budgets()
+            .await?
+            .budgets
+            .into_iter()
+            .find(|b| b.category == "read")
+            .map(|b| b.daily_limit_microusd)
+            .unwrap_or_default();
+        assert_eq!(read_budget, 12_345);
+
+        let receipt = state
+            .receipts
+            .append(serde_json::json!({
+                "kind": "tool_call",
+                "tool_id": "echo",
+                "runtime": "builtin",
+                "decision": "allow",
+                "cost_usd": 0.0,
+                "source": "local:test",
+                "ts": Utc::now().to_rfc3339(),
+            }))
+            .await?;
+
+        // Simulate an updated policy bundle.
+        let mut budgets2 = BTreeMap::new();
+        budgets2.insert("read".to_string(), 999);
+        let bundle2 = briefcase_control_plane_api::types::PolicyBundle {
+            bundle_id: 2,
+            policy_text: format!("{default_policy}\n// bundle 2\n"),
+            budgets: budgets2,
+            updated_at_rfc3339: Utc::now().to_rfc3339(),
+        };
+        *cp_state.bundle.lock().await = bundle2;
+
+        let sync = client.control_plane_sync().await?;
+        match sync {
+            briefcase_api::types::ControlPlaneSyncResponse::Synced {
+                policy_applied,
+                receipts_uploaded,
+            } => {
+                assert!(policy_applied, "expected policy_applied");
+                assert!(receipts_uploaded >= 1, "expected receipt upload");
+            }
+            other => anyhow::bail!("expected synced response, got {other:?}"),
+        }
+
+        let pol2 = client.policy_get().await?;
+        assert!(
+            pol2.policy_text.contains("// bundle 2"),
+            "expected bundle 2 policy text"
+        );
+
+        let st2 = client.control_plane_status().await?;
+        match st2 {
+            briefcase_api::types::ControlPlaneStatusResponse::Enrolled {
+                last_policy_bundle_id,
+                last_receipt_upload_id,
+                ..
+            } => {
+                assert_eq!(last_policy_bundle_id, Some(2));
+                assert!(
+                    last_receipt_upload_id >= receipt.id,
+                    "expected receipt watermark to advance"
+                );
+            }
+            other => anyhow::bail!("expected enrolled status, got {other:?}"),
+        }
+
+        let stored = cp_state.receipts.lock().await.clone();
+        assert!(
+            stored.iter().any(|r| r.id == receipt.id),
+            "control plane should store uploaded receipt"
+        );
+
+        daemon_task.abort();
+        provider_task.abort();
+        cp_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn control_plane_enroll_rolls_back_on_policy_compile_error() -> anyhow::Result<()> {
+        use std::collections::BTreeMap;
+
+        let (provider_addr, _provider_state, provider_task) = start_mock_provider().await?;
+        let provider_base_url = format!("http://{provider_addr}");
+
+        let (state, _daemon_base, client, daemon_task) = start_daemon(provider_base_url).await?;
+
+        let mut budgets = BTreeMap::new();
+        budgets.insert("read".to_string(), 1);
+        let bundle = briefcase_control_plane_api::types::PolicyBundle {
+            bundle_id: 1,
+            policy_text: "this is not valid cedar".to_string(),
+            budgets,
+            updated_at_rfc3339: Utc::now().to_rfc3339(),
+        };
+
+        let (cp_addr, _cp_state, cp_task) = start_mock_control_plane(bundle).await?;
+        let cp_base_url = format!("http://{cp_addr}");
+
+        let err = client
+            .control_plane_enroll(briefcase_api::types::ControlPlaneEnrollRequest {
+                base_url: cp_base_url,
+                admin_token: "admin".to_string(),
+                device_name: "laptop-1".to_string(),
+            })
+            .await;
+        assert!(err.is_err(), "expected enroll error");
+
+        let st = client.control_plane_status().await?;
+        assert!(
+            matches!(
+                st,
+                briefcase_api::types::ControlPlaneStatusResponse::NotEnrolled
+            ),
+            "expected rollback to not_enrolled: {st:?}"
+        );
+        assert!(
+            state
+                .secrets
+                .get("control_plane.device_token")
+                .await?
+                .is_none(),
+            "device token should be rolled back"
+        );
+
+        daemon_task.abort();
+        provider_task.abort();
+        cp_task.abort();
         Ok(())
     }
 

@@ -18,6 +18,18 @@ export interface paths {
     /** Get holder identity DID */
     get: operations["getIdentity"];
   };
+  "/v1/control-plane": {
+    /** Get enterprise control plane enrollment status */
+    get: operations["controlPlaneStatus"];
+  };
+  "/v1/control-plane/enroll": {
+    /** Enroll this device into the enterprise control plane */
+    post: operations["controlPlaneEnroll"];
+  };
+  "/v1/control-plane/sync": {
+    /** Trigger an immediate control plane sync (policy + receipts) */
+    post: operations["controlPlaneSync"];
+  };
   "/v1/providers": {
     /** List providers */
     get: operations["listProviders"];
@@ -148,6 +160,41 @@ export interface components {
     IdentityResponse: {
       did: string;
     };
+    ControlPlaneStatusResponse: OneOf<[{
+      /** @constant */
+      status: "not_enrolled";
+    }, {
+      /** @constant */
+      status: "enrolled";
+      base_url: string;
+      /** Format: uuid */
+      device_id: string;
+      policy_signing_pubkey_b64: string;
+      /** Format: int64 */
+      last_policy_bundle_id: number | null;
+      /** Format: int64 */
+      last_receipt_upload_id: number;
+      /** Format: date-time */
+      last_sync_at_rfc3339: string | null;
+      last_error: string | null;
+      /** Format: date-time */
+      updated_at_rfc3339: string;
+    }]>;
+    ControlPlaneEnrollRequest: {
+      base_url: string;
+      admin_token: string;
+      device_name: string;
+    };
+    ControlPlaneSyncResponse: OneOf<[{
+      /** @constant */
+      status: "not_enrolled";
+    }, {
+      /** @constant */
+      status: "synced";
+      policy_applied: boolean;
+      /** Format: int64 */
+      receipts_uploaded: number;
+    }]>;
     ProviderSummary: {
       id: string;
       base_url: string;
@@ -498,6 +545,68 @@ export interface operations {
       200: {
         content: {
           "application/json": components["schemas"]["IdentityResponse"];
+        };
+      };
+      /** @description unauthorized */
+      401: {
+        content: {
+          "application/json": components["schemas"]["ErrorResponse"];
+        };
+      };
+    };
+  };
+  /** Get enterprise control plane enrollment status */
+  controlPlaneStatus: {
+    responses: {
+      /** @description ok */
+      200: {
+        content: {
+          "application/json": components["schemas"]["ControlPlaneStatusResponse"];
+        };
+      };
+      /** @description unauthorized */
+      401: {
+        content: {
+          "application/json": components["schemas"]["ErrorResponse"];
+        };
+      };
+    };
+  };
+  /** Enroll this device into the enterprise control plane */
+  controlPlaneEnroll: {
+    requestBody: {
+      content: {
+        "application/json": components["schemas"]["ControlPlaneEnrollRequest"];
+      };
+    };
+    responses: {
+      /** @description ok */
+      200: {
+        content: {
+          "application/json": components["schemas"]["ControlPlaneStatusResponse"];
+        };
+      };
+      /** @description bad request */
+      400: {
+        content: {
+          "application/json": components["schemas"]["ErrorResponse"];
+        };
+      };
+      /** @description unauthorized */
+      401: {
+        content: {
+          "application/json": components["schemas"]["ErrorResponse"];
+        };
+      };
+    };
+  };
+  /** Trigger an immediate control plane sync (policy + receipts) */
+  controlPlaneSync: {
+    responses: {
+      /** @description ok */
+      200: {
+        content: {
+          "application/json": components["schemas"]["ControlPlaneSyncResponse"];
         };
       };
       /** @description unauthorized */

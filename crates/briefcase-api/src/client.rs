@@ -15,6 +15,7 @@ use thiserror::Error;
 
 use crate::types::{
     AiAnomaliesResponse, ApproveResponse, BudgetRecord, CallToolRequest, CallToolResponse,
+    ControlPlaneEnrollRequest, ControlPlaneStatusResponse, ControlPlaneSyncResponse,
     DeleteMcpServerResponse, DeleteProviderResponse, ErrorResponse, FetchVcResponse,
     IdentityResponse, ListApprovalsResponse, ListBudgetsResponse, ListMcpServersResponse,
     ListProvidersResponse, ListReceiptsResponse, ListToolsResponse, McpOAuthExchangeRequest,
@@ -76,6 +77,26 @@ impl BriefcaseClient {
 
     pub async fn identity(&self) -> Result<IdentityResponse, BriefcaseClientError> {
         self.get_json("/v1/identity").await
+    }
+
+    pub async fn control_plane_status(
+        &self,
+    ) -> Result<ControlPlaneStatusResponse, BriefcaseClientError> {
+        self.get_json("/v1/control-plane").await
+    }
+
+    pub async fn control_plane_enroll(
+        &self,
+        req: ControlPlaneEnrollRequest,
+    ) -> Result<ControlPlaneStatusResponse, BriefcaseClientError> {
+        self.post_json("/v1/control-plane/enroll", req).await
+    }
+
+    pub async fn control_plane_sync(
+        &self,
+    ) -> Result<ControlPlaneSyncResponse, BriefcaseClientError> {
+        self.post_json("/v1/control-plane/sync", serde_json::json!({}))
+            .await
     }
 
     pub async fn list_providers(&self) -> Result<ListProvidersResponse, BriefcaseClientError> {

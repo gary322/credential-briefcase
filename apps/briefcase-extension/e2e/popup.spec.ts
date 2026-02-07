@@ -97,6 +97,7 @@ test("popup flows: servers/providers/approvals/receipts/budgets", async ({ page 
       anomalies: unknown[];
       receipts: unknown[];
       budgets: { category: string; daily_limit_microusd: number }[];
+      control_plane: any;
     } = {
       servers: [
         {
@@ -147,6 +148,7 @@ test("popup flows: servers/providers/approvals/receipts/budgets", async ({ page 
         },
       ],
       budgets: [{ category: "default", daily_limit_microusd: 123 }],
+      control_plane: { status: "not_enrolled" },
     };
 
     function ok(result: unknown) {
@@ -164,6 +166,36 @@ test("popup flows: servers/providers/approvals/receipts/budgets", async ({ page 
             const params = msg.params ?? {};
 
             switch (method) {
+              case "control_plane_status":
+                return ok(state.control_plane);
+              case "control_plane_enroll": {
+                const { base_url, device_name } = params;
+                state.control_plane = {
+                  status: "enrolled",
+                  base_url,
+                  device_id: "00000000-0000-0000-0000-000000000123",
+                  policy_signing_pubkey_b64: "pubkey",
+                  last_policy_bundle_id: 1,
+                  last_receipt_upload_id: 0,
+                  last_sync_at_rfc3339: null,
+                  last_error: null,
+                  updated_at_rfc3339: "2026-01-01T00:00:00Z",
+                  device_name,
+                };
+                return ok(state.control_plane);
+              }
+              case "control_plane_sync": {
+                if (state.control_plane.status === "not_enrolled") {
+                  return ok({ status: "not_enrolled" });
+                }
+                state.control_plane.last_sync_at_rfc3339 = "2026-01-01T00:00:01Z";
+                state.control_plane.last_receipt_upload_id += 1;
+                return ok({
+                  status: "synced",
+                  policy_applied: false,
+                  receipts_uploaded: 1,
+                });
+              }
               case "list_mcp_servers":
                 return ok({ servers: state.servers });
               case "upsert_mcp_server": {
@@ -283,9 +315,12 @@ test("popup flows: servers/providers/approvals/receipts/budgets", async ({ page 
 
   // Approvals tab.
   await page.getByRole("button", { name: "Approvals" }).click();
-  await expect(page.getByText("demo.write")).toBeVisible();
+  await expect(page.getByText("demo.write", { exact: true })).toBeVisible();
   await expect(
-    page.getByText("Approve write tool call: demo.write", { exact: false }),
+    page
+      .locator("#approvals div.url")
+      .filter({ hasText: "Approve write tool call: demo.write" })
+      .first(),
   ).toBeVisible();
   await page.getByRole("button", { name: "Approve" }).click();
   await expect(page.getByText("No pending approvals.")).toBeVisible();
@@ -296,6 +331,18 @@ test("popup flows: servers/providers/approvals/receipts/budgets", async ({ page 
     page.getByText("tool output contained suspicious instruction signals"),
   ).toBeVisible();
 
+  // Enterprise tab.
+  await page.getByRole("button", { name: "Enterprise" }).click();
+  await expect(page.getByText("Not enrolled.")).toBeVisible();
+  await page.getByLabel("Control Plane Base URL").fill("http://127.0.0.1:9999");
+  await page.getByLabel("Admin Token").fill("admin-token");
+  await page.getByLabel("Device Name").fill("laptop-1");
+  await page.getByRole("button", { name: "Enroll" }).click();
+  await expect(page.getByText("Enrolled.")).toBeVisible();
+  await expect(page.getByText("base_url: http://127.0.0.1:9999")).toBeVisible();
+  await page.getByRole("button", { name: "Sync now" }).click();
+  await expect(page.getByText("Sync complete.", { exact: false })).toBeVisible();
+
   // Receipts tab.
   await page.getByRole("button", { name: "Receipts" }).click();
   await expect(page.getByText("tool_call:demo.read")).toBeVisible();
@@ -304,7 +351,7 @@ test("popup flows: servers/providers/approvals/receipts/budgets", async ({ page 
 
   // Budgets tab.
   await page.getByRole("button", { name: "Budgets" }).click();
-  await expect(page.getByText("default")).toBeVisible();
+  await expect(page.locator("#budgets").getByText("default", { exact: true })).toBeVisible();
   await page.getByLabel("Category").fill("research");
   await page.getByLabel("Daily Limit (micro-USD)").fill("999");
   await page.getByRole("button", { name: "Set Budget" }).click();

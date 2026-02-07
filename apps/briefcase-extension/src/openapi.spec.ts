@@ -23,6 +23,11 @@ describe("briefcased OpenAPI types", () => {
     type HasPolicyApply =
       "/v1/policy/proposals/{id}/apply" extends keyof paths ? true : false;
     type HasAiAnomalies = "/v1/ai/anomalies" extends keyof paths ? true : false;
+    type HasControlPlane = "/v1/control-plane" extends keyof paths ? true : false;
+    type HasControlPlaneEnroll =
+      "/v1/control-plane/enroll" extends keyof paths ? true : false;
+    type HasControlPlaneSync =
+      "/v1/control-plane/sync" extends keyof paths ? true : false;
 
     const hasTools: HasTools = true;
     const hasCallTool: HasCallTool = true;
@@ -37,6 +42,9 @@ describe("briefcased OpenAPI types", () => {
     const hasPolicyCompile: HasPolicyCompile = true;
     const hasPolicyApply: HasPolicyApply = true;
     const hasAiAnomalies: HasAiAnomalies = true;
+    const hasControlPlane: HasControlPlane = true;
+    const hasControlPlaneEnroll: HasControlPlaneEnroll = true;
+    const hasControlPlaneSync: HasControlPlaneSync = true;
 
     // Runtime assertions are intentionally trivial; this test mainly ensures type generation stays in sync.
     expect(
@@ -52,7 +60,10 @@ describe("briefcased OpenAPI types", () => {
         hasPolicy &&
         hasPolicyCompile &&
         hasPolicyApply &&
-        hasAiAnomalies,
+        hasAiAnomalies &&
+        hasControlPlane &&
+        hasControlPlaneEnroll &&
+        hasControlPlaneSync,
     ).toBe(true);
   });
 });

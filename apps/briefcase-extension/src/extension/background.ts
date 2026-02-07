@@ -11,6 +11,9 @@ type PopupResponse =
 const ALLOWED_RPC_METHODS = new Set([
   "health",
   "identity",
+  "control_plane_status",
+  "control_plane_enroll",
+  "control_plane_sync",
   "list_tools",
   "list_providers",
   "upsert_provider",

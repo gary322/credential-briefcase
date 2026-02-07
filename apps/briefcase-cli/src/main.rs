@@ -54,6 +54,10 @@ enum Command {
         #[command(subcommand)]
         cmd: IdentityCommand,
     },
+    ControlPlane {
+        #[command(subcommand)]
+        cmd: ControlPlaneCommand,
+    },
     Providers {
         #[command(subcommand)]
         cmd: ProvidersCommand,
@@ -93,6 +97,23 @@ enum ToolsCommand {
 #[derive(Debug, Subcommand)]
 enum IdentityCommand {
     Show,
+}
+
+#[derive(Debug, Subcommand)]
+enum ControlPlaneCommand {
+    Status,
+    Enroll {
+        base_url: String,
+        device_name: String,
+        /// Admin bearer token for the control plane. Prefer setting `BRIEFCASE_CONTROL_PLANE_ADMIN_TOKEN`
+        /// to avoid leaking it in shell history.
+        #[arg(long, env = "BRIEFCASE_CONTROL_PLANE_ADMIN_TOKEN")]
+        admin_token: Option<String>,
+        /// Read admin token from stdin (useful for piping).
+        #[arg(long)]
+        admin_token_stdin: bool,
+    },
+    Sync,
 }
 
 #[derive(Debug, Subcommand)]
@@ -217,6 +238,7 @@ async fn main() -> anyhow::Result<()> {
     match args.cmd {
         Command::Tools { cmd } => handle_tools(&client, cmd).await?,
         Command::Identity { cmd } => handle_identity(&client, cmd).await?,
+        Command::ControlPlane { cmd } => handle_control_plane(&client, cmd).await?,
         Command::Providers { cmd } => handle_providers(&client, cmd).await?,
         Command::Mcp { cmd } => handle_mcp(&client, cmd).await?,
         Command::Budgets { cmd } => handle_budgets(&client, cmd).await?,
@@ -232,6 +254,53 @@ async fn handle_identity(client: &BriefcaseClient, cmd: IdentityCommand) -> anyh
         IdentityCommand::Show => {
             let id = client.identity().await?;
             println!("{}", id.did);
+        }
+    }
+    Ok(())
+}
+
+async fn handle_control_plane(
+    client: &BriefcaseClient,
+    cmd: ControlPlaneCommand,
+) -> anyhow::Result<()> {
+    match cmd {
+        ControlPlaneCommand::Status => {
+            let st = client.control_plane_status().await?;
+            println!("{}", serde_json::to_string_pretty(&st)?);
+        }
+        ControlPlaneCommand::Enroll {
+            base_url,
+            device_name,
+            admin_token,
+            admin_token_stdin,
+        } => {
+            let admin_token = match (admin_token, admin_token_stdin) {
+                (Some(t), false) => t,
+                (None, true) => {
+                    let mut s = String::new();
+                    std::io::stdin().read_line(&mut s)?;
+                    s.trim().to_string()
+                }
+                (Some(_), true) => {
+                    anyhow::bail!("provide either --admin-token or --admin-token-stdin")
+                }
+                (None, false) => anyhow::bail!(
+                    "missing admin token (use --admin-token, --admin-token-stdin, or BRIEFCASE_CONTROL_PLANE_ADMIN_TOKEN)"
+                ),
+            };
+
+            let st = client
+                .control_plane_enroll(briefcase_api::types::ControlPlaneEnrollRequest {
+                    base_url,
+                    admin_token,
+                    device_name,
+                })
+                .await?;
+            println!("{}", serde_json::to_string_pretty(&st)?);
+        }
+        ControlPlaneCommand::Sync => {
+            let st = client.control_plane_sync().await?;
+            println!("{}", serde_json::to_string_pretty(&st)?);
         }
     }
     Ok(())

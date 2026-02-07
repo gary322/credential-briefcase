@@ -1058,6 +1058,7 @@ dependencies = [
  "base64",
  "briefcase-ai",
  "briefcase-api",
+ "briefcase-control-plane-api",
  "briefcase-core",
  "briefcase-dpop",
  "briefcase-identity",

@@ -294,7 +294,7 @@ For each task, include:
   - **Verify**: docker-compose e2e tests.
   - _Reqs: FR-12_
 
-- [ ] 11.2 Integrate device enrollment and policy sync into daemon
+- [x] 11.2 Integrate device enrollment and policy sync into daemon
   - **Do**: add enroll command; periodic sync; signature verification; safe rollback on failure.
   - **Files**: `apps/briefcased/src/control_plane.rs` (new), `apps/briefcase-cli/*`, `apps/briefcase-extension/*`
   - **Done when**: policy is centrally managed and enforced locally.

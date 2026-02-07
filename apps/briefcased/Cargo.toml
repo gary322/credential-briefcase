@@ -41,6 +41,7 @@ url.workspace = true
 
 briefcase-api = { path = "../../crates/briefcase-api" }
 briefcase-ai = { path = "../../crates/briefcase-ai" }
+briefcase-control-plane-api = { path = "../../crates/briefcase-control-plane-api" }
 briefcase-core = { path = "../../crates/briefcase-core" }
 briefcase-dpop = { path = "../../crates/briefcase-dpop" }
 briefcase-identity = { path = "../../crates/briefcase-identity" }

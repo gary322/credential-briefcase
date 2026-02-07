@@ -46,6 +46,84 @@ components:
         did:
           type: string
 
+    ControlPlaneStatusResponse:
+      oneOf:
+        - type: object
+          required: [status]
+          properties:
+            status:
+              type: string
+              const: not_enrolled
+        - type: object
+          required:
+            [
+              status,
+              base_url,
+              device_id,
+              policy_signing_pubkey_b64,
+              last_policy_bundle_id,
+              last_receipt_upload_id,
+              last_sync_at_rfc3339,
+              last_error,
+              updated_at_rfc3339,
+            ]
+          properties:
+            status:
+              type: string
+              const: enrolled
+            base_url:
+              type: string
+            device_id:
+              type: string
+              format: uuid
+            policy_signing_pubkey_b64:
+              type: string
+            last_policy_bundle_id:
+              type: ["integer", "null"]
+              format: int64
+            last_receipt_upload_id:
+              type: integer
+              format: int64
+            last_sync_at_rfc3339:
+              type: ["string", "null"]
+              format: date-time
+            last_error:
+              type: ["string", "null"]
+            updated_at_rfc3339:
+              type: string
+              format: date-time
+
+    ControlPlaneEnrollRequest:
+      type: object
+      required: [base_url, admin_token, device_name]
+      properties:
+        base_url:
+          type: string
+        admin_token:
+          type: string
+        device_name:
+          type: string
+
+    ControlPlaneSyncResponse:
+      oneOf:
+        - type: object
+          required: [status]
+          properties:
+            status:
+              type: string
+              const: not_enrolled
+        - type: object
+          required: [status, policy_applied, receipts_uploaded]
+          properties:
+            status:
+              type: string
+              const: synced
+            policy_applied:
+              type: boolean
+            receipts_uploaded:
+              type: integer
+              format: int64
+
     ProviderSummary:
       type: object
       required: [id, base_url, has_oauth_refresh, has_vc, vc_expires_at_rfc3339]
@@ -737,6 +815,78 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/IdentityResponse"
+        "401":
+          description: unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /v1/control-plane:
+    get:
+      summary: Get enterprise control plane enrollment status
+      operationId: controlPlaneStatus
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ControlPlaneStatusResponse"
+        "401":
+          description: unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /v1/control-plane/enroll:
+    post:
+      summary: Enroll this device into the enterprise control plane
+      operationId: controlPlaneEnroll
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ControlPlaneEnrollRequest"
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ControlPlaneStatusResponse"
+        "400":
+          description: bad request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "401":
+          description: unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /v1/control-plane/sync:
+    post:
+      summary: Trigger an immediate control plane sync (policy + receipts)
+      operationId: controlPlaneSync
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ControlPlaneSyncResponse"
         "401":
           description: unauthorized
           content:

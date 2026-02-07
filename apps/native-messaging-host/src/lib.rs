@@ -198,6 +198,13 @@ async fn handle(client: &BriefcaseClient, req: NativeRequest) -> anyhow::Result<
     }
 
     #[derive(Debug, Deserialize)]
+    struct ControlPlaneEnrollParams {
+        base_url: String,
+        admin_token: String,
+        device_name: String,
+    }
+
+    #[derive(Debug, Deserialize)]
     struct McpOAuthStartParams {
         server_id: String,
         client_id: String,
@@ -219,6 +226,21 @@ async fn handle(client: &BriefcaseClient, req: NativeRequest) -> anyhow::Result<
             Ok(ok_json!(serde_json::json!({ "status": "ok" })))
         }
         "identity" => Ok(ok_json!(client.identity().await?)),
+        "control_plane_status" => Ok(ok_json!(client.control_plane_status().await?)),
+        "control_plane_enroll" => {
+            let p: ControlPlaneEnrollParams =
+                serde_json::from_value(req.params).context("parse params")?;
+            Ok(ok_json!(
+                client
+                    .control_plane_enroll(briefcase_api::types::ControlPlaneEnrollRequest {
+                        base_url: p.base_url,
+                        admin_token: p.admin_token,
+                        device_name: p.device_name,
+                    })
+                    .await?
+            ))
+        }
+        "control_plane_sync" => Ok(ok_json!(client.control_plane_sync().await?)),
         "list_tools" => Ok(ok_json!(client.list_tools().await?)),
         "list_providers" => Ok(ok_json!(client.list_providers().await?)),
         "upsert_provider" => {
