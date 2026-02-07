@@ -134,9 +134,18 @@ jobs:
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
 
+      - name: Install Android SDK packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          yes | sdkmanager --licenses >/dev/null
+          sdkmanager --install \
+            "platforms;android-34" \
+            "build-tools;34.0.0"
+
       - name: Assemble debug
         working-directory: apps/briefcase-mobile-signer/android
-        run: ./gradlew :app:assembleDebug
+        run: ./gradlew :app:assembleDebug --stacktrace --no-daemon
 
       - name: Package APK
         shell: bash
@@ -173,7 +182,7 @@ jobs:
           xcodebuild \
             -project BriefcaseMobileSigner.xcodeproj \
             -scheme BriefcaseMobileSigner \
-            -destination 'platform=iOS Simulator,name=iPhone 15' \
+            -destination 'generic/platform=iOS Simulator' \
             -derivedDataPath build/derived \
             CODE_SIGNING_ALLOWED=NO \
             build

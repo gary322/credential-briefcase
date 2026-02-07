@@ -6,6 +6,7 @@ COMPOSE_FILE="$ROOT/docker/lightning-regtest/docker-compose.yml"
 DATA_DIR="$ROOT/docker/lightning-regtest/.data"
 PROJECT="credential-briefcase-lightning"
 MODE="${1:-all}"
+WAIT_SECS="${WAIT_SECS:-240}"
 
 # Prefer rustup-managed toolchains when available (avoids PATH picking up a
 # system-installed Rust).
@@ -59,7 +60,7 @@ wait_for() {
   local desc="$1"
   shift
 
-  for _ in $(seq 1 120); do
+  for _ in $(seq 1 "$WAIT_SECS"); do
     # Run in a subshell with errexit disabled so a failing probe never aborts
     # the harness (we want retries instead).
     if ( set +e; "$@" >/dev/null 2>&1 ); then
@@ -120,7 +121,7 @@ retry_json_field() {
   shift 2
 
   local last_out=""
-  for _ in $(seq 1 120); do
+  for _ in $(seq 1 "$WAIT_SECS"); do
     # Capture stdout (expected JSON) but keep stderr visible for debugging.
     last_out="$("$@" || true)"
     if v="$(printf '%s' "$last_out" | json_get "$key" 2>/dev/null | tr -d '\r')"; then
