@@ -26,43 +26,44 @@ Credential Briefcase centralizes **custody, enforcement, payment, and auditing**
 
 ```mermaid
 flowchart LR
-  subgraph Agent["Untrusted agent runtime"]
-    A["LLM / Agent"]
+  subgraph Agent[Untrusted agent runtime]
+    A[LLM / Agent]
   end
 
-  subgraph Local["Briefcase boundary (local-first)"]
-    G["mcp-gateway<br/>single MCP surface"]
-    D["briefcased<br/>policy + secrets + payments + receipts"]
-    S["briefcase-sandbox<br/>per-tool isolation"]
-    K["Secret + key custody<br/>(OS keychain, file vault, PKCS#11, TPM2, SE, CNG, remote signer)"]
-    R["Receipts store<br/>hash-chained"]
-    X["Browser extension + native messaging host"]
-    M["Mobile signer (iOS/Android)"]
+  subgraph Local[Briefcase boundary (local-first)]
+    G[mcp-gateway]
+    D[briefcased]
+    S[briefcase-sandbox]
+    K[Secret + key custody]
+    R[Receipts store]
+    X[Browser extension + native host]
+    M[Mobile signer]
   end
 
-  subgraph Providers["Providers / remote systems"]
-    RMCP["Remote MCP servers"]
-    P["Provider APIs"]
-    PG["agent-access-gateway<br/>(reference provider gateway)"]
-    L["Lightning node<br/>(LND/CLN)"]
-    C["x402 stablecoin rails"]
-    CP["Enterprise control plane (optional)"]
+  subgraph Providers[Providers / remote systems]
+    RMCP[Remote MCP servers]
+    P[Provider APIs]
+    PG[agent-access-gateway]
+    L[Lightning node LND or CLN]
+    C[x402 stablecoin rails]
+    CP[Enterprise control plane]
   end
 
-  A -->|MCP (stdio or streamable HTTP)| G
-  G -->|local IPC (unix socket / TCP)| D
+  A -->|MCP stdio or streamable HTTP| G
+  G -->|local IPC| D
   D --> S
   D --> K
   D --> R
-  X -->|OAuth UX + approvals| D
+  X -->|onboarding + approvals| D
   M -->|signed approvals| D
 
-  D -->|MCP client (policy-enforced)| RMCP
-  D -->|capability tokens + PoP| PG
+  D -->|remote MCP routing| RMCP
+  D -->|capabilities + PoP| PG
   PG --> P
   D -->|L402 payments| L
   D -->|x402 proofs| C
-  D <--> |policy bundles + receipt ingestion| CP
+  CP -->|signed policy bundle| D
+  D -->|receipt uploads| CP
 ```
 
 ### Tool Call Sequence (Happy Path + Approvals)
@@ -89,7 +90,7 @@ sequenceDiagram
     Gateway->>Daemon: ExecuteTool(call, approval_token)
   end
 
-  Daemon->>Provider: request with capability token (+ PoP)
+  Daemon->>Provider: request with capability token and PoP
   Provider-->>Daemon: result
   Daemon->>Receipts: append receipt (hash-chained)
   Daemon-->>Gateway: redacted result + provenance
@@ -104,7 +105,7 @@ flowchart LR
   CP -->|signed policy bundle| D["briefcased on devices"]
   D -->|upload receipts| CP
   Auditor["Auditor"] -->|query receipts| CP
-  CP -. optional .-> RS["Remote signer service<br/>(custody)"]
+  CP -. optional .-> RS["Remote signer service"]
   RS -. signs .-> D
 ```
 
