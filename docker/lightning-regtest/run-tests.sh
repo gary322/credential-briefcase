@@ -3,10 +3,18 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 COMPOSE_FILE="$ROOT/docker/lightning-regtest/docker-compose.yml"
-DATA_DIR="$ROOT/docker/lightning-regtest/.data"
 PROJECT="credential-briefcase-lightning"
 MODE="${1:-all}"
 WAIT_SECS="${WAIT_SECS:-240}"
+
+DEFAULT_PROJECT_DIR="$ROOT/docker/lightning-regtest"
+if [ "${GITHUB_ACTIONS:-}" = "true" ] || [ "${CI:-}" = "true" ]; then
+  # Keep Unix domain socket paths short (CLN JSON-RPC) to avoid `SUN_LEN` limits.
+  PROJECT_DIR="${BRIEFCASE_LIGHTNING_PROJECT_DIR:-/tmp/credential-briefcase-lightning}"
+else
+  PROJECT_DIR="${BRIEFCASE_LIGHTNING_PROJECT_DIR:-$DEFAULT_PROJECT_DIR}"
+fi
+DATA_DIR="$PROJECT_DIR/.data"
 
 # Prefer rustup-managed toolchains when available (avoids PATH picking up a
 # system-installed Rust).
@@ -35,7 +43,7 @@ if [ "$(uname -s)" = "Darwin" ]; then
 fi
 
 dc() {
-  docker compose -p "$PROJECT" -f "$COMPOSE_FILE" "$@"
+  docker compose -p "$PROJECT" -f "$COMPOSE_FILE" --project-directory "$PROJECT_DIR" "$@"
 }
 
 cleanup() {
@@ -47,6 +55,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
+mkdir -p "$PROJECT_DIR"
 rm -rf "$DATA_DIR"
 mkdir -p "$DATA_DIR/bitcoin" \
   "$DATA_DIR/lnd-alice" \
@@ -92,6 +101,15 @@ ${BITCOIN_CLI[@]} -rpcwallet=miner generatetoaddress 110 "$MINER_ADDR" >/dev/nul
 
 wait_for "lnd-alice synced" bash -lc 'docker compose -p credential-briefcase-lightning -f "'"$COMPOSE_FILE"'" exec -T lnd-alice lncli --network=regtest getinfo | python3 -c "import json,sys; sys.exit(0 if json.load(sys.stdin).get(\"synced_to_chain\") else 1)"'
 wait_for "lnd-bob synced" bash -lc 'docker compose -p credential-briefcase-lightning -f "'"$COMPOSE_FILE"'" exec -T lnd-bob lncli --network=regtest getinfo | python3 -c "import json,sys; sys.exit(0 if json.load(sys.stdin).get(\"synced_to_chain\") else 1)"'
+
+wait_for "lnd-alice macaroon" dc exec -T lnd-alice sh -lc 'test -f /root/.lnd/data/chain/bitcoin/regtest/admin.macaroon'
+wait_for "lnd-bob macaroon" dc exec -T lnd-bob sh -lc 'test -f /root/.lnd/data/chain/bitcoin/regtest/admin.macaroon'
+
+# The LND containers create `tls.cert` and macaroons as root with restrictive
+# permissions. The integration tests read these files from the host-mounted
+# volume, so ensure they are readable in CI.
+dc exec -T lnd-alice sh -lc 'chmod a+r /root/.lnd/tls.cert || true; chmod -R a+rX /root/.lnd/data/chain/bitcoin/regtest || true'
+dc exec -T lnd-bob sh -lc 'chmod a+r /root/.lnd/tls.cert || true; chmod -R a+rX /root/.lnd/data/chain/bitcoin/regtest || true'
 
 cln_carol_synced() {
   dc exec -T cln-carol lightning-cli --network=regtest --lightning-dir=/root/.lightning --rpc-file=/root/.lightning/lightning-rpc getinfo | python3 -c 'import json,sys; obj=json.load(sys.stdin); sys.exit(0 if not obj.get("warning_bitcoind_sync") else 1)'
