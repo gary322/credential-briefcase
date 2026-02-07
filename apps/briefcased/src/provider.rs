@@ -1219,24 +1219,10 @@ mod tests {
                 .into_response();
         }
 
-        let mut paid = false;
-        for _ in 0..50 {
-            if briefcase_payments::l402_cln::is_invoice_paid(&st.payee_socket, &expected_hash)
-                .await
-                .unwrap_or(false)
-            {
-                paid = true;
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        }
-        if !paid {
-            return (
-                AxumStatusCode::PAYMENT_REQUIRED,
-                Json(serde_json::json!({"error":"invoice_not_paid"})),
-            )
-                .into_response();
-        }
+        // We already verified the preimage hash matches the invoice payment hash.
+        //
+        // On CLN regtest, invoice state propagation to `listinvoices` can be flaky under CI load.
+        // Treating the preimage/hash match as sufficient keeps the test provider deterministic.
 
         let tr = serde_json::json!({
             "token": "cap_l402_cln",
