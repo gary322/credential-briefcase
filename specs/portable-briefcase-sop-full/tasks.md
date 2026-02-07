@@ -314,7 +314,7 @@ For each task, include:
   - **Done when**: fuzz targets run in CI on schedule; regressions blocked.
   - **Verify**: `cargo fuzz run ...` (CI job)
 
-- [ ] 12.2 Observability (OpenTelemetry end-to-end)
+- [x] 12.2 Observability (OpenTelemetry end-to-end)
   - **Do**: add OTel traces for tool execution chain across gateway/daemon/sandbox; metrics for spend/approvals.
   - **Files**: `apps/briefcased/*`, `apps/mcp-gateway/*`, `docs/OBSERVABILITY.md`
   - **Done when**: trace shows end-to-end request with policy decision and upstream call.

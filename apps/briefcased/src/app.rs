@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use anyhow::Context as _;
 use axum::extract::{Path as AxumPath, Query, State};
-use axum::http::StatusCode;
+use axum::http::{Request, StatusCode};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::Engine as _;
@@ -29,7 +29,9 @@ use chrono::Utc;
 use rand::RngCore as _;
 use serde::Deserialize;
 use sha2::Digest as _;
+use tower_http::trace::TraceLayer;
 use tracing::{error, info};
+use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 use uuid::Uuid;
 
 use crate::db::Db;
@@ -419,6 +421,19 @@ fn router(state: AppState) -> Router {
         .route("/health", get(health))
         .merge(authed)
         .merge(signer)
+        .layer(
+            TraceLayer::new_for_http().make_span_with(|req: &Request<_>| {
+                // Never include request headers or bodies in spans (may contain secrets).
+                let span = tracing::info_span!(
+                    "http.request",
+                    http_method = %req.method(),
+                    http_path = %req.uri().path(),
+                );
+                let cx = briefcase_otel::extract_trace_context(req.headers());
+                let _ = span.set_parent(cx);
+                span
+            }),
+        )
         .with_state(state)
 }
 
@@ -1496,6 +1511,8 @@ async fn handle_unknown_vc_status(
                 return Ok(None);
             }
 
+            briefcase_otel::metrics().record_approval_required(&call.tool_id, "vc_status_unknown");
+
             let summary = approval_summary_for_tool_call(
                 &call.tool_id,
                 spec,
@@ -1720,6 +1737,11 @@ fn approval_summary_for_tool_call(
     })
 }
 
+#[tracing::instrument(
+    name = "tool.execute",
+    skip(state, call),
+    fields(tool_id = %call.tool_id, runtime = tracing::field::Empty)
+)]
 async fn call_tool_impl(state: &AppState, call: ToolCall) -> anyhow::Result<CallToolResponse> {
     enum ResolvedTool {
         Local(Arc<crate::tools::ToolRuntime>),
@@ -1767,6 +1789,8 @@ async fn call_tool_impl(state: &AppState, call: ToolCall) -> anyhow::Result<Call
             None => "builtin".to_string(),
         },
     };
+
+    tracing::Span::current().record("runtime", tracing::field::display(runtime.as_str()));
 
     let policy_ctx = match &tool {
         ResolvedTool::Remote(_) => ToolPolicyContext {
@@ -1816,9 +1840,17 @@ async fn call_tool_impl(state: &AppState, call: ToolCall) -> anyhow::Result<Call
 
     // Cedar policy: allow/deny/require-approval.
     let policy = state.policy.read().await.clone();
-    let decision = policy.decide("local-user", spec, policy_ctx)?;
+    let policy_span = tracing::info_span!(
+        "policy.decide",
+        decision = tracing::field::Empty,
+        reason = tracing::field::Empty,
+        approval_kind = tracing::field::Empty,
+    );
+    let decision = policy_span.in_scope(|| policy.decide("local-user", spec, policy_ctx))?;
     match &decision {
         PolicyDecision::Deny { reason } => {
+            policy_span.record("decision", tracing::field::display("deny"));
+            policy_span.record("reason", tracing::field::display(reason.as_str()));
             state
                 .receipts
                 .append(serde_json::json!({
@@ -1835,8 +1867,16 @@ async fn call_tool_impl(state: &AppState, call: ToolCall) -> anyhow::Result<Call
             });
         }
         PolicyDecision::RequireApproval { reason, kind } => {
+            policy_span.record("decision", tracing::field::display("approval_required"));
+            policy_span.record("reason", tracing::field::display(reason.as_str()));
+            policy_span.record(
+                "approval_kind",
+                tracing::field::display(approval_kind_str(*kind)),
+            );
+
             // If the user already attached an approval token, proceed.
             if call.approval_token.is_none() {
+                briefcase_otel::metrics().record_approval_required(&call.tool_id, reason);
                 let summary = approval_summary_for_tool_call(
                     &call.tool_id,
                     spec,
@@ -1872,7 +1912,9 @@ async fn call_tool_impl(state: &AppState, call: ToolCall) -> anyhow::Result<Call
                 return Ok(CallToolResponse::ApprovalRequired { approval });
             }
         }
-        PolicyDecision::Allow => {}
+        PolicyDecision::Allow => {
+            policy_span.record("decision", tracing::field::display("allow"));
+        }
     }
 
     // Non-authoritative risk scoring. This can only tighten (require approval), never loosen.
@@ -1887,6 +1929,8 @@ async fn call_tool_impl(state: &AppState, call: ToolCall) -> anyhow::Result<Call
             if reason.len() > 160 {
                 reason.truncate(160);
             }
+
+            briefcase_otel::metrics().record_approval_required(&call.tool_id, &reason);
 
             let summary = approval_summary_for_tool_call(
                 &call.tool_id,
@@ -1934,6 +1978,7 @@ async fn call_tool_impl(state: &AppState, call: ToolCall) -> anyhow::Result<Call
             .await?
         && call.approval_token.is_none()
     {
+        briefcase_otel::metrics().record_approval_required(&call.tool_id, "budget_exceeded");
         let summary = approval_summary_for_tool_call(
             &call.tool_id,
             spec,
@@ -2011,6 +2056,8 @@ async fn call_tool_impl(state: &AppState, call: ToolCall) -> anyhow::Result<Call
                     .db
                     .record_spend(spec.category.as_str(), amount_microusd)
                     .await?;
+                briefcase_otel::metrics()
+                    .record_spend_microusd(spec.category.as_str(), amount_microusd);
             }
 
             let content = match &tool {
@@ -2316,10 +2363,15 @@ async fn approve(
     }
 
     match state.db.approve(id).await {
-        Ok(Some(token)) => Ok(Json(ApproveResponse {
-            approval_id: id,
-            approval_token: token,
-        })),
+        Ok(Some(res)) => {
+            if res.changed {
+                briefcase_otel::metrics().record_approval_approved(&res.tool_id);
+            }
+            Ok(Json(ApproveResponse {
+                approval_id: id,
+                approval_token: res.approval_token,
+            }))
+        }
         Ok(None) => Err((
             StatusCode::NOT_FOUND,
             Json(ErrorResponse {
@@ -2450,10 +2502,15 @@ async fn signer_approve(
     verify_signer_request(&state, "approve", Some(id), &req).await?;
 
     match state.db.approve(id).await {
-        Ok(Some(token)) => Ok(Json(ApproveResponse {
-            approval_id: id,
-            approval_token: token,
-        })),
+        Ok(Some(res)) => {
+            if res.changed {
+                briefcase_otel::metrics().record_approval_approved(&res.tool_id);
+            }
+            Ok(Json(ApproveResponse {
+                approval_id: id,
+                approval_token: res.approval_token,
+            }))
+        }
         Ok(None) => Err((
             StatusCode::NOT_FOUND,
             Json(ErrorResponse {
@@ -2828,7 +2885,13 @@ mod tests {
     use ed25519_dalek::Signer as _;
     use tempfile::tempdir;
 
-    static LOG_BUF: OnceLock<Arc<StdMutex<Vec<u8>>>> = OnceLock::new();
+    #[derive(Clone)]
+    struct TestTelemetry {
+        log_buf: Arc<StdMutex<Vec<u8>>>,
+        span_exporter: opentelemetry_sdk::trace::InMemorySpanExporter,
+    }
+
+    static TEST_TELEMETRY: OnceLock<TestTelemetry> = OnceLock::new();
 
     #[derive(Clone)]
     struct LogBufWriter {
@@ -2864,21 +2927,47 @@ mod tests {
     }
 
     fn init_log_capture() -> Arc<StdMutex<Vec<u8>>> {
-        LOG_BUF
+        TEST_TELEMETRY
             .get_or_init(|| {
-                let buf = Arc::new(StdMutex::new(Vec::new()));
-                let writer = LogBufWriter { buf: buf.clone() };
-                let subscriber = tracing_subscriber::fmt()
-                    .with_env_filter(
-                        tracing_subscriber::EnvFilter::try_from_default_env()
-                            .unwrap_or_else(|_| "info,hyper=warn,sqlx=warn".into()),
-                    )
-                    .json()
-                    .with_writer(writer)
-                    .finish();
+                use tracing_subscriber::layer::SubscriberExt as _;
+
+                let log_buf = Arc::new(StdMutex::new(Vec::new()));
+                let writer = LogBufWriter {
+                    buf: log_buf.clone(),
+                };
+                let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| "info,hyper=warn,sqlx=warn".into());
+
+                // In-memory OTel exporter for tests that assert spans exist and join correctly
+                // across client->daemon->sandbox. This keeps tests hermetic (no collector).
+                let span_exporter = opentelemetry_sdk::trace::InMemorySpanExporter::default();
+                let tracer_provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+                    .with_simple_exporter(span_exporter.clone())
+                    .build();
+                opentelemetry::global::set_tracer_provider(tracer_provider);
+                let tracer = opentelemetry::global::tracer("briefcased-tests");
+                let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
+
+                let subscriber = tracing_subscriber::registry()
+                    .with(env_filter)
+                    .with(tracing_subscriber::fmt::layer().json().with_writer(writer))
+                    .with(otel_layer);
                 let _ = tracing::subscriber::set_global_default(subscriber);
-                buf
+
+                TestTelemetry {
+                    log_buf,
+                    span_exporter,
+                }
             })
+            .log_buf
+            .clone()
+    }
+
+    fn test_span_exporter() -> opentelemetry_sdk::trace::InMemorySpanExporter {
+        TEST_TELEMETRY
+            .get()
+            .expect("init_log_capture must be called first")
+            .span_exporter
             .clone()
     }
 
@@ -4532,6 +4621,74 @@ mod tests {
         // Receipts exist.
         let receipts = client.list_receipts().await?.receipts;
         assert!(!receipts.is_empty());
+
+        daemon_task.abort();
+        provider_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn observability_otel_trace_contains_policy_and_upstream_spans() -> anyhow::Result<()> {
+        use anyhow::Context as _;
+        use std::collections::HashSet;
+        use tracing::Instrument as _;
+
+        let _buf = init_log_capture();
+        let exporter = test_span_exporter();
+        exporter.reset();
+
+        let (provider_addr, _provider_state, provider_task) = start_mock_provider().await?;
+        let provider_base_url = format!("http://{provider_addr}");
+
+        let (_state, _daemon_base, client, daemon_task) = start_daemon(provider_base_url).await?;
+
+        let resp = async {
+            client
+                .call_tool(CallToolRequest {
+                    call: ToolCall {
+                        tool_id: "quote".to_string(),
+                        args: serde_json::json!({ "symbol": "TEST" }),
+                        context: ToolCallContext::new(),
+                        approval_token: None,
+                    },
+                })
+                .await
+        }
+        .instrument(tracing::info_span!("gateway.call_tool", tool_id = "quote"))
+        .await?;
+
+        assert!(
+            matches!(resp, CallToolResponse::Ok { .. }),
+            "expected ok quote response, got: {resp:?}"
+        );
+
+        let spans = exporter
+            .get_finished_spans()
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+
+        let gw_span = spans
+            .iter()
+            .find(|s| s.name.as_ref() == "gateway.call_tool")
+            .context("missing gateway span")?;
+        let trace_id = gw_span.span_context.trace_id();
+
+        let trace_span_names: HashSet<String> = spans
+            .iter()
+            .filter(|s| s.span_context.trace_id() == trace_id)
+            .map(|s| s.name.as_ref().to_string())
+            .collect();
+
+        for required in [
+            "tool.execute",
+            "policy.decide",
+            "sandbox.execute",
+            "provider.quote_request",
+        ] {
+            assert!(
+                trace_span_names.contains(required),
+                "missing required span {required:?} in trace; have: {trace_span_names:?}"
+            );
+        }
 
         daemon_task.abort();
         provider_task.abort();

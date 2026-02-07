@@ -9,6 +9,7 @@ use rand::RngCore;
 use tracing::info;
 
 use base64::Engine as _;
+use briefcase_otel::TracingInitOptions;
 
 mod app;
 mod control_plane;
@@ -55,13 +56,11 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,hyper=warn,reqwest=warn".into()),
-        )
-        .json()
-        .init();
+    briefcase_otel::init_tracing(TracingInitOptions {
+        service_name: "briefcased",
+        service_version: env!("CARGO_PKG_VERSION"),
+        default_env_filter: "info,hyper=warn,reqwest=warn",
+    })?;
 
     let args = Args::parse();
     let data_dir = resolve_data_dir(args.data_dir.as_deref())?;

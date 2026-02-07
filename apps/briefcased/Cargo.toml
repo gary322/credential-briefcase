@@ -36,6 +36,7 @@ tokio-rusqlite.workspace = true
 tower-http.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+tracing-opentelemetry.workspace = true
 uuid.workspace = true
 url.workspace = true
 
@@ -47,6 +48,7 @@ briefcase-dpop = { path = "../../crates/briefcase-dpop" }
 briefcase-identity = { path = "../../crates/briefcase-identity" }
 briefcase-keys = { path = "../../crates/briefcase-keys" }
 briefcase-mcp = { path = "../../crates/briefcase-mcp" }
+briefcase-otel = { path = "../../crates/briefcase-otel" }
 briefcase-oauth-discovery = { path = "../../crates/briefcase-oauth-discovery" }
 briefcase-payments = { path = "../../crates/briefcase-payments" }
 briefcase-policy = { path = "../../crates/briefcase-policy" }
@@ -60,6 +62,8 @@ briefcase-secrets = { path = "../../crates/briefcase-secrets" }
 flate2.workspace = true
 hex.workspace = true
 tempfile.workspace = true
+opentelemetry.workspace = true
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
 
 [build-dependencies]
 wat = "1.244.0"

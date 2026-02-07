@@ -155,6 +155,15 @@ impl ProviderClient {
         self.cached.lock().await.remove(provider_id);
     }
 
+    #[tracing::instrument(
+        name = "provider.quote_request",
+        skip(self, token),
+        fields(
+            http_method = tracing::field::Empty,
+            http_path = tracing::field::Empty,
+            http_status_code = tracing::field::Empty,
+        )
+    )]
     async fn quote_request(
         &self,
         base_url: &str,
@@ -164,6 +173,10 @@ impl ProviderClient {
         let base = Url::parse(base_url).context("parse base_url")?;
         let mut url = base.join("/api/quote").context("join /api/quote")?;
         url.query_pairs_mut().append_pair("symbol", symbol);
+
+        let span = tracing::Span::current();
+        span.record("http_method", tracing::field::display("GET"));
+        span.record("http_path", tracing::field::display(url.path()));
 
         let mut req = self.http.get(url.clone());
         let pop = self.pop.read().await.clone();
@@ -179,6 +192,10 @@ impl ProviderClient {
         }
 
         let resp = req.send().await?;
+        span.record(
+            "http_status_code",
+            tracing::field::display(resp.status().as_u16()),
+        );
         Ok(resp)
     }
 

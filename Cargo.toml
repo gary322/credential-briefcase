@@ -17,6 +17,7 @@ members = [
   "crates/briefcase-identity",
   "crates/briefcase-keys",
   "crates/briefcase-mcp",
+  "crates/briefcase-otel",
   "crates/briefcase-oauth-discovery",
   "crates/briefcase-payments",
   "crates/briefcase-revocation",
@@ -79,6 +80,7 @@ tower = "0.5.2"
 tower-http = { version = "0.6.2", features = ["trace"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter", "fmt", "json"] }
+tracing-opentelemetry = "0.32.1"
 uuid = { version = "1.14.0", features = ["serde", "v4"] }
 tempfile = "3.16.0"
 url = "2.5.4"
@@ -86,6 +88,12 @@ wasmtime = "40.0.3"
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security_Cryptography"] }
 zeroize = { version = "1.8.1", features = ["derive"] }
 similar = "2.7.0"
+
+# Observability (Phase 12.2).
+opentelemetry = "0.31.0"
+opentelemetry-otlp = "0.31.0"
+opentelemetry-semantic-conventions = "0.31.0"
+opentelemetry_sdk = "0.31.0"
 
 # Lightning / gRPC (Phase 8).
 lightning-invoice = "0.34.0"

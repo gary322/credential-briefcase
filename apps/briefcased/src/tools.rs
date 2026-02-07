@@ -11,6 +11,7 @@ use briefcase_sandbox::{
 };
 use jsonschema::Validator;
 use thiserror::Error;
+use tracing::info_span;
 use url::Url;
 
 use crate::db::Db;
@@ -230,8 +231,13 @@ impl ToolRuntime {
                     .map_err(|e| ToolRuntimeError::Exec(e.to_string()))?;
 
                 let sandbox = sandbox.clone();
+                let sandbox_span = info_span!(
+                    "sandbox.execute",
+                    tool_id = %self.spec.id,
+                    kind = "wasm"
+                );
                 let out = tokio::task::spawn_blocking(move || {
-                    sandbox.execute(&policy, &limits, handler, &input)
+                    sandbox_span.in_scope(|| sandbox.execute(&policy, &limits, handler, &input))
                 })
                 .await
                 .map_err(|e| ToolRuntimeError::Exec(e.to_string()))?
@@ -291,9 +297,21 @@ impl ToolRuntime {
                     .map_err(|e| ToolRuntimeError::Exec(e.to_string()))?;
 
                 let sandbox = sandbox.clone();
+                let sandbox_span = info_span!(
+                    "sandbox.execute",
+                    tool_id = %self.spec.id,
+                    kind = "wasm"
+                );
                 let input = path.to_string();
                 let out = tokio::task::spawn_blocking(move || {
-                    sandbox.execute(&policy, &limits, Arc::new(DeterministicHttpHandler), &input)
+                    sandbox_span.in_scope(|| {
+                        sandbox.execute(
+                            &policy,
+                            &limits,
+                            Arc::new(DeterministicHttpHandler),
+                            &input,
+                        )
+                    })
                 })
                 .await
                 .map_err(|e| ToolRuntimeError::Exec(e.to_string()))?

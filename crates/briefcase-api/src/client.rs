@@ -387,10 +387,15 @@ impl BriefcaseClient {
             builder = builder.header("content-type", "application/json");
         }
 
-        builder
+        let mut req = builder
             .body(Full::new(Bytes::from(body)))
             .context("build http request")
-            .map_err(BriefcaseClientError::Other)
+            .map_err(BriefcaseClientError::Other)?;
+
+        // Best-effort trace context propagation. This is safe even when tracing/OTel are disabled.
+        briefcase_otel::inject_trace_headers(req.headers_mut());
+
+        Ok(req)
     }
 
     async fn send(&self, req: Request<Full<Bytes>>) -> Result<Vec<u8>, BriefcaseClientError> {

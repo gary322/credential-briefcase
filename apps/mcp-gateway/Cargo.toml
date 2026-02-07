@@ -23,3 +23,4 @@ uuid.workspace = true
 briefcase-api = { path = "../../crates/briefcase-api" }
 briefcase-core = { path = "../../crates/briefcase-core" }
 briefcase-mcp = { path = "../../crates/briefcase-mcp" }
+briefcase-otel = { path = "../../crates/briefcase-otel" }

@@ -17,6 +17,13 @@ pub struct Db {
 }
 
 #[derive(Debug, Clone)]
+pub struct ApproveResult {
+    pub approval_token: String,
+    pub tool_id: String,
+    pub changed: bool,
+}
+
+#[derive(Debug, Clone)]
 pub struct RemoteMcpServerRecord {
     pub id: String,
     pub endpoint_url: String,
@@ -1912,25 +1919,29 @@ impl Db {
             .map_err(Into::into)
     }
 
-    pub async fn approve(&self, id: Uuid) -> anyhow::Result<Option<String>> {
+    pub async fn approve(&self, id: Uuid) -> anyhow::Result<Option<ApproveResult>> {
         let id_s = id.to_string();
         let res = self
             .conn
             .call(move |conn| {
-                let row: Option<(String, String)> = conn
+                let row: Option<(String, String, String)> = conn
                     .query_row(
-                        "SELECT status, expires_at_rfc3339 FROM approvals WHERE id=?1",
+                        "SELECT status, expires_at_rfc3339, tool_id FROM approvals WHERE id=?1",
                         params![id_s],
-                        |r| Ok((r.get(0)?, r.get(1)?)),
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
                     )
                     .optional()?;
 
-                let Some((status, expires_at)) = row else {
+                let Some((status, expires_at, tool_id)) = row else {
                     return Ok(None);
                 };
 
                 if status != "pending" {
-                    return Ok(Some(id.to_string()));
+                    return Ok(Some(ApproveResult {
+                        approval_token: id.to_string(),
+                        tool_id,
+                        changed: false,
+                    }));
                 }
 
                 let expires_at = expires_at.parse::<DateTime<Utc>>().map_err(|e| {
@@ -1954,7 +1965,11 @@ impl Db {
                     params![id.to_string()],
                 )?;
 
-                Ok(Some(id.to_string()))
+                Ok(Some(ApproveResult {
+                    approval_token: id.to_string(),
+                    tool_id,
+                    changed: true,
+                }))
             })
             .await?;
 

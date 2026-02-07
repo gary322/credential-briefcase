@@ -23,8 +23,10 @@ use serde_json::Value;
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 use tokio::sync::Mutex;
 use tower_http::trace::TraceLayer;
-use tracing::info;
+use tracing::{Instrument as _, info};
 use uuid::Uuid;
+
+use briefcase_otel::TracingInitOptions;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -69,72 +71,87 @@ struct GatewayHandler {
 #[async_trait::async_trait]
 impl McpHandler for GatewayHandler {
     async fn list_tools(&self, _params: ListToolsParams) -> anyhow::Result<ListToolsResult> {
-        let list = self.client.list_tools().await?;
-        let tools = list
-            .tools
-            .into_iter()
-            .map(|t| Tool {
-                name: t.id,
-                title: Some(t.name),
-                description: Some(t.description),
-                input_schema: t.input_schema,
+        let client = self.client.clone();
+        async move {
+            let list = client.list_tools().await?;
+            let tools = list
+                .tools
+                .into_iter()
+                .map(|t| Tool {
+                    name: t.id,
+                    title: Some(t.name),
+                    description: Some(t.description),
+                    input_schema: t.input_schema,
+                })
+                .collect::<Vec<_>>();
+            Ok(ListToolsResult {
+                tools,
+                next_cursor: None,
             })
-            .collect::<Vec<_>>();
-        Ok(ListToolsResult {
-            tools,
-            next_cursor: None,
-        })
+        }
+        .instrument(tracing::info_span!("gateway.list_tools"))
+        .await
     }
 
     async fn call_tool(&self, params: CallToolParams) -> anyhow::Result<CallToolResult> {
-        let args = params.arguments.unwrap_or_else(|| serde_json::json!({}));
-        let call = ToolCall {
-            tool_id: params.name,
-            args,
-            context: ToolCallContext::new(),
-            approval_token: None,
-        };
+        let client = self.client.clone();
+        let tool_id = params.name.clone();
+        let tool_id_for_span = tool_id.clone();
+        async move {
+            let args = params.arguments.unwrap_or_else(|| serde_json::json!({}));
+            let call = ToolCall {
+                tool_id: tool_id.clone(),
+                args,
+                context: ToolCallContext::new(),
+                approval_token: None,
+            };
 
-        let resp = self.client.call_tool(CallToolRequest { call }).await?;
-        Ok(match resp {
-            CallToolResponse::Ok { result } => {
-                let pretty = serde_json::to_string_pretty(&result.content)
-                    .unwrap_or_else(|_| result.content.to_string());
-                CallToolResult {
-                    content: vec![ContentBlock::Text { text: pretty }],
-                    structured_content: Some(result.content),
-                    is_error: Some(false),
-                    meta: Some(serde_json::json!({ "provenance": result.provenance })),
+            let resp = client.call_tool(CallToolRequest { call }).await?;
+            Ok(match resp {
+                CallToolResponse::Ok { result } => {
+                    let pretty = serde_json::to_string_pretty(&result.content)
+                        .unwrap_or_else(|_| result.content.to_string());
+                    CallToolResult {
+                        content: vec![ContentBlock::Text { text: pretty }],
+                        structured_content: Some(result.content),
+                        is_error: Some(false),
+                        meta: Some(serde_json::json!({ "provenance": result.provenance })),
+                    }
                 }
-            }
-            CallToolResponse::ApprovalRequired { approval } => CallToolResult {
-                content: vec![ContentBlock::Text {
-                    text: format!(
-                        "Approval required for tool `{}`: {}. Approval ID: {}. Approve via `briefcase approvals approve {}`.",
-                        approval.tool_id, approval.reason, approval.id, approval.id
-                    ),
-                }],
-                structured_content: None,
-                is_error: Some(true),
-                meta: Some(serde_json::json!({ "approval": approval })),
-            },
-            CallToolResponse::Denied { reason } => CallToolResult {
-                content: vec![ContentBlock::Text {
-                    text: format!("Denied: {reason}"),
-                }],
-                structured_content: None,
-                is_error: Some(true),
-                meta: None,
-            },
-            CallToolResponse::Error { message } => CallToolResult {
-                content: vec![ContentBlock::Text {
-                    text: format!("Error: {message}"),
-                }],
-                structured_content: None,
-                is_error: Some(true),
-                meta: None,
-            },
-        })
+                CallToolResponse::ApprovalRequired { approval } => CallToolResult {
+                    content: vec![ContentBlock::Text {
+                        text: format!(
+                            "Approval required for tool `{}`: {}. Approval ID: {}. Approve via `briefcase approvals approve {}`.",
+                            approval.tool_id, approval.reason, approval.id, approval.id
+                        ),
+                    }],
+                    structured_content: None,
+                    is_error: Some(true),
+                    meta: Some(serde_json::json!({ "approval": approval })),
+                },
+                CallToolResponse::Denied { reason } => CallToolResult {
+                    content: vec![ContentBlock::Text {
+                        text: format!("Denied: {reason}"),
+                    }],
+                    structured_content: None,
+                    is_error: Some(true),
+                    meta: None,
+                },
+                CallToolResponse::Error { message } => CallToolResult {
+                    content: vec![ContentBlock::Text {
+                        text: format!("Error: {message}"),
+                    }],
+                    structured_content: None,
+                    is_error: Some(true),
+                    meta: None,
+                },
+            })
+        }
+        .instrument(tracing::info_span!(
+            "gateway.call_tool",
+            tool_id = %tool_id_for_span
+        ))
+        .await
     }
 }
 
@@ -147,12 +164,11 @@ struct HttpState {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
-        .json()
-        .init();
+    briefcase_otel::init_tracing(TracingInitOptions {
+        service_name: "mcp-gateway",
+        service_version: env!("CARGO_PKG_VERSION"),
+        default_env_filter: "info",
+    })?;
 
     let args = Args::parse();
     let data_dir = resolve_data_dir(args.data_dir.as_deref())?;
