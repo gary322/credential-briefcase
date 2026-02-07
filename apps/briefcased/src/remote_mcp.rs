@@ -15,7 +15,7 @@ use briefcase_oauth_discovery::OAuthDiscoveryClient;
 use briefcase_secrets::SecretStore;
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 use tracing::{info, warn};
 use url::Url;
 
@@ -75,6 +75,7 @@ pub struct RemoteMcpManager {
     oauth: Arc<OAuthDiscoveryClient>,
     keys: SoftwareKeyManager,
     http: reqwest::Client,
+    dpop_override: Arc<RwLock<Option<Arc<dyn briefcase_keys::Signer>>>>,
     sessions: Arc<Mutex<HashMap<String, Arc<Mutex<RemoteSession>>>>>, // server_id -> session
     ttl: Duration,
 }
@@ -97,9 +98,16 @@ impl RemoteMcpManager {
             oauth,
             keys,
             http,
+            dpop_override: Arc::new(RwLock::new(None)),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             ttl: Duration::from_secs(30),
         })
+    }
+
+    pub async fn set_dpop_override(&self, signer: Option<Arc<dyn briefcase_keys::Signer>>) {
+        *self.dpop_override.write().await = signer;
+        // Existing sessions may cache the previous signer; force refresh.
+        self.sessions.lock().await.clear();
     }
 
     pub async fn list_tool_specs(&self) -> Vec<ToolSpec> {
@@ -382,6 +390,20 @@ impl RemoteMcpManager {
         server_id: &str,
         supported_algs: &[String],
     ) -> anyhow::Result<Option<Arc<dyn briefcase_keys::Signer>>> {
+        if let Some(signer) = self.dpop_override.read().await.clone() {
+            let ok = match signer.handle().algorithm {
+                KeyAlgorithm::Ed25519 => supported_algs
+                    .iter()
+                    .any(|a| a.eq_ignore_ascii_case("EdDSA")),
+                KeyAlgorithm::P256 => supported_algs
+                    .iter()
+                    .any(|a| a.eq_ignore_ascii_case("ES256")),
+            };
+            if ok {
+                return Ok(Some(signer));
+            }
+        }
+
         let Some(want_alg) = Self::select_dpop_key_algorithm(supported_algs) else {
             return Ok(None);
         };

@@ -37,4 +37,4 @@ export BRIEFCASE_PKCS11_TOKEN_LABEL="${TOKEN_LABEL}"
 export BRIEFCASE_PKCS11_USER_PIN="${USER_PIN}"
 
 cargo test -p briefcase-keys --features pkcs11
-
+cargo test -p briefcase-control-plane --features pkcs11

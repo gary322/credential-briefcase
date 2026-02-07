@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context as _;
@@ -15,10 +16,12 @@ use uuid::Uuid;
 
 use crate::app::AppState;
 use crate::db::ControlPlaneRecord;
-use briefcase_keys::{KeyAlgorithm, KeyHandle, SoftwareKeyManager};
+use briefcase_keys::remote::RemoteKeyManager;
+use briefcase_keys::{KeyAlgorithm, KeyBackendKind, KeyHandle, SoftwareKeyManager};
 use briefcase_policy::{CedarPolicyEngine, CedarPolicyEngineOptions};
 
 const DEVICE_TOKEN_SECRET_KEY: &str = "control_plane.device_token";
+const POP_KEY_HANDLE_SECRET_KEY: &str = "pop.key_handle";
 
 #[derive(Debug, Clone, Default)]
 pub struct ControlPlaneSyncOutcome {
@@ -119,6 +122,13 @@ pub async fn enroll(
         return Err(e).context("apply control plane policy bundle");
     }
 
+    if let Err(e) = configure_remote_custody(state, &base_url, &device_id, &resp).await {
+        // Enrollment is considered incomplete if remote custody was advertised but could not be configured.
+        let _ = state.db.delete_control_plane_enrollment().await;
+        let _ = state.secrets.delete(DEVICE_TOKEN_SECRET_KEY).await;
+        return Err(e).context("configure remote custody");
+    }
+
     let _ = state
         .receipts
         .append(serde_json::json!({
@@ -135,6 +145,87 @@ pub async fn enroll(
         .await?
         .context("control plane record missing after enroll")?;
     Ok(rec)
+}
+
+async fn configure_remote_custody(
+    state: &AppState,
+    base_url: &str,
+    device_id: &Uuid,
+    resp: &EnrollDeviceResponse,
+) -> anyhow::Result<()> {
+    match &resp.remote_signer {
+        Some(rs) => {
+            let alg = match rs.algorithm.as_str() {
+                "p256" | "P256" | "P-256" => KeyAlgorithm::P256,
+                "ed25519" | "Ed25519" => KeyAlgorithm::Ed25519,
+                other => anyhow::bail!("unsupported remote signer algorithm: {other}"),
+            };
+
+            let km = RemoteKeyManager::new(state.secrets.clone())?;
+            let handle = km
+                .upsert(
+                    rs.key_id.clone(),
+                    alg,
+                    base_url.to_string(),
+                    device_id.to_string(),
+                    briefcase_core::Sensitive(resp.device_token.clone()),
+                )
+                .await?;
+
+            state
+                .secrets
+                .put(
+                    POP_KEY_HANDLE_SECRET_KEY,
+                    briefcase_core::Sensitive(handle.to_json()?),
+                )
+                .await?;
+
+            let signer = km.signer(handle);
+            state.provider.set_pop_signer(Some(signer.clone())).await;
+            state.remote_mcp.set_dpop_override(Some(signer)).await;
+
+            let _ = state
+                .receipts
+                .append(serde_json::json!({
+                    "kind": "control_plane_remote_custody_enabled",
+                    "base_url": base_url,
+                    "device_id": device_id,
+                    "algorithm": rs.algorithm,
+                    "key_id": rs.key_id,
+                    "ts": Utc::now().to_rfc3339(),
+                }))
+                .await;
+        }
+        None => {
+            // Control plane doesn't advertise remote custody; clear any previous remote signer configuration.
+            let prev = state.secrets.get(POP_KEY_HANDLE_SECRET_KEY).await?;
+            if let Some(raw) = prev {
+                if let Ok(handle) = KeyHandle::from_json(&raw.into_inner())
+                    && handle.backend == KeyBackendKind::Remote
+                {
+                    let km = RemoteKeyManager::new(state.secrets.clone())?;
+                    let _ = km.delete(&handle).await;
+                }
+                let _ = state.secrets.delete(POP_KEY_HANDLE_SECRET_KEY).await;
+
+                // Restore local PoP signing (identity key) and clear remote MCP override.
+                let identity = identity_signer(state).await?;
+                state.provider.set_pop_signer(Some(identity)).await;
+                state.remote_mcp.set_dpop_override(None).await;
+
+                let _ = state
+                    .receipts
+                    .append(serde_json::json!({
+                        "kind": "control_plane_remote_custody_disabled",
+                        "base_url": base_url,
+                        "device_id": device_id,
+                        "ts": Utc::now().to_rfc3339(),
+                    }))
+                    .await;
+            }
+        }
+    }
+    Ok(())
 }
 
 pub async fn sync_once(state: &AppState) -> anyhow::Result<ControlPlaneSyncOutcome> {
@@ -329,6 +420,12 @@ fn verify_policy_bundle_signature(
 }
 
 async fn identity_pubkey_b64(state: &AppState) -> anyhow::Result<String> {
+    let signer = identity_signer(state).await?;
+    let pk = signer.public_key_bytes().await?;
+    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(pk))
+}
+
+async fn identity_signer(state: &AppState) -> anyhow::Result<Arc<dyn briefcase_keys::Signer>> {
     let keys = SoftwareKeyManager::new(state.secrets.clone());
     let handle_json = state
         .secrets
@@ -340,9 +437,7 @@ async fn identity_pubkey_b64(state: &AppState) -> anyhow::Result<String> {
     if handle.algorithm != KeyAlgorithm::Ed25519 {
         anyhow::bail!("identity key must be ed25519");
     }
-    let signer = keys.signer(handle);
-    let pk = signer.public_key_bytes().await?;
-    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(pk))
+    Ok(keys.signer(handle))
 }
 
 fn normalize_control_plane_base_url(base_url: &str) -> anyhow::Result<String> {

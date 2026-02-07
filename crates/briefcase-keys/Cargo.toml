@@ -21,12 +21,14 @@ ed25519-dalek.workspace = true
 hex.workspace = true
 p256.workspace = true
 rand.workspace = true
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 tempfile = { workspace = true, optional = true }
 thiserror.workspace = true
 tokio = { workspace = true, optional = true }
+url.workspace = true
 uuid.workspace = true
 zeroize.workspace = true
 
@@ -40,4 +42,6 @@ security-framework.workspace = true
 windows-sys.workspace = true
 
 [dev-dependencies]
+axum.workspace = true
+briefcase-dpop = { path = "../briefcase-dpop" }
 tokio.workspace = true

@@ -38,7 +38,8 @@ use crate::pairing::{PairingManager, SignerReplayCache};
 use crate::provider::ProviderClient;
 use crate::remote_mcp::RemoteMcpManager;
 use crate::tools::ToolRegistry;
-use briefcase_keys::{KeyAlgorithm, KeyHandle, SoftwareKeyManager};
+use briefcase_keys::remote::RemoteKeyManager;
+use briefcase_keys::{KeyAlgorithm, KeyBackendKind, KeyHandle, SoftwareKeyManager};
 use briefcase_policy::{CedarPolicyEngine, CedarPolicyEngineOptions, ToolPolicyContext};
 use briefcase_receipts::{ReceiptStore, ReceiptStoreOptions};
 use briefcase_secrets::SecretStore;
@@ -230,7 +231,19 @@ impl AppState {
         }
 
         let identity_signer = keys.signer(identity_handle.clone());
-        let pop_signer = Some(identity_signer.clone());
+        let remote_keys = RemoteKeyManager::new(secrets.clone()).context("init remote keys")?;
+        let (pop_signer, pop_is_remote) = match secrets.get("pop.key_handle").await? {
+            Some(raw) => {
+                let handle =
+                    KeyHandle::from_json(&raw.into_inner()).context("decode pop.key_handle")?;
+                match handle.backend {
+                    KeyBackendKind::Software => (Some(keys.signer(handle)), false),
+                    KeyBackendKind::Remote => (Some(remote_keys.signer(handle)), true),
+                    other => anyhow::bail!("unsupported pop.key_handle backend: {other:?}"),
+                }
+            }
+            None => (Some(identity_signer.clone()), false),
+        };
 
         let identity_did = {
             let pk = identity_signer.public_key_bytes().await?;
@@ -269,10 +282,15 @@ impl AppState {
         let provider = Arc::new(ProviderClient::new(
             secrets.clone(),
             db.clone(),
-            pop_signer,
+            pop_signer.clone(),
             payments,
         ));
         let tools = ToolRegistry::new(provider.clone(), db.clone());
+
+        if pop_is_remote {
+            // In remote custody mode, also use the remote signer for OAuth DPoP proofs when possible.
+            remote_mcp.set_dpop_override(pop_signer).await;
+        }
 
         let pairing = Arc::new(PairingManager::new(std::time::Duration::from_secs(300)));
         let signer_replay = Arc::new(SignerReplayCache::new(std::time::Duration::from_secs(600)));
@@ -4001,10 +4019,13 @@ mod tests {
         signing_key: ed25519_dalek::SigningKey,
         bundle: Arc<tokio::sync::Mutex<briefcase_control_plane_api::types::PolicyBundle>>,
         receipts: Arc<tokio::sync::Mutex<Vec<briefcase_core::ReceiptRecord>>>,
+        remote_signer_sk: Option<Arc<tokio::sync::Mutex<p256::ecdsa::SigningKey>>>,
+        remote_sign_calls: Arc<tokio::sync::Mutex<u64>>,
     }
 
     async fn start_mock_control_plane(
         initial_bundle: briefcase_control_plane_api::types::PolicyBundle,
+        enable_remote_signer: bool,
     ) -> anyhow::Result<(
         SocketAddr,
         MockControlPlaneState,
@@ -4016,8 +4037,9 @@ mod tests {
         use axum::{Json, Router};
         use base64::Engine as _;
         use briefcase_control_plane_api::types::{
-            DevicePolicyResponse, EnrollDeviceRequest, EnrollDeviceResponse, SignedPolicyBundle,
-            UploadReceiptsRequest, UploadReceiptsResponse,
+            DevicePolicyResponse, DeviceRemoteSignerResponse, EnrollDeviceRequest,
+            EnrollDeviceResponse, RemoteSignRequest, RemoteSignResponse, RemoteSignerKeyInfo,
+            SignedPolicyBundle, UploadReceiptsRequest, UploadReceiptsResponse,
         };
 
         fn unauthorized() -> (StatusCode, Json<briefcase_control_plane_api::ErrorResponse>) {
@@ -4026,6 +4048,18 @@ mod tests {
                 Json(briefcase_control_plane_api::ErrorResponse {
                     code: "unauthorized".to_string(),
                     message: "unauthorized".to_string(),
+                }),
+            )
+        }
+
+        fn bad_request(
+            code: &str,
+        ) -> (StatusCode, Json<briefcase_control_plane_api::ErrorResponse>) {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(briefcase_control_plane_api::ErrorResponse {
+                    code: code.to_string(),
+                    message: code.to_string(),
                 }),
             )
         }
@@ -4066,6 +4100,27 @@ mod tests {
             let policy_signing_pubkey_b64 =
                 base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(pk);
 
+            let remote_signer = if let Some(sk) = &st.remote_signer_sk {
+                let sk = sk.lock().await;
+                let vk = sk.verifying_key();
+                let point = vk.to_encoded_point(false);
+                let x = point.x().context("missing x").map_err(|_| unauthorized())?;
+                let y = point.y().context("missing y").map_err(|_| unauthorized())?;
+                let public_jwk = serde_json::json!({
+                    "kty": "EC",
+                    "crv": "P-256",
+                    "x": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(x),
+                    "y": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(y),
+                });
+                Some(RemoteSignerKeyInfo {
+                    key_id: req.device_id.to_string(),
+                    algorithm: "p256".to_string(),
+                    public_jwk,
+                })
+            } else {
+                None
+            };
+
             Ok(Json(EnrollDeviceResponse {
                 device_id: req.device_id,
                 device_token: st.device_token.clone(),
@@ -4074,6 +4129,110 @@ mod tests {
                     bundle,
                     signature_b64,
                 },
+                remote_signer,
+            }))
+        }
+
+        async fn device_remote_signer(
+            AxumState(st): AxumState<MockControlPlaneState>,
+            AxumPath(device_id): AxumPath<uuid::Uuid>,
+            headers: HeaderMap,
+        ) -> Result<
+            Json<DeviceRemoteSignerResponse>,
+            (StatusCode, Json<briefcase_control_plane_api::ErrorResponse>),
+        > {
+            let ok = headers
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|h| h.to_str().ok())
+                .and_then(|v| v.strip_prefix("Bearer "))
+                .map(|t| t == st.device_token)
+                .unwrap_or(false);
+            if !ok {
+                return Err(unauthorized());
+            }
+            let Some(sk) = &st.remote_signer_sk else {
+                return Err((
+                    StatusCode::NOT_FOUND,
+                    Json(briefcase_control_plane_api::ErrorResponse {
+                        code: "not_found".to_string(),
+                        message: "remote signer not enabled".to_string(),
+                    }),
+                ));
+            };
+
+            let sk = sk.lock().await;
+            let vk = sk.verifying_key();
+            let point = vk.to_encoded_point(false);
+            let x = point.x().context("missing x").map_err(|_| unauthorized())?;
+            let y = point.y().context("missing y").map_err(|_| unauthorized())?;
+            let public_jwk = serde_json::json!({
+                "kty": "EC",
+                "crv": "P-256",
+                "x": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(x),
+                "y": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(y),
+            });
+
+            Ok(Json(DeviceRemoteSignerResponse {
+                signer: RemoteSignerKeyInfo {
+                    key_id: device_id.to_string(),
+                    algorithm: "p256".to_string(),
+                    public_jwk,
+                },
+            }))
+        }
+
+        async fn device_remote_signer_sign(
+            AxumState(st): AxumState<MockControlPlaneState>,
+            AxumPath(device_id): AxumPath<uuid::Uuid>,
+            headers: HeaderMap,
+            Json(req): Json<RemoteSignRequest>,
+        ) -> Result<
+            Json<RemoteSignResponse>,
+            (StatusCode, Json<briefcase_control_plane_api::ErrorResponse>),
+        > {
+            use p256::ecdsa::signature::Signer as _;
+
+            let ok = headers
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|h| h.to_str().ok())
+                .and_then(|v| v.strip_prefix("Bearer "))
+                .map(|t| t == st.device_token)
+                .unwrap_or(false);
+            if !ok {
+                return Err(unauthorized());
+            }
+
+            let Some(sk) = &st.remote_signer_sk else {
+                return Err((
+                    StatusCode::NOT_FOUND,
+                    Json(briefcase_control_plane_api::ErrorResponse {
+                        code: "not_found".to_string(),
+                        message: "remote signer not enabled".to_string(),
+                    }),
+                ));
+            };
+
+            if req.key_id != device_id.to_string() {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(briefcase_control_plane_api::ErrorResponse {
+                        code: "invalid_key_id".to_string(),
+                        message: "invalid key_id".to_string(),
+                    }),
+                ));
+            }
+
+            let msg = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(req.msg_b64.as_bytes())
+                .map_err(|_| bad_request("invalid_msg_b64"))?;
+            let sk = sk.lock().await;
+            let sig: p256::ecdsa::Signature = sk.sign(&msg);
+
+            *st.remote_sign_calls.lock().await += 1;
+
+            Ok(Json(RemoteSignResponse {
+                signature_b64: base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .encode(sig.to_bytes()),
             }))
         }
 
@@ -4133,12 +4292,22 @@ mod tests {
         }
 
         let signing_key = ed25519_dalek::SigningKey::from_bytes(&[42u8; 32]);
+        let remote_signer_sk = if enable_remote_signer {
+            Some(Arc::new(tokio::sync::Mutex::new(
+                p256::ecdsa::SigningKey::random(&mut p256::elliptic_curve::rand_core::OsRng),
+            )))
+        } else {
+            None
+        };
+
         let st = MockControlPlaneState {
             admin_token: "admin".to_string(),
             device_token: "device-token".to_string(),
             signing_key,
             bundle: Arc::new(tokio::sync::Mutex::new(initial_bundle)),
             receipts: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            remote_signer_sk,
+            remote_sign_calls: Arc::new(tokio::sync::Mutex::new(0)),
         };
 
         let app = Router::new()
@@ -4146,6 +4315,11 @@ mod tests {
             .route("/v1/admin/devices/enroll", post(enroll_device))
             .route("/v1/devices/{id}/policy", get(device_get_policy))
             .route("/v1/devices/{id}/receipts", post(device_upload_receipts))
+            .route("/v1/devices/{id}/remote-signer", get(device_remote_signer))
+            .route(
+                "/v1/devices/{id}/remote-signer/sign",
+                post(device_remote_signer_sign),
+            )
             .with_state(st.clone());
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
@@ -5678,7 +5852,7 @@ mod tests {
             updated_at_rfc3339: Utc::now().to_rfc3339(),
         };
 
-        let (cp_addr, cp_state, cp_task) = start_mock_control_plane(bundle1).await?;
+        let (cp_addr, cp_state, cp_task) = start_mock_control_plane(bundle1, false).await?;
         let cp_base_url = format!("http://{cp_addr}");
 
         let st = client.control_plane_status().await?;
@@ -5796,6 +5970,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn control_plane_enroll_with_remote_signer_is_used_for_dpop() -> anyhow::Result<()> {
+        use std::collections::BTreeMap;
+
+        let (provider_addr, _provider_state, provider_task) = start_mock_provider().await?;
+        let provider_base_url = format!("http://{provider_addr}");
+
+        let (state, _daemon_base, client, daemon_task) = start_daemon(provider_base_url).await?;
+
+        let default_policy =
+            briefcase_policy::CedarPolicyEngineOptions::default_policies().policy_text;
+        let mut budgets = BTreeMap::new();
+        budgets.insert("read".to_string(), 1_000_000);
+        let bundle = briefcase_control_plane_api::types::PolicyBundle {
+            bundle_id: 1,
+            policy_text: default_policy,
+            budgets,
+            updated_at_rfc3339: Utc::now().to_rfc3339(),
+        };
+
+        let (cp_addr, cp_state, cp_task) = start_mock_control_plane(bundle, true).await?;
+        let cp_base_url = format!("http://{cp_addr}");
+
+        client
+            .control_plane_enroll(briefcase_api::types::ControlPlaneEnrollRequest {
+                base_url: cp_base_url.clone(),
+                admin_token: "admin".to_string(),
+                device_name: "laptop-remote".to_string(),
+            })
+            .await?;
+
+        let raw = state
+            .secrets
+            .get("pop.key_handle")
+            .await?
+            .context("missing pop.key_handle")?
+            .into_inner();
+        let handle = briefcase_keys::KeyHandle::from_json(&raw)?;
+        assert_eq!(handle.backend, briefcase_keys::KeyBackendKind::Remote);
+
+        // Drive a provider tool call so the daemon generates DPoP proofs via the remote signer service.
+        client
+            .oauth_exchange(
+                "demo",
+                OAuthExchangeRequest {
+                    code: "code_mock".to_string(),
+                    redirect_uri: "http://127.0.0.1/callback".to_string(),
+                    client_id: "briefcase-cli".to_string(),
+                    code_verifier: "verifier".to_string(),
+                },
+            )
+            .await?;
+        client.fetch_vc("demo").await?;
+
+        let resp = client
+            .call_tool(CallToolRequest {
+                call: ToolCall {
+                    tool_id: "quote".to_string(),
+                    args: serde_json::json!({ "symbol": "TEST" }),
+                    context: ToolCallContext::new(),
+                    approval_token: None,
+                },
+            })
+            .await?;
+        assert!(matches!(resp, CallToolResponse::Ok { .. }));
+
+        assert!(
+            *cp_state.remote_sign_calls.lock().await > 0,
+            "expected remote signer to be called for DPoP signing"
+        );
+
+        daemon_task.abort();
+        provider_task.abort();
+        cp_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn control_plane_enroll_rolls_back_on_policy_compile_error() -> anyhow::Result<()> {
         use std::collections::BTreeMap;
 
@@ -5813,7 +6064,7 @@ mod tests {
             updated_at_rfc3339: Utc::now().to_rfc3339(),
         };
 
-        let (cp_addr, _cp_state, cp_task) = start_mock_control_plane(bundle).await?;
+        let (cp_addr, _cp_state, cp_task) = start_mock_control_plane(bundle, false).await?;
         let cp_base_url = format!("http://{cp_addr}");
 
         let err = client

@@ -9,13 +9,17 @@ use axum::{Json, Router};
 use base64::Engine as _;
 use briefcase_control_plane_api::types::{
     AdminSetPolicyRequest, AdminSetPolicyResponse, AuditListReceiptsResponse, DevicePolicyResponse,
-    EnrollDeviceRequest, EnrollDeviceResponse, ErrorResponse, HealthResponse, PolicyBundle,
+    DeviceRemoteSignerResponse, EnrollDeviceRequest, EnrollDeviceResponse, ErrorResponse,
+    HealthResponse, PolicyBundle, RemoteSignRequest, RemoteSignResponse, RemoteSignerKeyInfo,
     SignedPolicyBundle, UploadReceiptsRequest, UploadReceiptsResponse,
 };
 use briefcase_core::util::{sha256_hex, sha256_hex_concat};
 use chrono::{DateTime, Utc};
 use clap::Parser;
 use ed25519_dalek::{Signature, Signer as _, SigningKey, VerifyingKey};
+use p256::ecdsa::{
+    Signature as P256Signature, SigningKey as P256SigningKey, VerifyingKey as P256VerifyingKey,
+};
 use rand::RngCore as _;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
@@ -27,6 +31,7 @@ use uuid::Uuid;
 const DEFAULT_BIND_ADDR: &str = "127.0.0.1:9797";
 const MAX_POLICY_TEXT_BYTES: usize = 200_000;
 const MAX_RECEIPTS_PER_UPLOAD: usize = 500;
+const MAX_REMOTE_SIGN_MSG_BYTES: usize = 32_000;
 
 #[derive(Debug, Clone, Parser)]
 #[command(
@@ -54,6 +59,37 @@ struct Args {
     /// Ed25519 signing key seed (32 bytes, base64url; required).
     #[arg(long, env = "CONTROL_PLANE_POLICY_SIGNING_KEY_SEED_B64")]
     policy_signing_key_seed_b64: String,
+
+    /// Remote custody backend for device PoP signing keys: `derived` (default) or `pkcs11`.
+    ///
+    /// - `derived`: deterministic P-256 key derived from a server seed + device_id.
+    /// - `pkcs11`: non-exportable P-256 keys stored in a PKCS#11 token (SoftHSM in CI).
+    #[arg(
+        long,
+        env = "CONTROL_PLANE_REMOTE_SIGNER_BACKEND",
+        default_value = "derived"
+    )]
+    remote_signer_backend: String,
+
+    /// Seed for derived remote signer keys (32 bytes, base64url). If unset, defaults to the policy
+    /// signing seed (reference-only; production deployments should use a distinct secret).
+    #[arg(long, env = "CONTROL_PLANE_REMOTE_SIGNER_SEED_B64")]
+    remote_signer_seed_b64: Option<String>,
+
+    /// PKCS#11 module path (required for `pkcs11` backend). If unset, falls back to
+    /// `BRIEFCASE_PKCS11_MODULE` to reuse the repo's SoftHSM harness defaults.
+    #[arg(long, env = "CONTROL_PLANE_PKCS11_MODULE")]
+    pkcs11_module: Option<String>,
+
+    /// PKCS#11 token label (required for `pkcs11` backend). If unset, falls back to
+    /// `BRIEFCASE_PKCS11_TOKEN_LABEL`.
+    #[arg(long, env = "CONTROL_PLANE_PKCS11_TOKEN_LABEL")]
+    pkcs11_token_label: Option<String>,
+
+    /// PKCS#11 user PIN (required for `pkcs11` backend). If unset, falls back to
+    /// `BRIEFCASE_PKCS11_USER_PIN`.
+    #[arg(long, env = "CONTROL_PLANE_PKCS11_USER_PIN")]
+    pkcs11_user_pin: Option<String>,
 }
 
 #[derive(Clone)]
@@ -63,6 +99,431 @@ struct AppState {
     auditor_token: String,
     policy_signer: SigningKey,
     policy_pubkey_b64: String,
+    remote_signer: RemoteSignerBackend,
+}
+
+#[derive(Debug, Clone)]
+enum RemoteSignerBackend {
+    DerivedP256 {
+        seed: [u8; 32],
+    },
+    #[cfg(feature = "pkcs11")]
+    Pkcs11P256 {
+        module_path: String,
+        token_label: String,
+        user_pin: String,
+    },
+}
+
+fn build_remote_signer_backend(args: &Args) -> anyhow::Result<RemoteSignerBackend> {
+    let mode = args.remote_signer_backend.trim().to_lowercase();
+    match mode.as_str() {
+        "derived" | "derived_p256" => {
+            let seed_b64 = args
+                .remote_signer_seed_b64
+                .as_deref()
+                .unwrap_or(&args.policy_signing_key_seed_b64);
+            let seed = parse_seed_32_b64url(seed_b64).context("parse remote signer seed")?;
+            Ok(RemoteSignerBackend::DerivedP256 { seed })
+        }
+        "pkcs11" | "pkcs11_p256" => {
+            #[cfg(feature = "pkcs11")]
+            {
+                let module_path = args
+                    .pkcs11_module
+                    .clone()
+                    .or_else(|| std::env::var("BRIEFCASE_PKCS11_MODULE").ok())
+                    .context("missing CONTROL_PLANE_PKCS11_MODULE (or BRIEFCASE_PKCS11_MODULE)")?;
+                let token_label = args
+                    .pkcs11_token_label
+                    .clone()
+                    .or_else(|| std::env::var("BRIEFCASE_PKCS11_TOKEN_LABEL").ok())
+                    .context(
+                        "missing CONTROL_PLANE_PKCS11_TOKEN_LABEL (or BRIEFCASE_PKCS11_TOKEN_LABEL)",
+                    )?;
+                let user_pin = args
+                    .pkcs11_user_pin
+                    .clone()
+                    .or_else(|| std::env::var("BRIEFCASE_PKCS11_USER_PIN").ok())
+                    .context(
+                        "missing CONTROL_PLANE_PKCS11_USER_PIN (or BRIEFCASE_PKCS11_USER_PIN)",
+                    )?;
+                Ok(RemoteSignerBackend::Pkcs11P256 {
+                    module_path,
+                    token_label,
+                    user_pin,
+                })
+            }
+            #[cfg(not(feature = "pkcs11"))]
+            {
+                anyhow::bail!(
+                    "remote signer backend `pkcs11` requires building with --features pkcs11"
+                );
+            }
+        }
+        other => anyhow::bail!("unsupported CONTROL_PLANE_REMOTE_SIGNER_BACKEND: {other}"),
+    }
+}
+
+impl RemoteSignerBackend {
+    fn key_id_for_device(&self, device_id: Uuid) -> String {
+        // Keep v1 simple: one PoP key per device, stable until rotated.
+        device_id.to_string()
+    }
+
+    async fn key_info(&self, device_id: Uuid) -> anyhow::Result<RemoteSignerKeyInfo> {
+        let key_id = self.key_id_for_device(device_id);
+        let public_jwk = self.public_jwk(device_id).await?;
+        Ok(RemoteSignerKeyInfo {
+            key_id,
+            algorithm: "p256".to_string(),
+            public_jwk,
+        })
+    }
+
+    async fn public_jwk(&self, device_id: Uuid) -> anyhow::Result<serde_json::Value> {
+        match self {
+            RemoteSignerBackend::DerivedP256 { seed } => {
+                let sk = derive_p256_signing_key(seed, device_id)?;
+                let vk = sk.verifying_key();
+                p256_public_jwk(vk)
+            }
+            #[cfg(feature = "pkcs11")]
+            RemoteSignerBackend::Pkcs11P256 {
+                module_path,
+                token_label,
+                user_pin,
+            } => {
+                let key_label = pkcs11_key_label_for_device(device_id);
+                let pk = pkcs11::ensure_and_load_public_key_bytes(
+                    module_path,
+                    token_label,
+                    user_pin,
+                    &key_label,
+                )
+                .await?;
+                let point = p256::EncodedPoint::from_bytes(&pk).context("decode p256 point")?;
+                let vk = P256VerifyingKey::from_encoded_point(&point).context("verifying key")?;
+                p256_public_jwk(&vk)
+            }
+        }
+    }
+
+    async fn sign(&self, device_id: Uuid, msg: &[u8]) -> anyhow::Result<Vec<u8>> {
+        match self {
+            RemoteSignerBackend::DerivedP256 { seed } => {
+                let sk = derive_p256_signing_key(seed, device_id)?;
+                let sig: P256Signature = sk.sign(msg);
+                Ok(sig.to_bytes().to_vec())
+            }
+            #[cfg(feature = "pkcs11")]
+            RemoteSignerBackend::Pkcs11P256 {
+                module_path,
+                token_label,
+                user_pin,
+            } => {
+                let key_label = pkcs11_key_label_for_device(device_id);
+                pkcs11::ensure_and_sign_p256(module_path, token_label, user_pin, &key_label, msg)
+                    .await
+            }
+        }
+    }
+}
+
+fn parse_seed_32_b64url(b64: &str) -> anyhow::Result<[u8; 32]> {
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(b64.trim().as_bytes())
+        .context("base64url decode")?;
+    if bytes.len() != 32 {
+        anyhow::bail!("expected 32-byte seed");
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&bytes);
+    Ok(out)
+}
+
+fn derive_p256_signing_key(seed: &[u8; 32], device_id: Uuid) -> anyhow::Result<P256SigningKey> {
+    use sha2::Digest as _;
+
+    for ctr in 0u8..=255 {
+        let digest = sha2::Sha256::digest([seed.as_slice(), device_id.as_bytes(), &[ctr]].concat());
+        let mut candidate = [0u8; 32];
+        candidate.copy_from_slice(&digest);
+        let fb = p256::FieldBytes::from(candidate);
+        if let Ok(sk) = P256SigningKey::from_bytes(&fb) {
+            return Ok(sk);
+        }
+    }
+    anyhow::bail!("failed to derive p256 key");
+}
+
+fn p256_public_jwk(vk: &P256VerifyingKey) -> anyhow::Result<serde_json::Value> {
+    let point = vk.to_encoded_point(false);
+    let x = point.x().context("p256 missing x")?;
+    let y = point.y().context("p256 missing y")?;
+    Ok(serde_json::json!({
+      "kty": "EC",
+      "crv": "P-256",
+      "x": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(x),
+      "y": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(y),
+    }))
+}
+
+#[cfg(feature = "pkcs11")]
+fn pkcs11_key_label_for_device(device_id: Uuid) -> String {
+    format!("briefcase-remote-{device_id}")
+}
+
+#[cfg(feature = "pkcs11")]
+mod pkcs11 {
+    use super::*;
+
+    use cryptoki::context::{CInitializeArgs, CInitializeFlags, Pkcs11};
+    use cryptoki::error::{Error as Pkcs11Error, RvError};
+    use cryptoki::mechanism::Mechanism;
+    use cryptoki::object::{Attribute, AttributeType, KeyType, ObjectClass};
+    use cryptoki::session::UserType;
+    use cryptoki::types::AuthPin;
+    use sha2::Digest as _;
+
+    async fn spawn_blocking<T: Send + 'static>(
+        f: impl FnOnce() -> anyhow::Result<T> + Send + 'static,
+    ) -> anyhow::Result<T> {
+        tokio::task::spawn_blocking(f)
+            .await
+            .map_err(|e| anyhow::anyhow!("pkcs11 join error: {e}"))?
+    }
+
+    pub async fn ensure_and_load_public_key_bytes(
+        module_path: &str,
+        token_label: &str,
+        user_pin: &str,
+        key_label: &str,
+    ) -> anyhow::Result<Vec<u8>> {
+        let module_path = module_path.to_string();
+        let token_label = token_label.to_string();
+        let user_pin = user_pin.to_string();
+        let key_label = key_label.to_string();
+        spawn_blocking(move || {
+            ensure_keypair_blocking(&module_path, &token_label, &user_pin, &key_label)?;
+            load_public_key_bytes_blocking(&module_path, &token_label, &user_pin, &key_label)
+        })
+        .await
+    }
+
+    pub async fn ensure_and_sign_p256(
+        module_path: &str,
+        token_label: &str,
+        user_pin: &str,
+        key_label: &str,
+        msg: &[u8],
+    ) -> anyhow::Result<Vec<u8>> {
+        let module_path = module_path.to_string();
+        let token_label = token_label.to_string();
+        let user_pin = user_pin.to_string();
+        let key_label = key_label.to_string();
+        let msg = msg.to_vec();
+        spawn_blocking(move || {
+            ensure_keypair_blocking(&module_path, &token_label, &user_pin, &key_label)?;
+            sign_p256_blocking(&module_path, &token_label, &user_pin, &key_label, &msg)
+        })
+        .await
+    }
+
+    fn ensure_keypair_blocking(
+        module_path: &str,
+        token_label: &str,
+        user_pin: &str,
+        key_label: &str,
+    ) -> anyhow::Result<()> {
+        let (pkcs11, session) = open_user_session(module_path, token_label, user_pin)?;
+        let label_bytes = key_label.as_bytes().to_vec();
+
+        let res = (|| -> anyhow::Result<()> {
+            let existing = session
+                .find_objects(&[
+                    Attribute::Class(ObjectClass::PRIVATE_KEY),
+                    Attribute::Label(label_bytes.clone()),
+                ])
+                .unwrap_or_default();
+            if !existing.is_empty() {
+                return Ok(());
+            }
+
+            // secp256r1 OID.
+            let secp256r1_oid: Vec<u8> =
+                vec![0x06, 0x08, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07];
+
+            let pub_key_template = vec![
+                Attribute::Token(true),
+                Attribute::Private(false),
+                Attribute::KeyType(KeyType::EC),
+                Attribute::Verify(true),
+                Attribute::EcParams(secp256r1_oid),
+                Attribute::Label(label_bytes.clone()),
+                Attribute::Id(label_bytes.clone()),
+            ];
+
+            let priv_key_template = vec![
+                Attribute::Token(true),
+                Attribute::Private(true),
+                Attribute::Sensitive(true),
+                Attribute::Extractable(false),
+                Attribute::Sign(true),
+                Attribute::Label(label_bytes.clone()),
+                Attribute::Id(label_bytes.clone()),
+            ];
+
+            let _ = session
+                .generate_key_pair(
+                    &Mechanism::EccKeyPairGen,
+                    &pub_key_template,
+                    &priv_key_template,
+                )
+                .context("generate p256 keypair")?;
+
+            Ok(())
+        })();
+
+        let _ = session.close();
+        let _ = pkcs11.finalize();
+        res
+    }
+
+    fn load_public_key_bytes_blocking(
+        module_path: &str,
+        token_label: &str,
+        user_pin: &str,
+        key_label: &str,
+    ) -> anyhow::Result<Vec<u8>> {
+        let (pkcs11, session) = open_user_session(module_path, token_label, user_pin)?;
+
+        let res = (|| -> anyhow::Result<Vec<u8>> {
+            let label_bytes = key_label.as_bytes().to_vec();
+            let mut objs = session
+                .find_objects(&[
+                    Attribute::Class(ObjectClass::PUBLIC_KEY),
+                    Attribute::Label(label_bytes),
+                ])
+                .context("find public key")?;
+            let obj = objs
+                .pop()
+                .ok_or_else(|| anyhow::anyhow!("pkcs11 public key not found"))?;
+
+            let ec_point_attr = session
+                .get_attributes(obj, &[AttributeType::EcPoint])
+                .context("get EC_POINT")?
+                .into_iter()
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("missing EC_POINT attribute"))?;
+
+            let raw = match ec_point_attr {
+                Attribute::EcPoint(v) => v,
+                _ => anyhow::bail!("unexpected EC_POINT attribute type"),
+            };
+            decode_ec_point(&raw)
+        })();
+
+        let _ = session.close();
+        let _ = pkcs11.finalize();
+        res
+    }
+
+    fn sign_p256_blocking(
+        module_path: &str,
+        token_label: &str,
+        user_pin: &str,
+        key_label: &str,
+        msg: &[u8],
+    ) -> anyhow::Result<Vec<u8>> {
+        let (pkcs11, session) = open_user_session(module_path, token_label, user_pin)?;
+
+        let res = (|| -> anyhow::Result<Vec<u8>> {
+            let label_bytes = key_label.as_bytes().to_vec();
+            let mut objs = session
+                .find_objects(&[
+                    Attribute::Class(ObjectClass::PRIVATE_KEY),
+                    Attribute::Label(label_bytes),
+                ])
+                .context("find private key")?;
+            let obj = objs
+                .pop()
+                .ok_or_else(|| anyhow::anyhow!("pkcs11 private key not found"))?;
+
+            // PKCS#11 CKM_ECDSA expects pre-hashed bytes.
+            let digest = sha2::Sha256::digest(msg);
+            let sig = session
+                .sign(&Mechanism::Ecdsa, obj, &digest)
+                .context("pkcs11 sign")?;
+            Ok(sig)
+        })();
+
+        let _ = session.close();
+        let _ = pkcs11.finalize();
+        res
+    }
+
+    fn open_user_session(
+        module_path: &str,
+        token_label: &str,
+        user_pin: &str,
+    ) -> anyhow::Result<(Pkcs11, cryptoki::session::Session)> {
+        let pkcs11 = Pkcs11::new(module_path).with_context(|| format!("load {module_path}"))?;
+        match pkcs11.initialize(CInitializeArgs::new(CInitializeFlags::OS_LOCKING_OK)) {
+            Ok(()) => {}
+            Err(Pkcs11Error::Pkcs11(RvError::CryptokiAlreadyInitialized, _)) => {}
+            Err(e) => return Err(anyhow::Error::new(e)).context("pkcs11 initialize"),
+        }
+
+        let slot = find_slot_by_label(&pkcs11, token_label).context("find token slot")?;
+        let session = pkcs11.open_rw_session(slot).context("open rw session")?;
+
+        let pin = AuthPin::new(user_pin.to_string().into());
+        session
+            .login(UserType::User, Some(&pin))
+            .context("pkcs11 login")?;
+
+        Ok((pkcs11, session))
+    }
+
+    fn find_slot_by_label(
+        pkcs11: &Pkcs11,
+        token_label: &str,
+    ) -> anyhow::Result<cryptoki::slot::Slot> {
+        for slot in pkcs11.get_slots_with_token().context("list slots")? {
+            if let Ok(info) = pkcs11.get_token_info(slot)
+                && info.label() == token_label
+            {
+                return Ok(slot);
+            }
+        }
+        anyhow::bail!("no PKCS#11 slot with token label {token_label:?}")
+    }
+
+    fn decode_ec_point(bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
+        // SoftHSM typically returns CKA_EC_POINT as DER OCTET STRING wrapping the uncompressed point.
+        if bytes.len() == 65 && bytes.first() == Some(&0x04) {
+            return Ok(bytes.to_vec());
+        }
+        if bytes.len() >= 3 && bytes[0] == 0x04 {
+            // DER length can be short-form or 0x81 long-form for small-ish values.
+            let (len, off) = if bytes[1] & 0x80 == 0 {
+                (bytes[1] as usize, 2usize)
+            } else if bytes[1] == 0x81 && bytes.len() >= 3 {
+                (bytes[2] as usize, 3usize)
+            } else {
+                anyhow::bail!("unsupported DER length form");
+            };
+            let end = off + len;
+            if end <= bytes.len() {
+                let inner = &bytes[off..end];
+                if inner.len() == 65 && inner.first() == Some(&0x04) {
+                    return Ok(inner.to_vec());
+                }
+            }
+        }
+        anyhow::bail!("unsupported EC_POINT encoding");
+    }
 }
 
 #[tokio::main]
@@ -82,6 +543,8 @@ async fn main() -> anyhow::Result<()> {
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(vk.to_bytes())
     };
 
+    let remote_signer = build_remote_signer_backend(&args).context("init remote signer backend")?;
+
     let pool = PgPoolOptions::new()
         .max_connections(10)
         .connect(&args.database_url)
@@ -97,6 +560,7 @@ async fn main() -> anyhow::Result<()> {
         auditor_token: args.auditor_token,
         policy_signer,
         policy_pubkey_b64,
+        remote_signer,
     };
 
     let app = Router::new()
@@ -108,6 +572,14 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/admin/devices/enroll", post(admin_devices_enroll))
         .route("/v1/devices/{id}/policy", get(device_policy_get))
         .route("/v1/devices/{id}/receipts", post(device_receipts_upload))
+        .route(
+            "/v1/devices/{id}/remote-signer",
+            get(device_remote_signer_get),
+        )
+        .route(
+            "/v1/devices/{id}/remote-signer/sign",
+            post(device_remote_signer_sign),
+        )
         .route("/v1/audit/receipts", get(audit_list_receipts))
         .layer(TraceLayer::new_for_http())
         .with_state(st);
@@ -199,11 +671,18 @@ async fn admin_devices_enroll(
         .map_err(internal_error)?;
     let signed = sign_policy_bundle(&st, &bundle).map_err(internal_error)?;
 
+    let remote_signer = st
+        .remote_signer
+        .key_info(req.device_id)
+        .await
+        .map_err(internal_error)?;
+
     Ok(Json(EnrollDeviceResponse {
         device_id: req.device_id,
         device_token,
         policy_signing_pubkey_b64: st.policy_pubkey_b64.clone(),
         policy_bundle: signed,
+        remote_signer: Some(remote_signer),
     }))
 }
 
@@ -293,6 +772,49 @@ async fn device_receipts_upload(
     tx.commit().await.map_err(internal_error)?;
 
     Ok(Json(UploadReceiptsResponse { stored }))
+}
+
+async fn device_remote_signer_get(
+    State(st): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path(device_id): Path<Uuid>,
+) -> Result<Json<DeviceRemoteSignerResponse>, (StatusCode, Json<ErrorResponse>)> {
+    require_device(&st, &headers, device_id).await?;
+    let signer = st
+        .remote_signer
+        .key_info(device_id)
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(DeviceRemoteSignerResponse { signer }))
+}
+
+async fn device_remote_signer_sign(
+    State(st): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path(device_id): Path<Uuid>,
+    Json(req): Json<RemoteSignRequest>,
+) -> Result<Json<RemoteSignResponse>, (StatusCode, Json<ErrorResponse>)> {
+    require_device(&st, &headers, device_id).await?;
+
+    let expected_key_id = st.remote_signer.key_id_for_device(device_id);
+    if req.key_id != expected_key_id {
+        return Err(bad_request("invalid_key_id"));
+    }
+
+    let msg = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(req.msg_b64.as_bytes())
+        .map_err(|_| bad_request("invalid_msg_b64"))?;
+    if msg.is_empty() || msg.len() > MAX_REMOTE_SIGN_MSG_BYTES {
+        return Err(bad_request("invalid_msg_size"));
+    }
+
+    let sig = st
+        .remote_signer
+        .sign(device_id, &msg)
+        .await
+        .map_err(internal_error)?;
+    let signature_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sig);
+    Ok(Json(RemoteSignResponse { signature_b64 }))
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -659,6 +1181,41 @@ fn unauthorized(code: &str) -> (StatusCode, Json<ErrorResponse>) {
 mod tests {
     use super::*;
 
+    fn p256_verify_key_from_jwk(jwk: &serde_json::Value) -> anyhow::Result<P256VerifyingKey> {
+        let obj = jwk.as_object().context("jwk must be object")?;
+        let kty = obj.get("kty").and_then(|v| v.as_str()).unwrap_or("");
+        if kty != "EC" {
+            anyhow::bail!("unsupported jwk.kty: {kty}");
+        }
+        let crv = obj.get("crv").and_then(|v| v.as_str()).unwrap_or("");
+        if crv != "P-256" {
+            anyhow::bail!("unsupported jwk.crv: {crv}");
+        }
+        let x_b64 = obj
+            .get("x")
+            .and_then(|v| v.as_str())
+            .context("missing jwk.x")?;
+        let y_b64 = obj
+            .get("y")
+            .and_then(|v| v.as_str())
+            .context("missing jwk.y")?;
+        let x = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(x_b64.as_bytes())
+            .context("decode jwk.x")?;
+        let y = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(y_b64.as_bytes())
+            .context("decode jwk.y")?;
+        if x.len() != 32 || y.len() != 32 {
+            anyhow::bail!("invalid p256 coordinate length");
+        }
+        let mut uncompressed = Vec::with_capacity(65);
+        uncompressed.push(0x04);
+        uncompressed.extend_from_slice(&x);
+        uncompressed.extend_from_slice(&y);
+        let point = p256::EncodedPoint::from_bytes(&uncompressed).context("decode p256 point")?;
+        P256VerifyingKey::from_encoded_point(&point).context("verifying key")
+    }
+
     #[test]
     fn policy_signing_round_trips() -> anyhow::Result<()> {
         let signer = SigningKey::from_bytes(&[7u8; 32]);
@@ -682,5 +1239,59 @@ mod tests {
         let event_json = serde_json::to_string(&event).unwrap();
         let h = sha256_hex_concat(&prev, event_json.as_bytes());
         assert_eq!(h.len(), 64);
+    }
+
+    #[tokio::test]
+    async fn derived_remote_signer_signs_and_verifies() -> anyhow::Result<()> {
+        use p256::ecdsa::signature::Verifier as _;
+
+        let backend = RemoteSignerBackend::DerivedP256 { seed: [1u8; 32] };
+        let device_id = Uuid::new_v4();
+        let info = backend.key_info(device_id).await?;
+        assert_eq!(info.algorithm, "p256");
+
+        let vk = p256_verify_key_from_jwk(&info.public_jwk)?;
+        let sig_bytes = backend.sign(device_id, b"hello").await?;
+        assert_eq!(sig_bytes.len(), 64);
+        let sig = P256Signature::from_slice(&sig_bytes).context("parse signature")?;
+        vk.verify(b"hello", &sig)?;
+        Ok(())
+    }
+
+    #[cfg(feature = "pkcs11")]
+    #[tokio::test]
+    async fn pkcs11_remote_signer_signs_and_verifies() -> anyhow::Result<()> {
+        use p256::ecdsa::signature::Verifier as _;
+
+        let module_path = std::env::var("CONTROL_PLANE_PKCS11_MODULE")
+            .ok()
+            .or_else(|| std::env::var("BRIEFCASE_PKCS11_MODULE").ok());
+        let token_label = std::env::var("CONTROL_PLANE_PKCS11_TOKEN_LABEL")
+            .ok()
+            .or_else(|| std::env::var("BRIEFCASE_PKCS11_TOKEN_LABEL").ok());
+        let user_pin = std::env::var("CONTROL_PLANE_PKCS11_USER_PIN")
+            .ok()
+            .or_else(|| std::env::var("BRIEFCASE_PKCS11_USER_PIN").ok());
+
+        let (Some(module_path), Some(token_label), Some(user_pin)) =
+            (module_path, token_label, user_pin)
+        else {
+            // Running without SoftHSM/Vault harness.
+            return Ok(());
+        };
+
+        let backend = RemoteSignerBackend::Pkcs11P256 {
+            module_path,
+            token_label,
+            user_pin,
+        };
+        let device_id = Uuid::new_v4();
+        let info = backend.key_info(device_id).await?;
+        let vk = p256_verify_key_from_jwk(&info.public_jwk)?;
+        let sig_bytes = backend.sign(device_id, b"hello").await?;
+        assert_eq!(sig_bytes.len(), 64);
+        let sig = P256Signature::from_slice(&sig_bytes).context("parse signature")?;
+        vk.verify(b"hello", &sig)?;
+        Ok(())
     }
 }

@@ -5,6 +5,34 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoteSignerKeyInfo {
+    /// Key identifier (stable until rotated).
+    pub key_id: String,
+    /// Signing algorithm (`p256` or `ed25519`).
+    pub algorithm: String,
+    /// Public JWK for this key (used for DPoP PoP binding).
+    pub public_jwk: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeviceRemoteSignerResponse {
+    pub signer: RemoteSignerKeyInfo,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoteSignRequest {
+    pub key_id: String,
+    /// Message bytes to sign (base64url, no padding).
+    pub msg_b64: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoteSignResponse {
+    /// Signature bytes (base64url, no padding). For ES256/EdDSA, this is the raw JWS signature.
+    pub signature_b64: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ErrorResponse {
     pub code: String,
     pub message: String,
@@ -49,6 +77,8 @@ pub struct EnrollDeviceResponse {
     /// Ed25519 public key used to verify policy bundle signatures (base64url).
     pub policy_signing_pubkey_b64: String,
     pub policy_bundle: SignedPolicyBundle,
+    /// Optional remote custody signer info for PoP keys (enterprise mode).
+    pub remote_signer: Option<RemoteSignerKeyInfo>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

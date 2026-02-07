@@ -9,7 +9,7 @@ use briefcase_payments::{
 use chrono::{DateTime, Utc};
 use reqwest::StatusCode;
 use serde::Deserialize;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 use tracing::{info, warn};
 use url::Url;
 
@@ -26,7 +26,7 @@ pub struct ProviderClient {
     secrets: Arc<dyn SecretStore>,
     db: Db,
     cached: Arc<Mutex<HashMap<String, CachedToken>>>, // provider_id -> token
-    pop: Option<Arc<dyn briefcase_keys::Signer>>,
+    pop: Arc<RwLock<Option<Arc<dyn briefcase_keys::Signer>>>>,
     payments: Arc<dyn PaymentBackend>,
 }
 
@@ -70,9 +70,15 @@ impl ProviderClient {
             secrets,
             db,
             cached: Arc::new(Mutex::new(HashMap::new())),
-            pop,
+            pop: Arc::new(RwLock::new(pop)),
             payments,
         }
+    }
+
+    pub async fn set_pop_signer(&self, pop: Option<Arc<dyn briefcase_keys::Signer>>) {
+        *self.pop.write().await = pop;
+        // Cached capability tokens can be DPoP-bound; when the PoP key changes, force refresh.
+        self.cached.lock().await.clear();
     }
 
     pub async fn get_quote(
@@ -160,7 +166,8 @@ impl ProviderClient {
         url.query_pairs_mut().append_pair("symbol", symbol);
 
         let mut req = self.http.get(url.clone());
-        if let Some(pop) = &self.pop {
+        let pop = self.pop.read().await.clone();
+        if let Some(pop) = pop {
             let proof =
                 briefcase_dpop::dpop_proof_for_resource_request(pop.as_ref(), &url, "GET", token)
                     .await?;
@@ -244,7 +251,8 @@ impl ProviderClient {
         let url = format!("{base_url}/token");
         let token_url = Url::parse(&url).context("parse token url")?;
         let mut req = self.http.post(url).header("x-vc-jwt", vc_jwt);
-        if let Some(pop) = &self.pop {
+        let pop = self.pop.read().await.clone();
+        if let Some(pop) = pop {
             let proof =
                 briefcase_dpop::dpop_proof_for_token_endpoint(pop.as_ref(), &token_url).await?;
             req = req.header("DPoP", proof);
@@ -291,7 +299,8 @@ impl ProviderClient {
         let url = format!("{base_url}/token");
         let token_url = Url::parse(&url).context("parse token url")?;
         let mut req = self.http.post(url).bearer_auth(&tr.access_token);
-        if let Some(pop) = &self.pop {
+        let pop = self.pop.read().await.clone();
+        if let Some(pop) = pop {
             let proof =
                 briefcase_dpop::dpop_proof_for_token_endpoint(pop.as_ref(), &token_url).await?;
             req = req.header("DPoP", proof);
@@ -309,7 +318,8 @@ impl ProviderClient {
         let token_url = provider_base.join("/token").context("join /token")?;
 
         let mut req = self.http.post(token_url.clone());
-        if let Some(pop) = &self.pop {
+        let pop = self.pop.read().await.clone();
+        if let Some(pop) = pop {
             let proof =
                 briefcase_dpop::dpop_proof_for_token_endpoint(pop.as_ref(), &token_url).await?;
             req = req.header("DPoP", proof);
@@ -338,7 +348,8 @@ impl ProviderClient {
                         payment_signature_b64,
                     }) => {
                         let mut req = self.http.post(token_url.clone());
-                        if let Some(pop) = &self.pop {
+                        let pop = self.pop.read().await.clone();
+                        if let Some(pop) = pop {
                             // For the retry, generate a fresh DPoP proof (new jti) bound to the same key.
                             let dpop = briefcase_dpop::dpop_proof_for_token_endpoint(
                                 pop.as_ref(),
@@ -399,7 +410,8 @@ impl ProviderClient {
 
         let proof = self.payments.pay(&provider_base, challenge).await?;
         let mut req = self.http.post(token_url.clone());
-        if let Some(pop) = &self.pop {
+        let pop = self.pop.read().await.clone();
+        if let Some(pop) = pop {
             // For the retry, generate a fresh DPoP proof (new jti) bound to the same key.
             let dpop =
                 briefcase_dpop::dpop_proof_for_token_endpoint(pop.as_ref(), &token_url).await?;

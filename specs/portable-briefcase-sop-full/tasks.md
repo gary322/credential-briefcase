@@ -300,7 +300,7 @@ For each task, include:
   - **Done when**: policy is centrally managed and enforced locally.
   - **Verify**: e2e tests.
 
-- [ ] 11.3 Optional remote custody mode (HSM/Vault)
+- [x] 11.3 Optional remote custody mode (HSM/Vault)
   - **Do**: implement remote signer backend in `briefcase-keys`; add control plane service for signing.
   - **Files**: `crates/briefcase-keys/src/remote.rs` (new), `apps/briefcase-control-plane/*`
   - **Done when**: remote signer can be used for DPoP/capabilities while preserving “no raw secrets to agent”.

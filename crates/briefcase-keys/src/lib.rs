@@ -17,6 +17,8 @@ pub mod tpm2;
 #[cfg(all(feature = "windows", target_os = "windows"))]
 pub mod windows;
 
+pub mod remote;
+
 use std::sync::Arc;
 
 use anyhow::Context as _;

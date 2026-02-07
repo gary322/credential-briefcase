@@ -6,8 +6,9 @@ use uuid::Uuid;
 
 use crate::types::{
     AdminSetPolicyRequest, AdminSetPolicyResponse, AuditListReceiptsResponse, DevicePolicyResponse,
-    EnrollDeviceRequest, EnrollDeviceResponse, ErrorResponse, HealthResponse,
-    UploadReceiptsRequest, UploadReceiptsResponse,
+    DeviceRemoteSignerResponse, EnrollDeviceRequest, EnrollDeviceResponse, ErrorResponse,
+    HealthResponse, RemoteSignRequest, RemoteSignResponse, UploadReceiptsRequest,
+    UploadReceiptsResponse,
 };
 
 #[derive(Debug, Clone)]
@@ -69,6 +70,32 @@ impl ControlPlaneClient {
     ) -> anyhow::Result<UploadReceiptsResponse> {
         self.post_json(
             &format!("/v1/devices/{device_id}/receipts"),
+            Some(device_token),
+            req,
+        )
+        .await
+    }
+
+    pub async fn device_remote_signer(
+        &self,
+        device_id: &Uuid,
+        device_token: &str,
+    ) -> anyhow::Result<DeviceRemoteSignerResponse> {
+        self.get_json(
+            &format!("/v1/devices/{device_id}/remote-signer"),
+            Some(device_token),
+        )
+        .await
+    }
+
+    pub async fn device_remote_sign(
+        &self,
+        device_id: &Uuid,
+        device_token: &str,
+        req: RemoteSignRequest,
+    ) -> anyhow::Result<RemoteSignResponse> {
+        self.post_json(
+            &format!("/v1/devices/{device_id}/remote-signer/sign"),
             Some(device_token),
             req,
         )
