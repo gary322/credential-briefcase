@@ -138,8 +138,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          yes | sdkmanager --licenses >/dev/null
-          sdkmanager --install \
+          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
+          test -n "${SDK_ROOT}"
+          yes | sdkmanager --sdk_root="${SDK_ROOT}" --licenses >/dev/null || true
+          sdkmanager --sdk_root="${SDK_ROOT}" --install \
             "platforms;android-34" \
             "build-tools;34.0.0"
 

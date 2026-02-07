@@ -29,10 +29,14 @@ enum PairingPayloadParser {
            let comps = URLComponents(url: u, resolvingAgainstBaseURL: false),
            let items = comps.queryItems
         {
-            let m = Dictionary(uniqueKeysWithValues: items.compactMap { qi in
-                guard let v = qi.value else { return nil }
-                return (qi.name, v)
-            })
+            // Newer Swift compilers can struggle to infer the generic arguments for
+            // `Dictionary(uniqueKeysWithValues:)` here. Build the map explicitly.
+            // If duplicate keys exist, the last occurrence wins.
+            var m: [String: String] = [:]
+            for qi in items {
+                guard let v = qi.value else { continue }
+                m[qi.name] = v
+            }
 
             if let base = m["base_url"],
                let pid = m["pairing_id"],
@@ -51,4 +55,3 @@ enum PairingPayloadParser {
         return nil
     }
 }
-
