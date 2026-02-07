@@ -256,6 +256,15 @@ export interface components {
       content: unknown;
       provenance: components["schemas"]["Provenance"];
     };
+    /**
+     * @description How an approval must be satisfied.
+     *
+     * - `local`: local UI (extension/CLI) using the daemon auth token.
+     * - `mobile_signer`: paired mobile signer must approve (signature-based auth).
+     *
+     * @enum {string}
+     */
+    ApprovalKind: "local" | "mobile_signer";
     ApprovalRequest: {
       /** Format: uuid */
       id: string;
@@ -265,6 +274,7 @@ export interface components {
       expires_at: string;
       tool_id: string;
       reason: string;
+      kind: components["schemas"]["ApprovalKind"];
       summary: unknown;
     };
     /** @description Matches `briefcase_api::types::CallToolResponse`. */

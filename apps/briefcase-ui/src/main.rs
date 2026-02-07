@@ -270,7 +270,7 @@ async fn index(State(st): State<AppState>) -> Html<String> {
         </div>
         <div id="approvalsErr" class="err"></div>
         <table>
-          <thead><tr><th>ID</th><th>Tool</th><th>Reason</th><th>Expires</th><th></th></tr></thead>
+          <thead><tr><th>ID</th><th>Tool</th><th>Reason</th><th>Kind</th><th>Expires</th><th></th></tr></thead>
           <tbody id="approvalsBody"></tbody>
         </table>
       </section>
@@ -354,26 +354,31 @@ async fn index(State(st): State<AppState>) -> Html<String> {
           for (const a of v.approvals) {{
             const tr = document.createElement('tr');
             const btn = document.createElement('button');
-            btn.textContent = 'Approve';
-            btn.onclick = async () => {{
-              btn.disabled = true;
-              try {{
-                await postJson(`/api/approvals/${{a.id}}/approve`, {{}});
-                await loadApprovals();
-              }} catch (e) {{
-                qs('#approvalsErr').textContent = e.toString();
-              }} finally {{
-                btn.disabled = false;
-              }}
-            }};
+            const needsSigner = a.kind === 'mobile_signer';
+            btn.textContent = needsSigner ? 'Mobile signer required' : 'Approve';
+            btn.disabled = needsSigner;
+            if (!needsSigner) {{
+              btn.onclick = async () => {{
+                btn.disabled = true;
+                try {{
+                  await postJson(`/api/approvals/${{a.id}}/approve`, {{}});
+                  await loadApprovals();
+                }} catch (e) {{
+                  qs('#approvalsErr').textContent = e.toString();
+                }} finally {{
+                  btn.disabled = false;
+                }}
+              }};
+            }}
             tr.innerHTML = `
               <td class="mono">${{a.id}}</td>
               <td>${{a.tool_id}}</td>
               <td class="muted">${{a.reason}}</td>
+              <td><span class="pill ${{a.kind === 'local' ? 'ok' : 'no'}}">${{a.kind}}</span></td>
               <td class="mono">${{a.expires_at}}</td>
               <td></td>
             `;
-            tr.children[4].appendChild(btn);
+            tr.children[5].appendChild(btn);
             qs('#approvalsBody').appendChild(tr);
           }}
         }} catch (e) {{

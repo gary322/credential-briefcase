@@ -2,8 +2,8 @@ use std::path::Path;
 
 use anyhow::Context as _;
 use briefcase_core::{
-    ApprovalRequest, ToolEgressPolicy, ToolFilesystemPolicy, ToolLimits, ToolManifest,
-    ToolRuntimeKind, util::sha256_hex,
+    ApprovalKind, ApprovalRequest, ToolEgressPolicy, ToolFilesystemPolicy, ToolLimits,
+    ToolManifest, ToolRuntimeKind, util::sha256_hex,
 };
 use chrono::{DateTime, Datelike as _, Duration, TimeZone as _, Utc};
 use rusqlite::{OptionalExtension, params};
@@ -78,6 +78,7 @@ impl Db {
                       expires_at_rfc3339 TEXT NOT NULL,
                       tool_id            TEXT NOT NULL,
                       reason             TEXT NOT NULL,
+                      approval_kind      TEXT NOT NULL DEFAULT 'local',
                       summary_json       TEXT NOT NULL,
                       call_hash_hex      TEXT NOT NULL,
                       status             TEXT NOT NULL
@@ -193,6 +194,10 @@ impl Db {
             .call(|conn| {
                 let _ = conn.execute(
                     "ALTER TABLE remote_mcp_oauth ADD COLUMN dpop_algs_json TEXT NOT NULL DEFAULT '[]'",
+                    [],
+                );
+                let _ = conn.execute(
+                    "ALTER TABLE approvals ADD COLUMN approval_kind TEXT NOT NULL DEFAULT 'local'",
                     [],
                 );
                 let _ = conn.execute(
@@ -888,6 +893,7 @@ impl Db {
         &self,
         tool_id: &str,
         reason: &str,
+        kind: ApprovalKind,
         args: &serde_json::Value,
     ) -> anyhow::Result<ApprovalRequest> {
         let id = Uuid::new_v4();
@@ -896,9 +902,15 @@ impl Db {
 
         let tool_id_s = tool_id.to_string();
         let reason_s = reason.to_string();
+        let kind_s = match kind {
+            ApprovalKind::Local => "local",
+            ApprovalKind::MobileSigner => "mobile_signer",
+        }
+        .to_string();
         let summary = serde_json::json!({
             "tool_id": tool_id,
             "reason": reason,
+            "kind": kind_s,
             "args_hash": sha256_hex(serde_json::to_vec(args)?.as_slice()),
         });
         let summary_json = serde_json::to_string(&summary)?;
@@ -909,16 +921,17 @@ impl Db {
         self.conn
             .call(move |conn| {
                 conn.execute(
-                    "INSERT INTO approvals(id, created_at_rfc3339, expires_at_rfc3339, tool_id, reason, summary_json, call_hash_hex, status)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending')",
+                    "INSERT INTO approvals(id, created_at_rfc3339, expires_at_rfc3339, tool_id, reason, approval_kind, summary_json, call_hash_hex, status)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'pending')",
                     params![
                         id.to_string(),
                         created_at.to_rfc3339(),
                         expires_at.to_rfc3339(),
                         tool_id_s,
                         reason_s,
+                        kind_s,
                         summary_json,
-                        call_hash_hex
+                        call_hash_hex,
                     ],
                 )?;
                 Ok(())
@@ -931,6 +944,7 @@ impl Db {
             expires_at,
             tool_id: tool_id.to_string(),
             reason: reason.to_string(),
+            kind,
             summary,
         })
     }
@@ -946,7 +960,7 @@ impl Db {
                 )?;
 
                 let mut stmt = conn.prepare(
-                    "SELECT id, created_at_rfc3339, expires_at_rfc3339, tool_id, reason, summary_json
+                    "SELECT id, created_at_rfc3339, expires_at_rfc3339, tool_id, reason, approval_kind, summary_json
                      FROM approvals WHERE status='pending' ORDER BY created_at_rfc3339 DESC LIMIT 100",
                 )?;
                 let rows = stmt.query_map([], |row| {
@@ -955,11 +969,17 @@ impl Db {
                     let expires_at: String = row.get(2)?;
                     let tool_id: String = row.get(3)?;
                     let reason: String = row.get(4)?;
-                    let summary_json: String = row.get(5)?;
+                    let kind: String = row.get(5)?;
+                    let kind = match kind.as_str() {
+                        "mobile_signer" => ApprovalKind::MobileSigner,
+                        _ => ApprovalKind::Local,
+                    };
+
+                    let summary_json: String = row.get(6)?;
                     let summary: serde_json::Value =
                         serde_json::from_str(&summary_json).map_err(|e| {
                             rusqlite::Error::FromSqlConversionFailure(
-                                5,
+                                6,
                                 rusqlite::types::Type::Text,
                                 Box::new(e),
                             )
@@ -992,11 +1012,35 @@ impl Db {
                         expires_at,
                         tool_id,
                         reason,
+                        kind,
                         summary,
                     })
                 })?;
 
                 Ok(rows.collect::<Result<Vec<_>, _>>()?)
+            })
+            .await
+            .map_err(Into::into)
+    }
+
+    pub async fn approval_kind(&self, id: Uuid) -> anyhow::Result<Option<ApprovalKind>> {
+        let id_s = id.to_string();
+        self.conn
+            .call(move |conn| {
+                let row: Option<String> = conn
+                    .query_row(
+                        "SELECT approval_kind FROM approvals WHERE id=?1",
+                        params![id_s],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                Ok(row.map(|s| {
+                    if s == "mobile_signer" {
+                        ApprovalKind::MobileSigner
+                    } else {
+                        ApprovalKind::Local
+                    }
+                }))
             })
             .await
             .map_err(Into::into)

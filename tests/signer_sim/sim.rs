@@ -72,7 +72,7 @@ impl SimSigner {
             .get("signer_id")
             .and_then(|x| x.as_str())
             .unwrap_or_default();
-        Ok(Uuid::parse_str(signer_id).context("parse signer_id")?)
+        Uuid::parse_str(signer_id).context("parse signer_id")
     }
 
     pub fn signed_request(
@@ -168,7 +168,7 @@ impl SimP256Signer {
             .get("signer_id")
             .and_then(|x| x.as_str())
             .unwrap_or_default();
-        Ok(Uuid::parse_str(signer_id).context("parse signer_id")?)
+        Uuid::parse_str(signer_id).context("parse signer_id")
     }
 
     pub fn signed_request(

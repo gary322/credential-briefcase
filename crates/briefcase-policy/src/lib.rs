@@ -5,4 +5,6 @@
 
 mod cedar_engine;
 
-pub use cedar_engine::{CedarPolicyEngine, CedarPolicyEngineError, CedarPolicyEngineOptions};
+pub use cedar_engine::{
+    CedarPolicyEngine, CedarPolicyEngineError, CedarPolicyEngineOptions, ToolPolicyContext,
+};

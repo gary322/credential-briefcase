@@ -12,7 +12,7 @@ use briefcase_api::types::{
     OAuthExchangeRequest,
 };
 use briefcase_api::{BriefcaseClient, DaemonEndpoint};
-use briefcase_core::{ToolCall, ToolCallContext};
+use briefcase_core::{ApprovalKind, ToolCall, ToolCallContext};
 use clap::{Parser, Subcommand};
 use directories::ProjectDirs;
 use rand::RngCore as _;
@@ -572,16 +572,35 @@ async fn handle_approvals(client: &BriefcaseClient, cmd: ApprovalsCommand) -> an
         ApprovalsCommand::List => {
             let approvals = client.list_approvals().await?.approvals;
             for a in approvals {
+                let kind = match a.kind {
+                    ApprovalKind::Local => "local",
+                    ApprovalKind::MobileSigner => "mobile_signer",
+                };
                 println!(
-                    "{} tool={} reason={} expires_at={}",
+                    "{} tool={} kind={} reason={} expires_at={}",
                     a.id,
                     a.tool_id,
+                    kind,
                     a.reason,
                     a.expires_at.to_rfc3339()
                 );
             }
         }
         ApprovalsCommand::Approve { id } => {
+            if let Some(a) = client
+                .list_approvals()
+                .await?
+                .approvals
+                .into_iter()
+                .find(|a| a.id == id)
+                && matches!(a.kind, ApprovalKind::MobileSigner)
+            {
+                println!(
+                    "approval {} requires a paired mobile signer; approve it from the mobile signer app",
+                    a.id
+                );
+                return Ok(());
+            }
             let r = client.approve(&id).await?;
             println!("approved: id={} token={}", r.approval_id, r.approval_token);
         }

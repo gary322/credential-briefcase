@@ -195,13 +195,13 @@ For each task, include:
   - **Done when**: iOS can pair and approve/sign requests end-to-end.
   - **Verify**: manual smoke + iOS unit tests in CI (build at minimum).
 
-- [ ] 6.3 Implement Android signer app (Keystore-backed keys)
+- [x] 6.3 Implement Android signer app (Keystore-backed keys)
   - **Do**: implement Android app with Keystore-backed keys; approval UI; QR pairing.
   - **Files**: `apps/briefcase-mobile-signer/android/*`
   - **Done when**: Android can pair and approve/sign requests end-to-end.
   - **Verify**: manual smoke + Android unit tests in CI (build at minimum).
 
-- [ ] 6.4 Mobile signer policy integration
+- [x] 6.4 Mobile signer policy integration
   - **Do**: add policy knobs: which tools/cost thresholds require mobile confirmation; integrate with Cedar policy decisions.
   - **Files**: `crates/briefcase-policy/*`, `apps/briefcased/src/app.rs`
   - **Done when**: high-risk actions are blocked without mobile confirmation.

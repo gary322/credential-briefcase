@@ -20,8 +20,8 @@ use briefcase_api::types::{
     UpsertMcpServerRequest, UpsertProviderRequest, VerifyReceiptsResponse,
 };
 use briefcase_core::{
-    PolicyDecision, ToolCall, ToolEgressPolicy, ToolFilesystemPolicy, ToolLimits, ToolManifest,
-    ToolResult, ToolRuntimeKind,
+    ApprovalKind, PolicyDecision, ToolCall, ToolEgressPolicy, ToolFilesystemPolicy, ToolLimits,
+    ToolManifest, ToolResult, ToolRuntimeKind,
 };
 use chrono::Utc;
 use rand::RngCore as _;
@@ -37,7 +37,7 @@ use crate::provider::ProviderClient;
 use crate::remote_mcp::RemoteMcpManager;
 use crate::tools::ToolRegistry;
 use briefcase_keys::{KeyAlgorithm, KeyHandle, SoftwareKeyManager};
-use briefcase_policy::{CedarPolicyEngine, CedarPolicyEngineOptions};
+use briefcase_policy::{CedarPolicyEngine, CedarPolicyEngineOptions, ToolPolicyContext};
 use briefcase_receipts::{ReceiptStore, ReceiptStoreOptions};
 use briefcase_secrets::SecretStore;
 use std::sync::Arc;
@@ -843,9 +843,14 @@ async fn call_tool_impl(state: &AppState, call: ToolCall) -> anyhow::Result<Call
         ResolvedTool::Remote(s) => s.as_ref(),
     };
 
+    let manifest_opt = match &tool {
+        ResolvedTool::Remote(_) => None,
+        ResolvedTool::Local(_) => state.db.get_tool_manifest(&call.tool_id).await?,
+    };
+
     let runtime = match &tool {
         ResolvedTool::Remote(_) => "remote_mcp".to_string(),
-        ResolvedTool::Local(_) => match state.db.get_tool_manifest(&call.tool_id).await? {
+        ResolvedTool::Local(_) => match &manifest_opt {
             Some(m) => match m.runtime {
                 briefcase_core::ToolRuntimeKind::Builtin => "builtin".to_string(),
                 briefcase_core::ToolRuntimeKind::Wasm => "wasm".to_string(),
@@ -853,6 +858,27 @@ async fn call_tool_impl(state: &AppState, call: ToolCall) -> anyhow::Result<Call
             },
             None => "builtin".to_string(),
         },
+    };
+
+    let policy_ctx = match &tool {
+        ResolvedTool::Remote(_) => ToolPolicyContext {
+            net_access: true,
+            fs_access: false,
+        },
+        ResolvedTool::Local(_) => {
+            let net_access = manifest_opt
+                .as_ref()
+                .map(|m| !m.egress.allowed_hosts.is_empty())
+                .unwrap_or(false);
+            let fs_access = manifest_opt
+                .as_ref()
+                .map(|m| !m.filesystem.allowed_path_prefixes.is_empty())
+                .unwrap_or(false);
+            ToolPolicyContext {
+                net_access,
+                fs_access,
+            }
+        }
     };
 
     // Validate inputs early. We treat invalid args as denied.
@@ -881,7 +907,7 @@ async fn call_tool_impl(state: &AppState, call: ToolCall) -> anyhow::Result<Call
     }
 
     // Cedar policy: allow/deny/require-approval.
-    let decision = state.policy.decide("local-user", spec)?;
+    let decision = state.policy.decide("local-user", spec, policy_ctx)?;
     match &decision {
         PolicyDecision::Deny { reason } => {
             state
@@ -899,12 +925,12 @@ async fn call_tool_impl(state: &AppState, call: ToolCall) -> anyhow::Result<Call
                 reason: reason.clone(),
             });
         }
-        PolicyDecision::RequireApproval { reason } => {
+        PolicyDecision::RequireApproval { reason, kind } => {
             // If the user already attached an approval token, proceed.
             if call.approval_token.is_none() {
                 let approval = state
                     .db
-                    .create_approval(&call.tool_id, reason, &call.args)
+                    .create_approval(&call.tool_id, reason, *kind, &call.args)
                     .await?;
 
                 state
@@ -915,6 +941,7 @@ async fn call_tool_impl(state: &AppState, call: ToolCall) -> anyhow::Result<Call
                         "runtime": runtime.as_str(),
                         "decision": "approval_required",
                         "approval_id": approval.id,
+                        "approval_kind": approval.kind,
                         "ts": Utc::now().to_rfc3339(),
                     }))
                     .await?;
@@ -940,7 +967,7 @@ async fn call_tool_impl(state: &AppState, call: ToolCall) -> anyhow::Result<Call
 
             let approval = state
                 .db
-                .create_approval(&call.tool_id, &reason, &call.args)
+                .create_approval(&call.tool_id, &reason, ApprovalKind::Local, &call.args)
                 .await?;
 
             state
@@ -951,6 +978,7 @@ async fn call_tool_impl(state: &AppState, call: ToolCall) -> anyhow::Result<Call
                     "runtime": runtime.as_str(),
                     "decision": "approval_required",
                     "approval_id": approval.id,
+                    "approval_kind": approval.kind,
                     "reason": reason,
                     "ts": Utc::now().to_rfc3339(),
                 }))
@@ -971,8 +999,28 @@ async fn call_tool_impl(state: &AppState, call: ToolCall) -> anyhow::Result<Call
     {
         let approval = state
             .db
-            .create_approval(&call.tool_id, "budget_exceeded", &call.args)
+            .create_approval(
+                &call.tool_id,
+                "budget_exceeded",
+                ApprovalKind::Local,
+                &call.args,
+            )
             .await?;
+
+        state
+            .receipts
+            .append(serde_json::json!({
+                "kind": "tool_call",
+                "tool_id": call.tool_id,
+                "runtime": runtime.as_str(),
+                "decision": "approval_required",
+                "approval_id": approval.id,
+                "approval_kind": approval.kind,
+                "reason": "budget_exceeded",
+                "ts": Utc::now().to_rfc3339(),
+            }))
+            .await?;
+
         return Ok(CallToolResponse::ApprovalRequired { approval });
     }
 
@@ -1274,16 +1322,19 @@ async fn approve(
     State(state): State<AppState>,
     AxumPath(id): AxumPath<Uuid>,
 ) -> Result<Json<ApproveResponse>, (StatusCode, Json<ErrorResponse>)> {
-    if state.require_signer_for_approvals
-        && state.db.has_any_signers().await.map_err(internal_error)?
-    {
-        return Err((
-            StatusCode::FORBIDDEN,
-            Json(ErrorResponse {
-                code: "signer_required".to_string(),
-                message: "mobile signer required".to_string(),
-            }),
-        ));
+    if let Some(kind) = state.db.approval_kind(id).await.map_err(internal_error)? {
+        let policy_requires_signer = matches!(kind, ApprovalKind::MobileSigner);
+        let global_requires_signer = state.require_signer_for_approvals
+            && state.db.has_any_signers().await.map_err(internal_error)?;
+        if policy_requires_signer || global_requires_signer {
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(ErrorResponse {
+                    code: "signer_required".to_string(),
+                    message: "mobile signer required".to_string(),
+                }),
+            ));
+        }
     }
 
     match state.db.approve(id).await {
@@ -2879,10 +2930,12 @@ mod tests {
             })
             .await?;
 
-        let approval_id = match resp {
-            CallToolResponse::ApprovalRequired { approval } => approval.id,
+        let approval = match resp {
+            CallToolResponse::ApprovalRequired { approval } => approval,
             _ => anyhow::bail!("expected approval_required"),
         };
+        assert_eq!(approval.kind, ApprovalKind::Local);
+        let approval_id = approval.id;
 
         // Signer can list approvals.
         let approvals = client
@@ -2959,10 +3012,12 @@ mod tests {
             })
             .await?;
 
-        let approval_id = match resp {
-            CallToolResponse::ApprovalRequired { approval } => approval.id,
+        let approval = match resp {
+            CallToolResponse::ApprovalRequired { approval } => approval,
             _ => anyhow::bail!("expected approval_required"),
         };
+        assert_eq!(approval.kind, ApprovalKind::Local);
+        let approval_id = approval.id;
 
         // Signer can list approvals.
         let approvals = client
@@ -3002,6 +3057,93 @@ mod tests {
             })
             .await?;
         assert!(matches!(resp, CallToolResponse::Ok { .. }));
+
+        daemon_task.abort();
+        provider_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn policy_requires_mobile_signer_for_high_risk_write() -> anyhow::Result<()> {
+        let (provider_addr, _provider_state, provider_task) = start_mock_provider().await?;
+        let provider_base_url = format!("http://{provider_addr}");
+
+        let (state, _daemon_base, client, daemon_task) =
+            start_daemon_with_options(provider_base_url, AppOptions::default()).await?;
+
+        // Configure file_read with filesystem access, making it a "high risk write".
+        let dir = tempdir()?;
+        let prefix = std::fs::canonicalize(dir.path())?;
+        let prefix_s = prefix.to_string_lossy().to_string();
+        let file_path = prefix.join("test.txt");
+        std::fs::write(&file_path, b"hello")?;
+        let file_path_s = file_path.to_string_lossy().to_string();
+
+        let mut m = ToolManifest::deny_all("file_read", ToolRuntimeKind::Wasm);
+        m.filesystem.allowed_path_prefixes = vec![prefix_s];
+        state.db.upsert_tool_manifest(&m).await?;
+
+        // Pair a signer so we can satisfy mobile_signer approvals.
+        let pair = client.signer_pair_start().await?;
+        let sim = signer_sim::SimSigner::new();
+        let signer_id = sim
+            .pair(&client, pair.pairing_id, &pair.pairing_code)
+            .await?;
+
+        // file_read requires mobile signer approval under the default policy.
+        let resp = client
+            .call_tool(CallToolRequest {
+                call: ToolCall {
+                    tool_id: "file_read".to_string(),
+                    args: serde_json::json!({ "path": file_path_s }),
+                    context: ToolCallContext::new(),
+                    approval_token: None,
+                },
+            })
+            .await?;
+
+        let approval = match resp {
+            CallToolResponse::ApprovalRequired { approval } => approval,
+            other => anyhow::bail!("expected approval_required, got {other:?}"),
+        };
+        assert_eq!(approval.kind, ApprovalKind::MobileSigner);
+
+        // Local approve is forbidden even without global signer enforcement.
+        match client.approve(&approval.id).await {
+            Ok(_) => anyhow::bail!("expected signer_required error"),
+            Err(BriefcaseClientError::Daemon { code, .. }) => {
+                assert_eq!(code, "signer_required");
+            }
+            Err(other) => anyhow::bail!("unexpected error: {other:?}"),
+        };
+
+        let approved = client
+            .signer_approve(
+                &approval.id,
+                sim.signed_request(signer_id, "approve", Some(approval.id)),
+            )
+            .await?;
+
+        // Retry with approval token.
+        let resp = client
+            .call_tool(CallToolRequest {
+                call: ToolCall {
+                    tool_id: "file_read".to_string(),
+                    args: serde_json::json!({ "path": file_path.to_string_lossy() }),
+                    context: ToolCallContext::new(),
+                    approval_token: Some(approved.approval_token),
+                },
+            })
+            .await?;
+        match resp {
+            CallToolResponse::Ok { result } => {
+                assert_eq!(
+                    result.content.get("ok").and_then(|v| v.as_bool()),
+                    Some(true)
+                );
+            }
+            other => anyhow::bail!("expected ok, got {other:?}"),
+        }
 
         daemon_task.abort();
         provider_task.abort();
@@ -3070,6 +3212,13 @@ mod tests {
 
         let (state, _daemon_base, client, daemon_task) = start_daemon(provider_base_url).await?;
 
+        // Pair a signer because filesystem-enabled tools are treated as "high risk writes" by default.
+        let pair = client.signer_pair_start().await?;
+        let sim = signer_sim::SimSigner::new();
+        let signer_id = sim
+            .pair(&client, pair.pairing_id, &pair.pairing_code)
+            .await?;
+
         // Ensure tool is surfaced.
         let tools = client.list_tools().await?.tools;
         assert!(tools.iter().any(|t| t.id == "file_read"));
@@ -3098,11 +3247,17 @@ mod tests {
             })
             .await?;
 
-        let approval_id = match resp {
-            CallToolResponse::ApprovalRequired { approval } => approval.id,
+        let approval = match resp {
+            CallToolResponse::ApprovalRequired { approval } => approval,
             other => anyhow::bail!("expected approval_required, got {other:?}"),
         };
-        let approved = client.approve(&approval_id).await?;
+        assert_eq!(approval.kind, ApprovalKind::MobileSigner);
+        let approved = client
+            .signer_approve(
+                &approval.id,
+                sim.signed_request(signer_id, "approve", Some(approval.id)),
+            )
+            .await?;
 
         // With approval, succeeds and returns file contents.
         let resp = client

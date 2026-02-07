@@ -345,9 +345,18 @@ components:
         provenance:
           $ref: "#/components/schemas/Provenance"
 
+    ApprovalKind:
+      type: string
+      enum: [local, mobile_signer]
+      description: |
+        How an approval must be satisfied.
+
+        - `local`: local UI (extension/CLI) using the daemon auth token.
+        - `mobile_signer`: paired mobile signer must approve (signature-based auth).
+
     ApprovalRequest:
       type: object
-      required: [id, created_at, expires_at, tool_id, reason, summary]
+      required: [id, created_at, expires_at, tool_id, reason, kind, summary]
       properties:
         id:
           type: string
@@ -362,6 +371,8 @@ components:
           type: string
         reason:
           type: string
+        kind:
+          $ref: "#/components/schemas/ApprovalKind"
         summary: {}
 
     CallToolResponse:

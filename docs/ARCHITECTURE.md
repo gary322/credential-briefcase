@@ -49,7 +49,10 @@ Provide a "credential briefcase" where:
 
 1. Policy decision requires approval.
 2. Daemon creates an approval request and returns `approval_required`.
-3. User approves via CLI (or future UI), obtaining an `approval_token`.
+3. User approves:
+   - `kind=local`: via extension/CLI/UI using the daemon auth token.
+   - `kind=mobile_signer`: via a paired mobile signer (signature-based auth).
+   This yields an `approval_token`.
 4. Tool call is retried with the `approval_token`.
 
 ## Provider Auth Strategy (v0.1)

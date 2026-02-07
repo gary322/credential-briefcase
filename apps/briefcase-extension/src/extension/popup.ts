@@ -21,12 +21,15 @@ type BudgetRecord = {
   daily_limit_microusd: number;
 };
 
+type ApprovalKind = "local" | "mobile_signer";
+
 type ApprovalRequest = {
   id: string;
   created_at: string;
   expires_at: string;
   tool_id: string;
   reason: string;
+  kind: ApprovalKind;
   summary: unknown;
 };
 
@@ -275,7 +278,7 @@ async function loadApprovals(): Promise<void> {
 
     const detail = document.createElement("div");
     detail.className = "url";
-    detail.innerText = `expires: ${a.expires_at}`;
+    detail.innerText = `kind: ${a.kind} | expires: ${a.expires_at}`;
     box.appendChild(detail);
 
     const pre = document.createElement("pre");
@@ -289,17 +292,23 @@ async function loadApprovals(): Promise<void> {
     const approve = document.createElement("button");
     approve.className = "connect";
     approve.type = "button";
-    approve.innerText = "Approve";
-    approve.addEventListener("click", async () => {
-      setStatus(`Approving ${a.id}...`);
-      try {
-        await rpc("approve", { id: a.id });
-        await renderAfter(loadApprovals);
-        setStatus("Approved. Retry the tool call with approval_token=approval_id.");
-      } catch (e) {
-        setStatus(errorMessage(e));
-      }
-    });
+    const needsSigner = a.kind === "mobile_signer";
+    approve.innerText = needsSigner ? "Mobile signer required" : "Approve";
+    approve.disabled = needsSigner;
+    if (needsSigner) {
+      approve.title = "Approve this request from the paired mobile signer app.";
+    } else {
+      approve.addEventListener("click", async () => {
+        setStatus(`Approving ${a.id}...`);
+        try {
+          await rpc("approve", { id: a.id });
+          await renderAfter(loadApprovals);
+          setStatus("Approved. Retry the tool call with approval_token=approval_id.");
+        } catch (e) {
+          setStatus(errorMessage(e));
+        }
+      });
+    }
 
     actions.appendChild(approve);
     box.appendChild(actions);

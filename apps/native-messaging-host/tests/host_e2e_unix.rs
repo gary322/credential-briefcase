@@ -387,6 +387,7 @@ async fn list_approvals(
             .with_timezone(&Utc),
         tool_id: "demo.write".to_string(),
         reason: "requires_approval".to_string(),
+        kind: briefcase_core::ApprovalKind::Local,
         summary: serde_json::json!({"action":"write"}),
     };
 

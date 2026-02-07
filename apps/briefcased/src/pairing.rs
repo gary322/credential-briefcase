@@ -68,15 +68,16 @@ pub fn noise_responder(psk: &[u8; 32]) -> anyhow::Result<snow::HandshakeState> {
     let builder = snow::Builder::new(params)
         .psk(0, psk)
         .context("set noise psk")?;
-    Ok(builder.build_responder().context("build responder")?)
+    builder.build_responder().context("build responder")
 }
 
+#[cfg(test)]
 pub fn noise_initiator(psk: &[u8; 32]) -> anyhow::Result<snow::HandshakeState> {
     let params: snow::params::NoiseParams = NOISE_PARAMS.parse().context("parse noise params")?;
     let builder = snow::Builder::new(params)
         .psk(0, psk)
         .context("set noise psk")?;
-    Ok(builder.build_initiator().context("build initiator")?)
+    builder.build_initiator().context("build initiator")
 }
 
 #[derive(Debug)]

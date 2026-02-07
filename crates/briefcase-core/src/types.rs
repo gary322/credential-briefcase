@@ -109,7 +109,16 @@ pub struct ToolCall {
 pub enum PolicyDecision {
     Allow,
     Deny { reason: String },
-    RequireApproval { reason: String },
+    RequireApproval { reason: String, kind: ApprovalKind },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalKind {
+    /// Approval can be satisfied via local UI (extension/CLI) using the daemon auth token.
+    Local,
+    /// Approval must be satisfied via a paired mobile signer (signature-based auth).
+    MobileSigner,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -144,6 +153,7 @@ pub struct ApprovalRequest {
     pub expires_at: DateTime<Utc>,
     pub tool_id: ToolId,
     pub reason: String,
+    pub kind: ApprovalKind,
     pub summary: serde_json::Value,
 }
 

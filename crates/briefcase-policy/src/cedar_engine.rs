@@ -2,12 +2,25 @@ use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 
 use anyhow::Context as _;
-use briefcase_core::{PolicyDecision, ToolCategory, ToolSpec};
+use briefcase_core::{ApprovalKind, PolicyDecision, ToolCategory, ToolSpec};
 use cedar_policy::{
     Authorizer, Context, Entities, Entity, EntityId, EntityTypeName, EntityUid, PolicySet, Request,
     RestrictedExpression,
 };
 use thiserror::Error;
+
+/// Additional tool metadata used for policy evaluation.
+///
+/// The Briefcase derives this from per-tool manifests at runtime so policy can distinguish
+/// "high risk writes" (e.g. tools that can touch the filesystem or the network) from purely local
+/// writes (e.g. writing to an internal DB table).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ToolPolicyContext {
+    /// True if the tool is configured with any outbound network egress.
+    pub net_access: bool,
+    /// True if the tool is configured with any filesystem allowlist.
+    pub fs_access: bool,
+}
 
 #[derive(Debug, Clone)]
 pub struct CedarPolicyEngineOptions {
@@ -17,13 +30,19 @@ pub struct CedarPolicyEngineOptions {
 
 impl CedarPolicyEngineOptions {
     pub fn default_policies() -> Self {
-        // NOTE: Cedar has only allow/deny. We encode "approval required" by evaluating
-        // a stricter action (CallWithoutApproval). If Call is permitted but
-        // CallWithoutApproval is forbidden, the caller must obtain approval.
+        // NOTE: Cedar has only allow/deny. We encode "approval required" and "mobile signer required"
+        // by evaluating stricter actions:
+        //
+        // - `CallWithoutApproval`: if forbidden, an approval record is required.
+        // - `CallWithoutSigner`: if forbidden, that approval must be satisfied by a paired mobile signer.
+        //
+        // If `Call` is permitted but `CallWithoutApproval` is forbidden -> approval required.
+        // If `CallWithoutApproval` is forbidden and `CallWithoutSigner` is forbidden -> mobile signer required.
         //
         // Defaults:
         // - allow calling all tools except category=="admin"
-        // - require approval for write tools OR cost > $0.01
+        // - allow no-approval calls only for cheap read tools
+        // - require mobile signer only for "high risk writes" (write tools with net/fs access)
         Self {
             policy_text: r#"
 // Allow calling any non-admin tool.
@@ -39,6 +58,13 @@ permit(principal, action == Action::"CallWithoutApproval", resource)
 when {
   resource.category == "read" &&
   resource.cost_microusd <= 10000
+};
+
+// Allow calls without a mobile signer unless this is a "high risk write"
+// (i.e. a write tool with network or filesystem access configured).
+permit(principal, action == Action::"CallWithoutSigner", resource)
+when {
+  !(resource.is_write && (resource.net_access || resource.fs_access))
 };
 "#
             .to_string(),
@@ -81,17 +107,18 @@ impl CedarPolicyEngine {
         &self,
         principal: &str,
         tool: &ToolSpec,
+        ctx: ToolPolicyContext,
     ) -> Result<PolicyDecision, CedarPolicyEngineError> {
-        let entities = Entities::from_entities([tool_entity(tool)?], None)
+        let entities = Entities::from_entities([tool_entity(tool, ctx)?], None)
             .map_err(|e| CedarPolicyEngineError::Other(anyhow::anyhow!("{e}")))?;
 
-        let principal = EntityUid::from_type_name_and_id(
+        let principal_uid = EntityUid::from_type_name_and_id(
             EntityTypeName::from_str("User")
                 .map_err(|e| CedarPolicyEngineError::Other(anyhow::anyhow!("{e}")))?,
             EntityId::from_str(principal)
                 .map_err(|e| CedarPolicyEngineError::Other(anyhow::anyhow!("{e}")))?,
         );
-        let resource = EntityUid::from_type_name_and_id(
+        let resource_uid = EntityUid::from_type_name_and_id(
             EntityTypeName::from_str("Tool")
                 .map_err(|e| CedarPolicyEngineError::Other(anyhow::anyhow!("{e}")))?,
             EntityId::from_str(&tool.id)
@@ -100,7 +127,12 @@ impl CedarPolicyEngine {
 
         let ctx = Context::empty();
 
-        let call = make_request(principal.clone(), resource.clone(), "Call", ctx.clone())?;
+        let call = make_request(
+            principal_uid.clone(),
+            resource_uid.clone(),
+            "Call",
+            ctx.clone(),
+        )?;
         let call_decision = self
             .authorizer
             .is_authorized(&call, &self.policies, &entities);
@@ -110,7 +142,12 @@ impl CedarPolicyEngine {
             });
         }
 
-        let call_wo_approval = make_request(principal, resource, "CallWithoutApproval", ctx)?;
+        let call_wo_approval = make_request(
+            principal_uid.clone(),
+            resource_uid.clone(),
+            "CallWithoutApproval",
+            ctx.clone(),
+        )?;
         let wo_decision =
             self.authorizer
                 .is_authorized(&call_wo_approval, &self.policies, &entities);
@@ -119,8 +156,20 @@ impl CedarPolicyEngine {
             return Ok(PolicyDecision::Allow);
         }
 
+        let call_wo_signer = make_request(principal_uid, resource_uid, "CallWithoutSigner", ctx)?;
+        let signer_decision =
+            self.authorizer
+                .is_authorized(&call_wo_signer, &self.policies, &entities);
+
+        let kind = if signer_decision.decision() == cedar_policy::Decision::Allow {
+            ApprovalKind::Local
+        } else {
+            ApprovalKind::MobileSigner
+        };
+
         Ok(PolicyDecision::RequireApproval {
             reason: "tool call requires approval".to_string(),
+            kind,
         })
     }
 }
@@ -142,7 +191,7 @@ fn make_request(
         .map_err(|e| CedarPolicyEngineError::Eval(format!("{e}")))
 }
 
-fn tool_entity(tool: &ToolSpec) -> Result<Entity, CedarPolicyEngineError> {
+fn tool_entity(tool: &ToolSpec, ctx: ToolPolicyContext) -> Result<Entity, CedarPolicyEngineError> {
     // Cedar numeric type is Long. Use micro-USD as integer to avoid floats.
     let cost_microusd: i64 = (tool.cost.estimated_usd * 1_000_000.0).round() as i64;
 
@@ -165,6 +214,16 @@ fn tool_entity(tool: &ToolSpec) -> Result<Entity, CedarPolicyEngineError> {
             "false"
         })
         .map_err(|e| CedarPolicyEngineError::Other(anyhow::anyhow!("{e}")))?,
+    );
+    attrs.insert(
+        "net_access".to_string(),
+        RestrictedExpression::from_str(if ctx.net_access { "true" } else { "false" })
+            .map_err(|e| CedarPolicyEngineError::Other(anyhow::anyhow!("{e}")))?,
+    );
+    attrs.insert(
+        "fs_access".to_string(),
+        RestrictedExpression::from_str(if ctx.fs_access { "true" } else { "false" })
+            .map_err(|e| CedarPolicyEngineError::Other(anyhow::anyhow!("{e}")))?,
     );
 
     let uid = EntityUid::from_type_name_and_id(
@@ -202,26 +261,70 @@ mod tests {
     #[test]
     fn cheap_read_is_allowed_without_approval() {
         let engine = CedarPolicyEngine::new(CedarPolicyEngineOptions::default_policies()).unwrap();
+        let ctx = ToolPolicyContext::default();
         let d = engine
-            .decide("me", &tool("echo", ToolCategory::Read, 0.0))
+            .decide("me", &tool("echo", ToolCategory::Read, 0.0), ctx)
             .unwrap();
         assert_eq!(d, PolicyDecision::Allow);
     }
 
     #[test]
-    fn write_requires_approval() {
+    fn expensive_read_requires_local_approval() {
         let engine = CedarPolicyEngine::new(CedarPolicyEngineOptions::default_policies()).unwrap();
+        let ctx = ToolPolicyContext::default();
         let d = engine
-            .decide("me", &tool("write", ToolCategory::Write, 0.0))
+            .decide("me", &tool("read", ToolCategory::Read, 0.02), ctx)
             .unwrap();
-        assert!(matches!(d, PolicyDecision::RequireApproval { .. }));
+        assert!(matches!(
+            d,
+            PolicyDecision::RequireApproval {
+                kind: ApprovalKind::Local,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn local_write_requires_local_approval() {
+        let engine = CedarPolicyEngine::new(CedarPolicyEngineOptions::default_policies()).unwrap();
+        let ctx = ToolPolicyContext::default();
+        let d = engine
+            .decide("me", &tool("write", ToolCategory::Write, 0.0), ctx)
+            .unwrap();
+        assert!(matches!(
+            d,
+            PolicyDecision::RequireApproval {
+                kind: ApprovalKind::Local,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn high_risk_write_requires_mobile_signer_approval() {
+        let engine = CedarPolicyEngine::new(CedarPolicyEngineOptions::default_policies()).unwrap();
+        let ctx = ToolPolicyContext {
+            net_access: true,
+            fs_access: false,
+        };
+        let d = engine
+            .decide("me", &tool("write", ToolCategory::Write, 0.0), ctx)
+            .unwrap();
+        assert!(matches!(
+            d,
+            PolicyDecision::RequireApproval {
+                kind: ApprovalKind::MobileSigner,
+                ..
+            }
+        ));
     }
 
     #[test]
     fn admin_is_denied() {
         let engine = CedarPolicyEngine::new(CedarPolicyEngineOptions::default_policies()).unwrap();
+        let ctx = ToolPolicyContext::default();
         let d = engine
-            .decide("me", &tool("admin", ToolCategory::Admin, 0.0))
+            .decide("me", &tool("admin", ToolCategory::Admin, 0.0), ctx)
             .unwrap();
         assert!(matches!(d, PolicyDecision::Deny { .. }));
     }
