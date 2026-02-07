@@ -287,7 +287,7 @@ For each task, include:
 
 ## Phase 11: Enterprise Control Plane (Reference)
 
-- [ ] 11.1 Implement control plane API (RBAC, policy bundles, receipt ingestion)
+- [x] 11.1 Implement control plane API (RBAC, policy bundles, receipt ingestion)
   - **Do**: build `apps/briefcase-control-plane` server with Postgres; define API contracts; issue signed policy bundles.
   - **Files**: `apps/briefcase-control-plane/*`, `deploy/docker-compose.enterprise.yml`
   - **Done when**: a client can enroll, fetch policy, and upload receipts; auditors can query.

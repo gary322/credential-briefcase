@@ -62,3 +62,7 @@ test-l402-lnd:
 
 test-l402-cln:
   bash docker/lightning-regtest/run-tests.sh cln
+
+# Enterprise control plane (Postgres) e2e harness.
+test-enterprise:
+  bash docker/enterprise/run-tests.sh

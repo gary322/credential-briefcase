@@ -157,6 +157,21 @@ jobs:
       - name: Run Lightning regtest harness
         run: bash docker/lightning-regtest/run-tests.sh all
 
+  enterprise_control_plane:
+    name: enterprise control plane (Postgres e2e)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.89.0"
+          components: rustfmt, clippy
+
+      - name: Enterprise e2e harness
+        run: bash docker/enterprise/run-tests.sh
+
   ios_signer_build:
     name: iOS signer (build)
     runs-on: macos-latest

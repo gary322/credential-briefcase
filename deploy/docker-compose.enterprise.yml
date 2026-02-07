@@ -1,0 +1,32 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: briefcase
+      POSTGRES_PASSWORD: briefcase
+      POSTGRES_DB: briefcase_control_plane
+    ports:
+      - "54329:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U briefcase -d briefcase_control_plane"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  control-plane:
+    build:
+      context: ..
+      dockerfile: docker/control-plane/Dockerfile
+    environment:
+      CONTROL_PLANE_BIND_ADDR: 0.0.0.0:9797
+      CONTROL_PLANE_DATABASE_URL: postgres://briefcase:briefcase@postgres:5432/briefcase_control_plane
+      CONTROL_PLANE_ADMIN_TOKEN: ${CONTROL_PLANE_ADMIN_TOKEN:-admin-test-token}
+      CONTROL_PLANE_AUDITOR_TOKEN: ${CONTROL_PLANE_AUDITOR_TOKEN:-auditor-test-token}
+      # 32 zero bytes, base64url-no-pad.
+      CONTROL_PLANE_POLICY_SIGNING_KEY_SEED_B64: ${CONTROL_PLANE_POLICY_SIGNING_KEY_SEED_B64:-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA}
+    ports:
+      - "9797:9797"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
