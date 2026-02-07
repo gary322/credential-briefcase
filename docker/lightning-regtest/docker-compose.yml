@@ -1,0 +1,113 @@
+services:
+  bitcoind:
+    image: bitcoin/bitcoin:27.1
+    command:
+      - bitcoind
+      - -datadir=/data
+      - -regtest=1
+      - -server=1
+      - -rpcallowip=0.0.0.0/0
+      - -rpcbind=0.0.0.0
+      - -rpcuser=rpcuser
+      - -rpcpassword=rpcpass
+      - -fallbackfee=0.0002
+      - -txindex=1
+      - -zmqpubrawblock=tcp://0.0.0.0:28332
+      - -zmqpubrawtx=tcp://0.0.0.0:28333
+      - -printtoconsole
+    volumes:
+      - ./.data/bitcoin:/data
+
+  lnd-alice:
+    image: lightninglabs/lnd:v0.18.3-beta
+    depends_on:
+      - bitcoind
+    command:
+      - lnd
+      - --lnddir=/root/.lnd
+      - --noseedbackup
+      - --alias=alice
+      - --bitcoin.active
+      - --bitcoin.regtest
+      - --bitcoin.node=bitcoind
+      - --bitcoind.rpchost=bitcoind:18443
+      - --bitcoind.rpcuser=rpcuser
+      - --bitcoind.rpcpass=rpcpass
+      - --bitcoind.zmqpubrawblock=tcp://bitcoind:28332
+      - --bitcoind.zmqpubrawtx=tcp://bitcoind:28333
+      - --rpclisten=0.0.0.0:10009
+      - --restlisten=0.0.0.0:8080
+      - --listen=0.0.0.0:9735
+      - --tlsextraip=127.0.0.1
+      - --tlsextradomain=localhost
+      - --debuglevel=info
+    ports:
+      - "10009:10009"
+    volumes:
+      - ./.data/lnd-alice:/root/.lnd
+
+  lnd-bob:
+    image: lightninglabs/lnd:v0.18.3-beta
+    depends_on:
+      - bitcoind
+    command:
+      - lnd
+      - --lnddir=/root/.lnd
+      - --noseedbackup
+      - --alias=bob
+      - --bitcoin.active
+      - --bitcoin.regtest
+      - --bitcoin.node=bitcoind
+      - --bitcoind.rpchost=bitcoind:18443
+      - --bitcoind.rpcuser=rpcuser
+      - --bitcoind.rpcpass=rpcpass
+      - --bitcoind.zmqpubrawblock=tcp://bitcoind:28332
+      - --bitcoind.zmqpubrawtx=tcp://bitcoind:28333
+      - --rpclisten=0.0.0.0:10009
+      - --restlisten=0.0.0.0:8080
+      - --listen=0.0.0.0:9735
+      - --tlsextraip=127.0.0.1
+      - --tlsextradomain=localhost
+      - --debuglevel=info
+    ports:
+      - "11009:10009"
+    volumes:
+      - ./.data/lnd-bob:/root/.lnd
+
+  cln-carol:
+    image: elementsproject/lightningd:v24.11.1
+    depends_on:
+      - bitcoind
+    command:
+      - --network=regtest
+      - --lightning-dir=/root/.lightning
+      - --rpc-file=/root/.lightning/lightning-rpc
+      - --rpc-file-mode=0666
+      - --addr=0.0.0.0:9735
+      - --bitcoin-rpcconnect=bitcoind
+      - --bitcoin-rpcport=18443
+      - --bitcoin-rpcuser=rpcuser
+      - --bitcoin-rpcpassword=rpcpass
+      - --log-level=info
+      - --developer
+    volumes:
+      - ./.data/cln-carol:/root/.lightning
+
+  cln-dave:
+    image: elementsproject/lightningd:v24.11.1
+    depends_on:
+      - bitcoind
+    command:
+      - --network=regtest
+      - --lightning-dir=/root/.lightning
+      - --rpc-file=/root/.lightning/lightning-rpc
+      - --rpc-file-mode=0666
+      - --addr=0.0.0.0:9735
+      - --bitcoin-rpcconnect=bitcoind
+      - --bitcoin-rpcport=18443
+      - --bitcoin-rpcuser=rpcuser
+      - --bitcoin-rpcpassword=rpcpass
+      - --log-level=info
+      - --developer
+    volumes:
+      - ./.data/cln-dave:/root/.lightning

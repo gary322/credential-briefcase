@@ -27,7 +27,8 @@ pub enum PaymentHelperRequest {
         payment_required: x402::PaymentRequired,
     },
 
-    /// Demo L402: helper returns a preimage for the invoice; daemon attaches macaroon+preimage.
+    /// L402: helper pays the BOLT11 invoice via a Lightning backend and returns the preimage;
+    /// daemon attaches macaroon+preimage.
     L402 {
         provider_base_url: String,
         invoice: String,

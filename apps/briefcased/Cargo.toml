@@ -5,6 +5,11 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = []
+l402-lnd = ["briefcase-payments/l402-lnd"]
+l402-cln = ["briefcase-payments/l402-cln"]
+
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
@@ -48,6 +53,7 @@ briefcase-sandbox = { path = "../../crates/briefcase-sandbox" }
 briefcase-secrets = { path = "../../crates/briefcase-secrets" }
 
 [dev-dependencies]
+hex.workspace = true
 tempfile.workspace = true
 
 [build-dependencies]

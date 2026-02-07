@@ -5,6 +5,11 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = []
+l402-lnd = ["briefcase-payments/l402-lnd"]
+l402-cln = ["briefcase-payments/l402-cln"]
+
 [dependencies]
 anyhow.workspace = true
 axum.workspace = true

@@ -1,0 +1,65 @@
+syntax = "proto3";
+
+package lnrpc;
+
+// Minimal subset of LND's `lnrpc.Lightning` service required for regtest L402
+// flows. We keep this intentionally small to avoid vendoring the full upstream
+// proto surface.
+//
+// Compatibility note: field numbers MUST match LND's upstream proto.
+// Source: https://github.com/lightningnetwork/lnd/blob/master/lnrpc/lightning.proto
+
+service Lightning {
+  rpc SendPaymentSync (SendRequest) returns (SendResponse) {}
+  rpc AddInvoice (Invoice) returns (AddInvoiceResponse) {}
+  rpc LookupInvoice (PaymentHash) returns (Invoice) {}
+}
+
+message SendRequest {
+  // lnd: string payment_request = 6;
+  string payment_request = 6;
+}
+
+message SendResponse {
+  // lnd: string payment_error = 1;
+  string payment_error = 1;
+  // lnd: bytes payment_preimage = 2;
+  bytes payment_preimage = 2;
+}
+
+message Invoice {
+  // lnd: string memo = 1;
+  string memo = 1;
+
+  // lnd: bytes r_hash = 4; (payment hash, output only)
+  bytes r_hash = 4;
+
+  // lnd: int64 value = 5;
+  int64 value = 5;
+
+  // lnd: string payment_request = 9; (output only)
+  string payment_request = 9;
+
+  // lnd: int64 expiry = 11;
+  int64 expiry = 11;
+
+  // lnd: InvoiceState state = 21; (enum values: OPEN=0, SETTLED=1, CANCELED=2, ACCEPTED=3)
+  int32 state = 21;
+
+  // lnd: int64 value_msat = 23;
+  int64 value_msat = 23;
+}
+
+message AddInvoiceResponse {
+  // lnd: bytes r_hash = 1;
+  bytes r_hash = 1;
+
+  // lnd: string payment_request = 2;
+  string payment_request = 2;
+}
+
+message PaymentHash {
+  // lnd: bytes r_hash = 2;
+  bytes r_hash = 2;
+}
+

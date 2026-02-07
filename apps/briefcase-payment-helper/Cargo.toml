@@ -5,6 +5,11 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = []
+l402-lnd = ["briefcase-payments/l402-lnd"]
+l402-cln = ["briefcase-payments/l402-cln"]
+
 [dependencies]
 anyhow.workspace = true
 briefcase-payments = { path = "../../crates/briefcase-payments" }
@@ -12,3 +17,4 @@ clap.workspace = true
 hex.workspace = true
 secp256k1.workspace = true
 serde_json.workspace = true
+tokio.workspace = true

@@ -479,7 +479,11 @@ mod tests {
     use axum::routing::post;
     use axum::{Json, Router};
     use chrono::Utc;
+    #[cfg(any(feature = "l402-lnd", all(feature = "l402-cln", unix)))]
+    use sha2::{Digest as _, Sha256};
     use tempfile::tempdir;
+    #[cfg(any(feature = "l402-lnd", all(feature = "l402-cln", unix)))]
+    use uuid::Uuid;
 
     #[derive(Clone)]
     struct X402V2State {
@@ -659,6 +663,486 @@ mod tests {
         assert_eq!(tok.token, "cap_v2");
         assert!(matches!(tok.minted_via, AuthMethod::PaymentX402));
         assert!(*st.verified.lock().await);
+
+        handle.abort();
+        Ok(())
+    }
+
+    #[cfg(feature = "l402-lnd")]
+    #[derive(Clone)]
+    struct L402LndState {
+        payee_cfg: briefcase_payments::l402_lnd::LndGrpcConfig,
+        pending: Arc<tokio::sync::Mutex<HashMap<String, String>>>, // macaroon -> payment_hash_hex
+    }
+
+    #[cfg(feature = "l402-lnd")]
+    async fn token_l402_lnd(
+        AxumState(st): AxumState<L402LndState>,
+        headers: HeaderMap,
+    ) -> axum::response::Response {
+        // Accept L402 proof.
+        if let Some(authz) = headers.get("authorization").and_then(|h| h.to_str().ok())
+            && let Some(rest) = authz.strip_prefix("L402 ")
+            && let Some((mac, pre)) = rest.split_once(':')
+        {
+            return token_l402_lnd_after_payment(st, mac, pre).await;
+        }
+        if let (Some(mac), Some(pre)) = (
+            headers.get("x-l402-macaroon").and_then(|h| h.to_str().ok()),
+            headers.get("x-l402-preimage").and_then(|h| h.to_str().ok()),
+        ) {
+            return token_l402_lnd_after_payment(st, mac, pre).await;
+        }
+
+        // Challenge.
+        let macaroon = format!("mac_{}", Uuid::new_v4());
+        let mut client = match briefcase_payments::l402_lnd::LndGrpcClient::connect(
+            st.payee_cfg.clone(),
+        )
+        .await
+        {
+            Ok(c) => c,
+            Err(err) => {
+                return (
+                    AxumStatusCode::BAD_GATEWAY,
+                    Json(serde_json::json!({
+                        "error":"lnd_connect_failed",
+                        "detail": format!("{err:#}"),
+                    })),
+                )
+                    .into_response();
+            }
+        };
+
+        let resp = match client.add_invoice("l402_test", 10, 600).await {
+            Ok(r) => r,
+            Err(_) => {
+                return (
+                    AxumStatusCode::BAD_GATEWAY,
+                    Json(serde_json::json!({"error":"lnd_add_invoice_failed"})),
+                )
+                    .into_response();
+            }
+        };
+
+        let payment_hash_hex = hex::encode(resp.r_hash);
+        st.pending
+            .lock()
+            .await
+            .insert(macaroon.clone(), payment_hash_hex);
+
+        let challenge = PaymentChallenge::L402 {
+            invoice: resp.payment_request,
+            macaroon: macaroon.clone(),
+            amount_microusd: 2000,
+        };
+
+        let www = briefcase_payments::format_www_authenticate(&challenge);
+        let mut out = (AxumStatusCode::PAYMENT_REQUIRED, Json(challenge)).into_response();
+        if let Ok(hv) = HeaderValue::from_str(&www) {
+            out.headers_mut()
+                .insert(reqwest::header::WWW_AUTHENTICATE, hv);
+        }
+        out
+    }
+
+    #[cfg(feature = "l402-lnd")]
+    async fn token_l402_lnd_after_payment(
+        st: L402LndState,
+        macaroon: &str,
+        preimage_hex: &str,
+    ) -> axum::response::Response {
+        let expected_hash = {
+            let mut guard = st.pending.lock().await;
+            match guard.remove(macaroon) {
+                Some(v) => v,
+                None => {
+                    return (
+                        AxumStatusCode::PAYMENT_REQUIRED,
+                        Json(serde_json::json!({"error":"unknown_macaroon"})),
+                    )
+                        .into_response();
+                }
+            }
+        };
+
+        let preimage = match hex::decode(preimage_hex.trim()) {
+            Ok(v) => v,
+            Err(_) => {
+                return (
+                    AxumStatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error":"invalid_preimage"})),
+                )
+                    .into_response();
+            }
+        };
+        if preimage.len() != 32 {
+            return (
+                AxumStatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error":"invalid_preimage_len"})),
+            )
+                .into_response();
+        }
+
+        let computed = hex::encode(Sha256::digest(&preimage));
+        if computed != expected_hash {
+            return (
+                AxumStatusCode::PAYMENT_REQUIRED,
+                Json(serde_json::json!({"error":"preimage_mismatch"})),
+            )
+                .into_response();
+        }
+
+        // Ensure invoice is settled on the provider node.
+        let mut client = match briefcase_payments::l402_lnd::LndGrpcClient::connect(
+            st.payee_cfg.clone(),
+        )
+        .await
+        {
+            Ok(c) => c,
+            Err(err) => {
+                return (
+                    AxumStatusCode::BAD_GATEWAY,
+                    Json(serde_json::json!({
+                        "error":"lnd_connect_failed",
+                        "detail": format!("{err:#}"),
+                    })),
+                )
+                    .into_response();
+            }
+        };
+        let hash_bytes = hex::decode(&expected_hash).unwrap_or_default();
+        if let Ok(inv) = client.lookup_invoice(&hash_bytes).await {
+            if inv.state != 1 {
+                return (
+                    AxumStatusCode::PAYMENT_REQUIRED,
+                    Json(serde_json::json!({"error":"invoice_not_settled"})),
+                )
+                    .into_response();
+            }
+        } else {
+            return (
+                AxumStatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({"error":"lookup_failed"})),
+            )
+                .into_response();
+        }
+
+        let tr = serde_json::json!({
+            "token": "cap_l402_lnd",
+            "expires_at_rfc3339": (Utc::now() + chrono::Duration::minutes(10)).to_rfc3339(),
+            "max_calls": 50
+        });
+        (AxumStatusCode::OK, Json(tr)).into_response()
+    }
+
+    #[cfg(feature = "l402-lnd")]
+    #[tokio::test]
+    async fn l402_lnd_token_mint_via_helper() -> anyhow::Result<()> {
+        let helper = match std::env::var("BRIEFCASE_TEST_PAYMENT_HELPER") {
+            Ok(v) => v,
+            Err(_) => return Ok(()),
+        };
+
+        let payee_endpoint = match std::env::var("BRIEFCASE_TEST_LND_PAYEE_GRPC_ENDPOINT") {
+            Ok(v) => v,
+            Err(_) => return Ok(()),
+        };
+        let payee_tls = match std::env::var("BRIEFCASE_TEST_LND_PAYEE_TLS_CERT_FILE") {
+            Ok(v) => v,
+            Err(_) => return Ok(()),
+        };
+        let payee_mac = match std::env::var("BRIEFCASE_TEST_LND_PAYEE_MACAROON_FILE") {
+            Ok(v) => v,
+            Err(_) => return Ok(()),
+        };
+
+        let payer_endpoint = match std::env::var("BRIEFCASE_TEST_LND_PAYER_GRPC_ENDPOINT") {
+            Ok(v) => v,
+            Err(_) => return Ok(()),
+        };
+        let payer_tls = match std::env::var("BRIEFCASE_TEST_LND_PAYER_TLS_CERT_FILE") {
+            Ok(v) => v,
+            Err(_) => return Ok(()),
+        };
+        let payer_mac = match std::env::var("BRIEFCASE_TEST_LND_PAYER_MACAROON_FILE") {
+            Ok(v) => v,
+            Err(_) => return Ok(()),
+        };
+
+        let mut payee_cfg = briefcase_payments::l402_lnd::LndGrpcConfig::from_files(
+            payee_endpoint,
+            std::path::Path::new(&payee_tls),
+            std::path::Path::new(&payee_mac),
+        )?;
+        // Many regtest setups issue certs for localhost.
+        payee_cfg = payee_cfg.tls_domain_override("localhost");
+
+        let st = L402LndState {
+            payee_cfg,
+            pending: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        };
+
+        let app = Router::new()
+            .route("/token", post(token_l402_lnd))
+            .with_state(st);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let base_url = format!("http://{addr}");
+
+        // Debug probe: helps diagnose failures in the embedded test token endpoint,
+        // especially when upstream nodes are unreachable.
+        let probe = reqwest::Client::new()
+            .post(format!("{base_url}/token"))
+            .send()
+            .await?;
+        let probe_status = probe.status();
+        if probe_status != StatusCode::PAYMENT_REQUIRED {
+            let body = probe.text().await.unwrap_or_default();
+            println!(
+                "l402_lnd_token_mint_via_helper probe: status={} body={}",
+                probe_status, body
+            );
+        }
+
+        let dir = tempdir()?;
+        let db_path = dir.path().join("briefcase.sqlite");
+        let db = Db::open(&db_path).await?;
+        db.init().await?;
+        let secrets = Arc::new(briefcase_secrets::InMemorySecretStore::default());
+
+        let payments = Arc::new(
+            briefcase_payments::CommandPaymentBackend::new(helper)
+                .with_args(vec![
+                    "--l402-backend".to_string(),
+                    "lnd".to_string(),
+                    "--lnd-grpc-endpoint".to_string(),
+                    payer_endpoint,
+                    "--lnd-tls-cert-file".to_string(),
+                    payer_tls,
+                    "--lnd-macaroon-file".to_string(),
+                    payer_mac,
+                    "--lnd-tls-domain".to_string(),
+                    "localhost".to_string(),
+                ])
+                .with_timeout(std::time::Duration::from_secs(60)),
+        );
+        let client = ProviderClient::new(secrets, db, None, payments);
+
+        let tok = client.fetch_token_via_payment(&base_url).await?;
+        assert_eq!(tok.token, "cap_l402_lnd");
+        assert!(matches!(tok.minted_via, AuthMethod::PaymentL402));
+
+        handle.abort();
+        Ok(())
+    }
+
+    #[cfg(all(feature = "l402-cln", unix))]
+    #[derive(Clone)]
+    struct L402ClnState {
+        payee_socket: std::path::PathBuf,
+        pending: Arc<tokio::sync::Mutex<HashMap<String, String>>>, // macaroon -> payment_hash_hex
+    }
+
+    #[cfg(all(feature = "l402-cln", unix))]
+    async fn token_l402_cln(
+        AxumState(st): AxumState<L402ClnState>,
+        headers: HeaderMap,
+    ) -> axum::response::Response {
+        if let Some(authz) = headers.get("authorization").and_then(|h| h.to_str().ok())
+            && let Some(rest) = authz.strip_prefix("L402 ")
+            && let Some((mac, pre)) = rest.split_once(':')
+        {
+            return token_l402_cln_after_payment(st, mac, pre).await;
+        }
+        if let (Some(mac), Some(pre)) = (
+            headers.get("x-l402-macaroon").and_then(|h| h.to_str().ok()),
+            headers.get("x-l402-preimage").and_then(|h| h.to_str().ok()),
+        ) {
+            return token_l402_cln_after_payment(st, mac, pre).await;
+        }
+
+        let macaroon = format!("mac_{}", Uuid::new_v4());
+        let inv = match briefcase_payments::l402_cln::create_invoice(
+            &st.payee_socket,
+            10_000,
+            &macaroon,
+            "l402_test",
+            Some(600),
+        )
+        .await
+        {
+            Ok(v) => v,
+            Err(err) => {
+                return (
+                    AxumStatusCode::BAD_GATEWAY,
+                    Json(serde_json::json!({
+                        "error":"cln_invoice_failed",
+                        "detail": format!("{err:#}"),
+                    })),
+                )
+                    .into_response();
+            }
+        };
+
+        st.pending
+            .lock()
+            .await
+            .insert(macaroon.clone(), inv.payment_hash_hex);
+
+        let challenge = PaymentChallenge::L402 {
+            invoice: inv.bolt11,
+            macaroon: macaroon.clone(),
+            amount_microusd: 2000,
+        };
+
+        let www = briefcase_payments::format_www_authenticate(&challenge);
+        let mut out = (AxumStatusCode::PAYMENT_REQUIRED, Json(challenge)).into_response();
+        if let Ok(hv) = HeaderValue::from_str(&www) {
+            out.headers_mut()
+                .insert(reqwest::header::WWW_AUTHENTICATE, hv);
+        }
+        out
+    }
+
+    #[cfg(all(feature = "l402-cln", unix))]
+    async fn token_l402_cln_after_payment(
+        st: L402ClnState,
+        macaroon: &str,
+        preimage_hex: &str,
+    ) -> axum::response::Response {
+        let expected_hash = {
+            let mut guard = st.pending.lock().await;
+            match guard.remove(macaroon) {
+                Some(v) => v,
+                None => {
+                    return (
+                        AxumStatusCode::PAYMENT_REQUIRED,
+                        Json(serde_json::json!({"error":"unknown_macaroon"})),
+                    )
+                        .into_response();
+                }
+            }
+        };
+
+        let preimage = match hex::decode(preimage_hex.trim()) {
+            Ok(v) => v,
+            Err(_) => {
+                return (
+                    AxumStatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error":"invalid_preimage"})),
+                )
+                    .into_response();
+            }
+        };
+        if preimage.len() != 32 {
+            return (
+                AxumStatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error":"invalid_preimage_len"})),
+            )
+                .into_response();
+        }
+        let computed = hex::encode(Sha256::digest(&preimage));
+        if computed != expected_hash {
+            return (
+                AxumStatusCode::PAYMENT_REQUIRED,
+                Json(serde_json::json!({"error":"preimage_mismatch"})),
+            )
+                .into_response();
+        }
+
+        let paid = briefcase_payments::l402_cln::is_invoice_paid(&st.payee_socket, &expected_hash)
+            .await
+            .unwrap_or(false);
+        if !paid {
+            return (
+                AxumStatusCode::PAYMENT_REQUIRED,
+                Json(serde_json::json!({"error":"invoice_not_paid"})),
+            )
+                .into_response();
+        }
+
+        let tr = serde_json::json!({
+            "token": "cap_l402_cln",
+            "expires_at_rfc3339": (Utc::now() + chrono::Duration::minutes(10)).to_rfc3339(),
+            "max_calls": 50
+        });
+        (AxumStatusCode::OK, Json(tr)).into_response()
+    }
+
+    #[cfg(all(feature = "l402-cln", unix))]
+    #[tokio::test]
+    async fn l402_cln_token_mint_via_helper() -> anyhow::Result<()> {
+        let helper = match std::env::var("BRIEFCASE_TEST_PAYMENT_HELPER") {
+            Ok(v) => v,
+            Err(_) => return Ok(()),
+        };
+
+        let payee_socket = match std::env::var("BRIEFCASE_TEST_CLN_PAYEE_RPC_SOCKET") {
+            Ok(v) => std::path::PathBuf::from(v),
+            Err(_) => return Ok(()),
+        };
+        let payer_socket = match std::env::var("BRIEFCASE_TEST_CLN_PAYER_RPC_SOCKET") {
+            Ok(v) => v,
+            Err(_) => return Ok(()),
+        };
+
+        let st = L402ClnState {
+            payee_socket,
+            pending: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        };
+
+        let app = Router::new()
+            .route("/token", post(token_l402_cln))
+            .with_state(st);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let base_url = format!("http://{addr}");
+
+        // Debug probe: helps diagnose failures in the embedded test token endpoint,
+        // especially when upstream nodes are unreachable.
+        let probe = reqwest::Client::new()
+            .post(format!("{base_url}/token"))
+            .send()
+            .await?;
+        let probe_status = probe.status();
+        if probe_status != StatusCode::PAYMENT_REQUIRED {
+            let body = probe.text().await.unwrap_or_default();
+            println!(
+                "l402_cln_token_mint_via_helper probe: status={} body={}",
+                probe_status, body
+            );
+        }
+
+        let dir = tempdir()?;
+        let db_path = dir.path().join("briefcase.sqlite");
+        let db = Db::open(&db_path).await?;
+        db.init().await?;
+        let secrets = Arc::new(briefcase_secrets::InMemorySecretStore::default());
+
+        let payments = Arc::new(
+            briefcase_payments::CommandPaymentBackend::new(helper)
+                .with_args(vec![
+                    "--l402-backend".to_string(),
+                    "cln".to_string(),
+                    "--cln-rpc-socket".to_string(),
+                    payer_socket,
+                ])
+                .with_timeout(std::time::Duration::from_secs(60)),
+        );
+        let client = ProviderClient::new(secrets, db, None, payments);
+
+        let tok = client.fetch_token_via_payment(&base_url).await?;
+        assert_eq!(tok.token, "cap_l402_cln");
+        assert!(matches!(tok.minted_via, AuthMethod::PaymentL402));
 
         handle.abort();
         Ok(())

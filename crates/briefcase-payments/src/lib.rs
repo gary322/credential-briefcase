@@ -15,6 +15,11 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 
 pub mod helper_protocol;
+pub mod l402;
+#[cfg(all(feature = "l402-cln", unix))]
+pub mod l402_cln;
+#[cfg(feature = "l402-lnd")]
+pub mod l402_lnd;
 pub mod x402;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

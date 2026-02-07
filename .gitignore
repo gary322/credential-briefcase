@@ -24,6 +24,9 @@ apps/briefcase-extension/playwright-report
 # Local caches (e.g. docker-mounted cargo registry)
 .cache
 
+# Lightning regtest harness runtime state
+docker/lightning-regtest/.data
+
 # Android
 apps/briefcase-mobile-signer/android/.gradle
 apps/briefcase-mobile-signer/android/**/build

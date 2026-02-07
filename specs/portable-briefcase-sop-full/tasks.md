@@ -224,20 +224,20 @@ For each task, include:
 
 ## Phase 8: Real L402 Lightning Payments
 
-- [ ] 8.1 Implement L402 backend with LND
+- [x] 8.1 Implement L402 backend with LND
   - **Do**: implement invoice payment via LND gRPC; parse BOLT11 invoices; handle macaroon+preimage return.
   - **Files**: `crates/briefcase-payments/src/l402_lnd.rs` (new)
   - **Done when**: can pay invoices on regtest and complete L402 flow end-to-end.
   - **Verify**: `just test-l402-lnd`
   - _Reqs: FR-9_
 
-- [ ] 8.2 Implement L402 backend with Core Lightning (optional but recommended)
+- [x] 8.2 Implement L402 backend with Core Lightning (optional but recommended)
   - **Do**: implement payment via CLN JSON-RPC; share common code with LND backend.
   - **Files**: `crates/briefcase-payments/src/l402_cln.rs` (new)
   - **Done when**: CLN backend passes regtest integration tests.
   - **Verify**: `just test-l402-cln`
 
-- [ ] 8.3 Lightning regtest harness in CI
+- [x] 8.3 Lightning regtest harness in CI
   - **Do**: add docker-compose harness for LND/CLN regtest; ensure tests are stable/time-bounded.
   - **Files**: `docker/lightning-regtest/*`, `.github/workflows/*`
   - **Done when**: CI runs L402 tests reliably.

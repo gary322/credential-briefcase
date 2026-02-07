@@ -12,9 +12,9 @@ ci:
   @just node-ci
 
 rust-ci:
-  cargo fmt --all -- --check
-  cargo clippy --all-targets --all-features -- -D warnings
-  cargo test --all
+  PATH="$HOME/.cargo/bin:$PATH" cargo fmt --all -- --check
+  PATH="$HOME/.cargo/bin:$PATH" cargo clippy --all-targets --all-features -- -D warnings
+  PATH="$HOME/.cargo/bin:$PATH" cargo test --all
 
 node-ci:
   # No-op if the monorepo has no Node workspace yet.
@@ -52,3 +52,13 @@ test-tpm2:
 test-x402:
   docker build -f docker/x402-harness/Dockerfile -t credential-briefcase-x402 .
   docker run --rm -v {{invocation_directory()}}:/workspace -w /workspace credential-briefcase-x402 bash docker/x402-harness/run-tests.sh
+
+# L402 (Lightning) regtest harness.
+test-lightning:
+  bash docker/lightning-regtest/run-tests.sh all
+
+test-l402-lnd:
+  bash docker/lightning-regtest/run-tests.sh lnd
+
+test-l402-cln:
+  bash docker/lightning-regtest/run-tests.sh cln

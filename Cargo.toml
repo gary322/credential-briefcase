@@ -79,3 +79,11 @@ url = "2.5.4"
 wasmtime = "40.0.3"
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security_Cryptography"] }
 zeroize = { version = "1.8.1", features = ["derive"] }
+
+# Lightning / gRPC (Phase 8).
+lightning-invoice = "0.34.0"
+prost = "0.14.3"
+protoc-bin-vendored = "3.2.0"
+tonic = { version = "0.14.3", default-features = false, features = ["transport", "codegen", "tls-ring"] }
+tonic-prost = "0.14.3"
+tonic-prost-build = "0.14.3"

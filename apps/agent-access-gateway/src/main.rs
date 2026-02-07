@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Context as _;
@@ -34,6 +35,14 @@ const X402_V2_TOKEN_NAME: &str = "USD Coin";
 const X402_V2_TOKEN_VERSION: &str = "2";
 const X402_V2_MAX_TIMEOUT_SECONDS: i64 = 60;
 
+#[derive(Debug, Clone, clap::ValueEnum, PartialEq, Eq)]
+#[clap(rename_all = "snake_case")]
+enum L402Backend {
+    Demo,
+    Lnd,
+    Cln,
+}
+
 #[derive(Debug, Parser)]
 #[command(
     name = "agent-access-gateway",
@@ -53,6 +62,37 @@ struct Args {
 
     #[arg(long, env = "AAG_MAX_CALLS", default_value_t = 50)]
     max_calls: i64,
+
+    /// L402 backend for issuing invoices and verifying payments.
+    ///
+    /// `demo` keeps the existing in-memory behavior. `lnd` and `cln` connect to a
+    /// regtest Lightning node and issue real BOLT11 invoices.
+    #[arg(long, env = "AAG_L402_BACKEND", default_value = "demo")]
+    l402_backend: L402Backend,
+
+    /// Amount to request on Lightning invoices, in satoshis.
+    #[arg(long, env = "AAG_L402_INVOICE_SATS", default_value_t = 10)]
+    l402_invoice_sats: i64,
+
+    /// LND gRPC endpoint for the provider's node, e.g. `https://localhost:10009`.
+    #[arg(long, env = "AAG_LND_GRPC_ENDPOINT")]
+    lnd_grpc_endpoint: Option<String>,
+
+    /// LND TLS cert file for the provider's node.
+    #[arg(long, env = "AAG_LND_TLS_CERT_FILE")]
+    lnd_tls_cert_file: Option<PathBuf>,
+
+    /// LND admin macaroon file for the provider's node.
+    #[arg(long, env = "AAG_LND_MACAROON_FILE")]
+    lnd_macaroon_file: Option<PathBuf>,
+
+    /// Override the TLS SNI/hostname used for LND certificate verification.
+    #[arg(long, env = "AAG_LND_TLS_DOMAIN")]
+    lnd_tls_domain: Option<String>,
+
+    /// Core Lightning JSON-RPC socket for the provider's node.
+    #[arg(long, env = "AAG_CLN_RPC_SOCKET")]
+    cln_rpc_socket: Option<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -60,6 +100,15 @@ struct AppState {
     secret: Vec<u8>,
     cost_microusd: i64,
     max_calls: i64,
+    l402_backend: L402Backend,
+    // Only used when real L402 backends are enabled; keep the config fields
+    // present so CLI/env remains stable across builds.
+    #[allow(dead_code)]
+    l402_invoice_sats: i64,
+    #[allow(dead_code)]
+    lnd: Option<LndProviderConfig>,
+    #[allow(dead_code)]
+    cln_rpc_socket: Option<PathBuf>,
     pending_x402: Arc<Mutex<HashMap<String, PendingPayment>>>,
     pending_l402: Arc<Mutex<HashMap<String, PendingL402>>>,
     usage: Arc<Mutex<HashMap<String, i64>>>, // jti -> calls
@@ -75,9 +124,36 @@ struct PendingPayment {
     paid: bool,
 }
 
+#[derive(Clone)]
+struct LndProviderConfig {
+    endpoint: String,
+    tls_cert_pem: Vec<u8>,
+    macaroon_hex: String,
+    tls_domain: String,
+}
+
+impl std::fmt::Debug for LndProviderConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LndProviderConfig")
+            .field("endpoint", &self.endpoint)
+            .field("tls_domain", &self.tls_domain)
+            .field("tls_cert_pem_len", &self.tls_cert_pem.len())
+            .field("macaroon_hex_len", &self.macaroon_hex.len())
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone)]
-struct PendingL402 {
-    preimage: String,
+enum PendingL402 {
+    Demo {
+        preimage: String,
+        created_at: DateTime<Utc>,
+    },
+    #[allow(dead_code)]
+    Lightning {
+        payment_hash_hex: String,
+        created_at: DateTime<Utc>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -227,10 +303,80 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let args = Args::parse();
+    if args.l402_invoice_sats <= 0 {
+        anyhow::bail!("--l402-invoice-sats must be > 0");
+    }
+
+    let lnd = if args.l402_backend == L402Backend::Lnd {
+        if !cfg!(feature = "l402-lnd") {
+            anyhow::bail!(
+                "built without l402-lnd feature; rebuild agent-access-gateway with --features l402-lnd"
+            );
+        }
+
+        let endpoint = args
+            .lnd_grpc_endpoint
+            .clone()
+            .context("missing --lnd-grpc-endpoint / AAG_LND_GRPC_ENDPOINT")?;
+        let url = Url::parse(&endpoint).context("parse lnd grpc endpoint")?;
+        if url.scheme() != "https" {
+            anyhow::bail!("lnd grpc endpoint must be https");
+        }
+
+        let tls_domain = args
+            .lnd_tls_domain
+            .clone()
+            .unwrap_or_else(|| url.host_str().unwrap_or("localhost").to_string());
+
+        let tls_cert_file = args
+            .lnd_tls_cert_file
+            .as_ref()
+            .context("missing --lnd-tls-cert-file / AAG_LND_TLS_CERT_FILE")?;
+        let tls_cert_pem = std::fs::read(tls_cert_file)
+            .with_context(|| format!("read lnd tls cert {}", tls_cert_file.display()))?;
+
+        let macaroon_file = args
+            .lnd_macaroon_file
+            .as_ref()
+            .context("missing --lnd-macaroon-file / AAG_LND_MACAROON_FILE")?;
+        let macaroon = std::fs::read(macaroon_file)
+            .with_context(|| format!("read lnd macaroon {}", macaroon_file.display()))?;
+        let macaroon_hex = hex::encode(macaroon);
+
+        Some(LndProviderConfig {
+            endpoint,
+            tls_cert_pem,
+            macaroon_hex,
+            tls_domain,
+        })
+    } else {
+        None
+    };
+
+    let cln_rpc_socket = if args.l402_backend == L402Backend::Cln {
+        if !cfg!(all(feature = "l402-cln", unix)) {
+            anyhow::bail!(
+                "built without l402-cln feature (unix only); rebuild agent-access-gateway with --features l402-cln"
+            );
+        }
+
+        Some(
+            args.cln_rpc_socket
+                .clone()
+                .context("missing --cln-rpc-socket / AAG_CLN_RPC_SOCKET")?,
+        )
+    } else {
+        None
+    };
+
     let st = AppState {
         secret: args.secret.as_bytes().to_vec(),
         cost_microusd: args.cost_microusd,
         max_calls: args.max_calls,
+        l402_backend: args.l402_backend,
+        l402_invoice_sats: args.l402_invoice_sats,
+        lnd,
+        cln_rpc_socket,
         pending_x402: Arc::new(Mutex::new(HashMap::new())),
         pending_l402: Arc::new(Mutex::new(HashMap::new())),
         usage: Arc::new(Mutex::new(HashMap::new())),
@@ -436,6 +582,14 @@ fn prune_used_x402_nonces(used: &mut HashMap<String, i64>) {
     // x402 authorizations are short-lived; keep a bounded replay cache.
     let cutoff = now - (60 * 60);
     used.retain(|_, iat| *iat >= cutoff);
+}
+
+fn prune_pending_l402(pending: &mut HashMap<String, PendingL402>) {
+    let cutoff = Utc::now() - chrono::Duration::minutes(10);
+    pending.retain(|_, v| match v {
+        PendingL402::Demo { created_at, .. } => *created_at >= cutoff,
+        PendingL402::Lightning { created_at, .. } => *created_at >= cutoff,
+    });
 }
 
 fn x402_v2_payment_required_for_request(
@@ -708,27 +862,173 @@ async fn token(State(st): State<AppState>, uri: Uri, headers: HeaderMap) -> Resp
         return (StatusCode::OK, Json(tok)).into_response();
     }
 
-    // No valid proof: challenge with x402 by default. Clients can request l402 via header.
-    let prefer_l402 = headers
+    // No valid proof: challenge with x402 by default. If a real L402 backend is
+    // configured, prefer L402 unless the client explicitly requests x402.
+    let accept_rail = headers
         .get("x-accept-payment-rail")
         .and_then(|h| h.to_str().ok())
-        .map(|v| v.eq_ignore_ascii_case("l402"))
-        .unwrap_or(false);
+        .unwrap_or("");
+    let prefer_l402 = if accept_rail.eq_ignore_ascii_case("x402") {
+        false
+    } else if accept_rail.eq_ignore_ascii_case("l402") {
+        true
+    } else {
+        st.l402_backend != L402Backend::Demo
+    };
 
     if prefer_l402 {
         let macaroon = format!("mac_{}", Uuid::new_v4());
-        let preimage = hmac_b64url(&st.secret, macaroon.as_bytes());
-        st.pending_l402
-            .lock()
-            .await
-            .insert(macaroon.clone(), PendingL402 { preimage });
+        let created_at = Utc::now();
 
-        let challenge = PaymentChallenge::L402 {
-            invoice: format!("lnbc_demo_{macaroon}"),
-            macaroon,
-            amount_microusd: st.cost_microusd,
-        };
-        return payment_required_response(challenge);
+        match st.l402_backend {
+            L402Backend::Demo => {
+                let preimage = hmac_b64url(&st.secret, macaroon.as_bytes());
+                let mut guard = st.pending_l402.lock().await;
+                prune_pending_l402(&mut guard);
+                guard.insert(
+                    macaroon.clone(),
+                    PendingL402::Demo {
+                        preimage,
+                        created_at,
+                    },
+                );
+
+                let challenge = PaymentChallenge::L402 {
+                    invoice: format!("lnbc_demo_{macaroon}"),
+                    macaroon,
+                    amount_microusd: st.cost_microusd,
+                };
+                return payment_required_response(challenge);
+            }
+            L402Backend::Lnd => {
+                #[cfg(feature = "l402-lnd")]
+                {
+                    let Some(lnd) = st.lnd.as_ref() else {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({"error":"lnd_not_configured"})),
+                        )
+                            .into_response();
+                    };
+
+                    let mut client = match briefcase_payments::l402_lnd::LndGrpcClient::connect(
+                        briefcase_payments::l402_lnd::LndGrpcConfig {
+                            endpoint: lnd.endpoint.clone(),
+                            tls_cert_pem: lnd.tls_cert_pem.clone(),
+                            macaroon_hex: lnd.macaroon_hex.clone(),
+                            tls_domain: lnd.tls_domain.clone(),
+                        },
+                    )
+                    .await
+                    {
+                        Ok(c) => c,
+                        Err(_) => {
+                            return (
+                                StatusCode::BAD_GATEWAY,
+                                Json(serde_json::json!({"error":"lnd_connect_failed"})),
+                            )
+                                .into_response();
+                        }
+                    };
+
+                    let resp = match client
+                        .add_invoice("agent-access-gateway", st.l402_invoice_sats, 600)
+                        .await
+                    {
+                        Ok(r) => r,
+                        Err(_) => {
+                            return (
+                                StatusCode::BAD_GATEWAY,
+                                Json(serde_json::json!({"error":"lnd_add_invoice_failed"})),
+                            )
+                                .into_response();
+                        }
+                    };
+
+                    let payment_hash_hex = hex::encode(&resp.r_hash);
+                    let mut guard = st.pending_l402.lock().await;
+                    prune_pending_l402(&mut guard);
+                    guard.insert(
+                        macaroon.clone(),
+                        PendingL402::Lightning {
+                            payment_hash_hex,
+                            created_at,
+                        },
+                    );
+
+                    let challenge = PaymentChallenge::L402 {
+                        invoice: resp.payment_request,
+                        macaroon,
+                        amount_microusd: st.cost_microusd,
+                    };
+                    return payment_required_response(challenge);
+                }
+                #[cfg(not(feature = "l402-lnd"))]
+                {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({"error":"l402_lnd_not_built"})),
+                    )
+                        .into_response();
+                }
+            }
+            L402Backend::Cln => {
+                #[cfg(all(feature = "l402-cln", unix))]
+                {
+                    let Some(socket) = st.cln_rpc_socket.as_ref() else {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({"error":"cln_not_configured"})),
+                        )
+                            .into_response();
+                    };
+
+                    let inv = match briefcase_payments::l402_cln::create_invoice(
+                        socket,
+                        (st.l402_invoice_sats as u64) * 1000,
+                        &macaroon,
+                        "agent-access-gateway",
+                        Some(600),
+                    )
+                    .await
+                    {
+                        Ok(v) => v,
+                        Err(_) => {
+                            return (
+                                StatusCode::BAD_GATEWAY,
+                                Json(serde_json::json!({"error":"cln_invoice_failed"})),
+                            )
+                                .into_response();
+                        }
+                    };
+
+                    let mut guard = st.pending_l402.lock().await;
+                    prune_pending_l402(&mut guard);
+                    guard.insert(
+                        macaroon.clone(),
+                        PendingL402::Lightning {
+                            payment_hash_hex: inv.payment_hash_hex,
+                            created_at,
+                        },
+                    );
+
+                    let challenge = PaymentChallenge::L402 {
+                        invoice: inv.bolt11,
+                        macaroon,
+                        amount_microusd: st.cost_microusd,
+                    };
+                    return payment_required_response(challenge);
+                }
+                #[cfg(any(not(feature = "l402-cln"), not(unix)))]
+                {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({"error":"l402_cln_not_built"})),
+                    )
+                        .into_response();
+                }
+            }
+        }
     }
 
     let payment_id = Uuid::new_v4().to_string();
@@ -772,6 +1072,12 @@ async fn l402_pay(
     State(st): State<AppState>,
     Json(req): Json<L402PayRequest>,
 ) -> Result<Json<L402PayResponse>, StatusCode> {
+    if st.l402_backend != L402Backend::Demo {
+        // Real L402 backends do not expose a "pay me" endpoint. The payer pays the
+        // Lightning invoice directly and presents the preimage.
+        return Err(StatusCode::NOT_FOUND);
+    }
+
     // In the demo, invoice looks like `lnbc_demo_<macaroon>`.
     let macaroon = req
         .invoice
@@ -781,8 +1087,11 @@ async fn l402_pay(
     let Some(p) = guard.get(macaroon) else {
         return Err(StatusCode::NOT_FOUND);
     };
+    let PendingL402::Demo { preimage, .. } = p else {
+        return Err(StatusCode::NOT_FOUND);
+    };
     Ok(Json(L402PayResponse {
-        preimage: p.preimage.clone(),
+        preimage: preimage.clone(),
     }))
 }
 
@@ -877,14 +1186,93 @@ async fn issue_token_after_l402(
     preimage: &str,
     cnf_jkt: Option<&str>,
 ) -> anyhow::Result<TokenResponse> {
-    let mut guard = st.pending_l402.lock().await;
-    let Some(p) = guard.get(macaroon) else {
-        anyhow::bail!("unknown macaroon");
+    let pending = {
+        let mut guard = st.pending_l402.lock().await;
+        prune_pending_l402(&mut guard);
+        guard.get(macaroon).cloned().context("unknown macaroon")?
     };
-    if p.preimage != preimage {
-        anyhow::bail!("invalid preimage");
+
+    match pending {
+        PendingL402::Demo { preimage: exp, .. } => {
+            if exp != preimage {
+                anyhow::bail!("invalid preimage");
+            }
+        }
+        PendingL402::Lightning {
+            payment_hash_hex, ..
+        } => {
+            let preimage_bytes = hex::decode(preimage.trim()).context("hex decode preimage")?;
+            if preimage_bytes.len() != 32 {
+                anyhow::bail!("preimage must be 32 bytes");
+            }
+
+            let computed = Sha256::digest(&preimage_bytes);
+            if hex::encode(computed) != payment_hash_hex {
+                anyhow::bail!("invalid preimage");
+            }
+
+            match st.l402_backend {
+                L402Backend::Lnd => {
+                    #[cfg(feature = "l402-lnd")]
+                    {
+                        let Some(lnd) = st.lnd.as_ref() else {
+                            anyhow::bail!("lnd not configured");
+                        };
+
+                        let mut client = briefcase_payments::l402_lnd::LndGrpcClient::connect(
+                            briefcase_payments::l402_lnd::LndGrpcConfig {
+                                endpoint: lnd.endpoint.clone(),
+                                tls_cert_pem: lnd.tls_cert_pem.clone(),
+                                macaroon_hex: lnd.macaroon_hex.clone(),
+                                tls_domain: lnd.tls_domain.clone(),
+                            },
+                        )
+                        .await
+                        .context("connect to lnd")?;
+
+                        let hash = hex::decode(&payment_hash_hex).context("decode payment hash")?;
+                        let inv = client
+                            .lookup_invoice(&hash)
+                            .await
+                            .context("lookup invoice")?;
+
+                        // LND invoice states: OPEN=0, SETTLED=1.
+                        if inv.state != 1 {
+                            anyhow::bail!("invoice not settled");
+                        }
+                    }
+                    #[cfg(not(feature = "l402-lnd"))]
+                    {
+                        anyhow::bail!("built without l402-lnd");
+                    }
+                }
+                L402Backend::Cln => {
+                    #[cfg(all(feature = "l402-cln", unix))]
+                    {
+                        let Some(socket) = st.cln_rpc_socket.as_ref() else {
+                            anyhow::bail!("cln not configured");
+                        };
+
+                        if !briefcase_payments::l402_cln::is_invoice_paid(socket, &payment_hash_hex)
+                            .await
+                            .context("cln listinvoices")?
+                        {
+                            anyhow::bail!("invoice not paid");
+                        }
+                    }
+                    #[cfg(any(not(feature = "l402-cln"), not(unix)))]
+                    {
+                        anyhow::bail!("built without l402-cln");
+                    }
+                }
+                L402Backend::Demo => {
+                    anyhow::bail!("unexpected backend for lightning invoice");
+                }
+            }
+        }
     }
-    guard.remove(macaroon);
+
+    st.pending_l402.lock().await.remove(macaroon);
     Ok(issue_capability_jwt(st, cnf_jkt.map(|s| s.to_string())))
 }
 
@@ -1177,6 +1565,10 @@ mod tests {
             secret: b"test-secret".to_vec(),
             cost_microusd: 2000,
             max_calls: 50,
+            l402_backend: L402Backend::Demo,
+            l402_invoice_sats: 10,
+            lnd: None,
+            cln_rpc_socket: None,
             pending_x402: Arc::new(Mutex::new(HashMap::new())),
             pending_l402: Arc::new(Mutex::new(HashMap::new())),
             usage: Arc::new(Mutex::new(HashMap::new())),
