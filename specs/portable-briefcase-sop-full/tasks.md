@@ -308,7 +308,7 @@ For each task, include:
 
 ## Phase 12: Production Hardening + Release
 
-- [ ] 12.1 Add fuzzing + security regression suite
+- [x] 12.1 Add fuzzing + security regression suite
   - **Do**: add `cargo-fuzz` targets for MCP parsing, x402/L402 parsing, receipt ingestion; add “no secrets in logs” tests.
   - **Files**: `fuzz/*`, `.github/workflows/security.yml`
   - **Done when**: fuzz targets run in CI on schedule; regressions blocked.

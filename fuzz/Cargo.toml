@@ -1,0 +1,35 @@
+[package]
+name = "credential-briefcase-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+briefcase-core = { path = "../crates/briefcase-core" }
+briefcase-mcp = { path = "../crates/briefcase-mcp" }
+briefcase-payments = { path = "../crates/briefcase-payments" }
+serde_json = "1.0"
+
+[[bin]]
+name = "mcp_parsing"
+path = "fuzz_targets/mcp_parsing.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "payments_parsing"
+path = "fuzz_targets/payments_parsing.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "receipts_ingest"
+path = "fuzz_targets/receipts_ingest.rs"
+test = false
+doc = false
+

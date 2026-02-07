@@ -2819,11 +2819,68 @@ fn validate_oauth_redirect_uri(raw: &str) -> anyhow::Result<String> {
 mod tests {
     use super::*;
 
+    use std::io;
+    use std::sync::{Mutex as StdMutex, OnceLock};
+
     use briefcase_api::types::CallToolRequest;
     use briefcase_api::{BriefcaseClient, BriefcaseClientError, DaemonEndpoint};
     use briefcase_core::ToolCallContext;
     use ed25519_dalek::Signer as _;
     use tempfile::tempdir;
+
+    static LOG_BUF: OnceLock<Arc<StdMutex<Vec<u8>>>> = OnceLock::new();
+
+    #[derive(Clone)]
+    struct LogBufWriter {
+        buf: Arc<StdMutex<Vec<u8>>>,
+    }
+
+    struct LogBufGuard {
+        buf: Arc<StdMutex<Vec<u8>>>,
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBufWriter {
+        type Writer = LogBufGuard;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            LogBufGuard {
+                buf: self.buf.clone(),
+            }
+        }
+    }
+
+    impl io::Write for LogBufGuard {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.buf
+                .lock()
+                .expect("lock log buf")
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn init_log_capture() -> Arc<StdMutex<Vec<u8>>> {
+        LOG_BUF
+            .get_or_init(|| {
+                let buf = Arc::new(StdMutex::new(Vec::new()));
+                let writer = LogBufWriter { buf: buf.clone() };
+                let subscriber = tracing_subscriber::fmt()
+                    .with_env_filter(
+                        tracing_subscriber::EnvFilter::try_from_default_env()
+                            .unwrap_or_else(|_| "info,hyper=warn,sqlx=warn".into()),
+                    )
+                    .json()
+                    .with_writer(writer)
+                    .finish();
+                let _ = tracing::subscriber::set_global_default(subscriber);
+                buf
+            })
+            .clone()
+    }
 
     mod signer_sim {
         include!(concat!(
@@ -6039,6 +6096,82 @@ mod tests {
             *cp_state.remote_sign_calls.lock().await > 0,
             "expected remote signer to be called for DPoP signing"
         );
+
+        daemon_task.abort();
+        provider_task.abort();
+        cp_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn no_secrets_in_logs_regression() -> anyhow::Result<()> {
+        use std::collections::BTreeMap;
+
+        let buf = init_log_capture();
+        buf.lock().expect("lock").clear();
+
+        let (provider_addr, _provider_state, provider_task) = start_mock_provider().await?;
+        let provider_base_url = format!("http://{provider_addr}");
+
+        let (_state, _daemon_base, client, daemon_task) = start_daemon(provider_base_url).await?;
+
+        let default_policy =
+            briefcase_policy::CedarPolicyEngineOptions::default_policies().policy_text;
+        let mut budgets = BTreeMap::new();
+        budgets.insert("read".to_string(), 1_000_000);
+        let bundle = briefcase_control_plane_api::types::PolicyBundle {
+            bundle_id: 1,
+            policy_text: default_policy,
+            budgets,
+            updated_at_rfc3339: Utc::now().to_rfc3339(),
+        };
+        let (cp_addr, _cp_state, cp_task) = start_mock_control_plane(bundle, true).await?;
+        let cp_base_url = format!("http://{cp_addr}");
+
+        // Control plane enrollment carries a device bearer token (secret).
+        client
+            .control_plane_enroll(briefcase_api::types::ControlPlaneEnrollRequest {
+                base_url: cp_base_url,
+                admin_token: "admin".to_string(),
+                device_name: "log-scan".to_string(),
+            })
+            .await?;
+
+        // Provider OAuth carries refresh tokens (secrets).
+        client
+            .oauth_exchange(
+                "demo",
+                OAuthExchangeRequest {
+                    code: "code_mock".to_string(),
+                    redirect_uri: "http://127.0.0.1/callback".to_string(),
+                    client_id: "briefcase-cli".to_string(),
+                    code_verifier: "verifier".to_string(),
+                },
+            )
+            .await?;
+
+        // Tool call path (exercises payment parsing, VC issuance, etc).
+        client.fetch_vc("demo").await?;
+        let _ = client
+            .call_tool(CallToolRequest {
+                call: ToolCall {
+                    tool_id: "quote".to_string(),
+                    args: serde_json::json!({ "symbol": "TEST" }),
+                    context: ToolCallContext::new(),
+                    approval_token: None,
+                },
+            })
+            .await?;
+
+        let guard = buf.lock().expect("lock");
+        let logs = String::from_utf8_lossy(&guard);
+        // Secrets used by the mock harnesses; if these ever show up in logs, we have a regression.
+        for secret in ["device-token", "rt_mock", "rt_mock2"] {
+            assert!(
+                !logs.contains(secret),
+                "logs leaked secret substring: {secret}"
+            );
+        }
 
         daemon_task.abort();
         provider_task.abort();

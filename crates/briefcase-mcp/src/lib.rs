@@ -18,6 +18,7 @@ pub use http_client::{
 };
 pub use jsonrpc::{JsonRpcError, JsonRpcId, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse};
 pub use server::{McpConnection, McpHandler, McpServerConfig};
+pub use sse::{decode_sse_events, parse_first_json_message_from_sse};
 pub use types::{
     CallToolParams, CallToolResult, ContentBlock, InitializeParams, InitializeResult,
     ListToolsParams, ListToolsResult, McpServerInfo, Tool,
