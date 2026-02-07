@@ -320,7 +320,7 @@ For each task, include:
   - **Done when**: trace shows end-to-end request with policy decision and upstream call.
   - **Verify**: integration test + local demo.
 
-- [ ] 12.3 Release automation for multi-artifact repo
+- [x] 12.3 Release automation for multi-artifact repo
   - **Do**: add GH Actions workflows for extension build/package, mobile builds (CI build only), control plane container builds, SBOMs.
   - **Files**: `.github/workflows/*`, `docs/RELEASING.md`
   - **Done when**: tagged release produces signed artifacts for daemon/gateway/cli/ui and versioned artifacts for extension/control plane.
