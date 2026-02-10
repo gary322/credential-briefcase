@@ -15,6 +15,11 @@ This repo answers: "How do I let agents use powerful tools, OAuth, paid APIs, an
 
 Traditional auth assumes the caller is trusted enough to hold credentials. Agents are not.
 
+Important non-goal:
+
+- This system does **not** try to make a prompt-injectable LLM runtime a trusted authenticated principal ("the agent logs in as itself").
+  Instead, it authenticates to upstream systems *at the boundary* (`briefcased`) and returns policy-filtered, redacted results to the agent.
+
 In this system, agentic auth is the end-to-end flow where:
 
 1. The agent emits an **intent** (`tools/call name args`) to a single MCP surface.

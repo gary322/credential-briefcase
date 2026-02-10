@@ -8,6 +8,8 @@ Provide a "credential briefcase" where:
 - secrets are not exposed to the agent runtime
 - tool calls are policy-bounded and auditable
 
+Non-goal: this does **not** attempt to authenticate the LLM process itself as a trusted identity. Instead, identity and custody live at the boundary (`briefcased`) and in human approvals.
+
 ## Reference vs GA contract
 
 This repo contains both:
