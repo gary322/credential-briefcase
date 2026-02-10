@@ -28,12 +28,20 @@ echo "[enterprise] starting postgres..."
 docker compose -f "${COMPOSE_FILE}" up -d postgres
 
 echo "[enterprise] waiting for postgres..."
+PG_READY="0"
 for i in $(seq 1 60); do
   if docker compose -f "${COMPOSE_FILE}" exec -T postgres pg_isready -U briefcase -d briefcase_control_plane >/dev/null 2>&1; then
+    PG_READY="1"
     break
   fi
   sleep 1
 done
+if [ "${PG_READY}" != "1" ]; then
+  echo "[enterprise] postgres failed to become ready" >&2
+  docker compose -f "${COMPOSE_FILE}" ps >&2 || true
+  docker compose -f "${COMPOSE_FILE}" logs --no-color --tail=200 >&2 || true
+  exit 1
+fi
 
 echo "[enterprise] building control plane..."
 PATH="$HOME/.cargo/bin:$PATH" cargo build -p briefcase-control-plane

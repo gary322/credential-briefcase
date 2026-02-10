@@ -124,15 +124,39 @@ mkdir -p "${LOG_DIR}"
 
 CARGO_BIN="$(pick_cargo)"
 
+CURRENT_STEP=""
+FAILED_STEP=""
+FAILED_EXIT_CODE=""
+AAG_PID=""
+
+set_step() {
+  local name="$1"
+  CURRENT_STEP="${name}"
+  echo "${CURRENT_STEP}" >"${OUT_DIR}/current_step.txt"
+  echo "step: ${name}"
+}
+
 run_and_capture() {
   local name="$1"
   shift
+
+  set_step "${name}"
 
   # Store a reproducible command line without secrets (secrets are passed via env).
   printf '%q ' "$@" >"${LOG_DIR}/${name}.cmd"
   echo >>"${LOG_DIR}/${name}.cmd"
 
-  "$@" >"${LOG_DIR}/${name}.out" 2>&1
+  if "$@" >"${LOG_DIR}/${name}.out" 2>&1; then
+    return 0
+  fi
+
+  local ec="$?"
+  FAILED_STEP="${name}"
+  FAILED_EXIT_CODE="${ec}"
+  echo "${FAILED_STEP}" >"${OUT_DIR}/failed_step.txt"
+  echo "${FAILED_EXIT_CODE}" >"${OUT_DIR}/failed_exit_code.txt"
+  echo "ERROR: step ${name} failed (exit ${ec}); see ${LOG_DIR}/${name}.out" >&2
+  return "${ec}"
 }
 
 wait_for_health() {
@@ -147,6 +171,115 @@ wait_for_health() {
   done
   return 1
 }
+
+cleanup_gateway() {
+  if [[ -n "${AAG_PID}" ]]; then
+    kill "${AAG_PID}" >/dev/null 2>&1 || true
+    wait "${AAG_PID}" >/dev/null 2>&1 || true
+  fi
+}
+
+emit_evidence_bundle() {
+  local exit_code="$1"
+
+  # Record failure context for humans without printing sensitive outputs.
+  if [[ "${exit_code}" != "0" ]]; then
+    {
+      echo "exit_code=${exit_code}"
+      if [[ -n "${FAILED_STEP}" ]]; then
+        echo "failed_step=${FAILED_STEP}"
+      elif [[ -n "${CURRENT_STEP}" ]]; then
+        echo "failed_step=${CURRENT_STEP}"
+      fi
+    } >>"${OUT_DIR}/meta.txt" 2>/dev/null || true
+  fi
+
+  # Package logs/metadata into a single evidence bundle, even on failures.
+  tar -C "${DIST_DIR}" -czf "${DIST_DIR}/ga-qualification-${LABEL}.tar.gz" "$(basename "${OUT_DIR}")" >/dev/null 2>&1 || true
+
+  # Emit a machine-readable summary alongside the detailed evidence tarball.
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - "${DIST_DIR}" "${DIST_DIR}/ga-qualification-${LABEL}.json" <<'PY' || true
+import json
+from pathlib import Path
+import sys
+
+dist = Path(sys.argv[1])
+out = Path(sys.argv[2])
+label = out.stem.removeprefix("ga-qualification-")
+
+compat = None
+try:
+    txt = Path("crates/briefcase-core/src/types.rs").read_text()
+    import re
+    m = re.search(r'COMPATIBILITY_PROFILE_VERSION:\s*&str\s*=\s*"([^"]+)"', txt)
+    compat = m.group(1) if m else None
+except Exception:
+    compat = None
+
+meta_path = dist / f"ga-qualification-{label}" / "meta.txt"
+meta = {}
+if meta_path.exists():
+    for line in meta_path.read_text().splitlines():
+        if "=" in line:
+            k, v = line.split("=", 1)
+            meta[k.strip()] = v.strip()
+
+failed_step = None
+failed_step_path = dist / f"ga-qualification-{label}" / "failed_step.txt"
+if failed_step_path.exists():
+    failed_step = failed_step_path.read_text().strip() or None
+
+exit_code = None
+exit_code_path = dist / f"ga-qualification-{label}" / "failed_exit_code.txt"
+if exit_code_path.exists():
+    try:
+        exit_code = int(exit_code_path.read_text().strip())
+    except Exception:
+        exit_code = None
+
+artifacts = []
+for p in [
+    dist / f"provider-contract-{label}.json",
+    dist / f"security-assessment-{label}.tar.gz",
+    dist / f"ga-qualification-{label}.tar.gz",
+]:
+    if p.exists():
+        artifacts.append(str(p.relative_to(dist)))
+
+doc = {
+    "label": label,
+    "mode": meta.get("mode"),
+    "generated_at_utc": meta.get("timestamp_utc"),
+    "git_sha_short": meta.get("git_sha_short"),
+    "compatibility_profile": compat,
+    "status": "failed" if exit_code not in (None, 0) else "ok",
+    "failed_step": failed_step,
+    "exit_code": exit_code,
+    "artifacts": artifacts,
+}
+out.write_text(json.dumps(doc, indent=2, sort_keys=True) + "\n")
+PY
+  fi
+
+  if [[ "${exit_code}" == "0" ]]; then
+    echo "ok: wrote ${DIST_DIR}/ga-qualification-${LABEL}.json"
+    echo "ok: wrote ${DIST_DIR}/ga-qualification-${LABEL}.tar.gz"
+  else
+    echo "error: wrote ${DIST_DIR}/ga-qualification-${LABEL}.json"
+    echo "error: wrote ${DIST_DIR}/ga-qualification-${LABEL}.tar.gz"
+  fi
+}
+
+on_exit() {
+  local ec="$?"
+  trap - EXIT
+  set +e
+  cleanup_gateway
+  emit_evidence_bundle "${ec}"
+  exit "${ec}"
+}
+trap on_exit EXIT
 
 {
   echo "timestamp_utc=$(timestamp_utc)"
@@ -172,16 +305,7 @@ run_and_capture docs_profile_consistency "${CARGO_BIN}" test -p briefcase-core -
 #
 # NOTE: For CI/release this uses a fixed local address; override via --aag-addr if needed.
 AAG_BASE_URL="http://${AAG_ADDR}"
-AAG_PID=""
 TARGET_DIR="${CARGO_TARGET_DIR:-target}"
-
-cleanup() {
-  if [[ -n "${AAG_PID}" ]]; then
-    kill "${AAG_PID}" >/dev/null 2>&1 || true
-    wait "${AAG_PID}" >/dev/null 2>&1 || true
-  fi
-}
-trap cleanup EXIT
 
 {
   echo "starting local agent-access-gateway at ${AAG_BASE_URL}"
@@ -195,12 +319,14 @@ trap cleanup EXIT
   fi
 
   # "test-secret" is used only for local conformance and is not printed elsewhere.
+  set_step agent_access_gateway_run
   AAG_SECRET="test-secret" \
     RUST_LOG="info,hyper=warn,reqwest=warn" \
     "${AAG_BIN}" --addr "${AAG_ADDR}" \
     >"${LOG_DIR}/agent-access-gateway.out" 2>&1 &
   AAG_PID="$!"
 
+  set_step agent_access_gateway_health
   if ! wait_for_health "${AAG_BASE_URL}/health"; then
     echo "agent-access-gateway failed health check; see ${LOG_DIR}/agent-access-gateway.out" >&2
     exit 1
@@ -208,6 +334,7 @@ trap cleanup EXIT
 } >"${LOG_DIR}/provider_contract_bootstrap.out" 2>&1
 
 PROVIDER_REPORT="${DIST_DIR}/provider-contract-${LABEL}.json"
+set_step provider_contract
 PROVIDER_ADMIN_SECRET="test-secret" \
   PROVIDER_BASE_URL="${AAG_BASE_URL}" \
   "${CARGO_BIN}" run -q -p briefcase-conformance --bin provider-contract -- --base-url "${AAG_BASE_URL}" --run-revocation \
@@ -215,7 +342,7 @@ PROVIDER_ADMIN_SECRET="test-secret" \
   2>"${LOG_DIR}/provider-contract.err"
 
 # Shut down the gateway now (avoid hanging the script on background tasks).
-cleanup
+cleanup_gateway
 AAG_PID=""
 
 if [[ "${MODE}" == "release" ]]; then
@@ -230,6 +357,7 @@ if [[ "${MODE}" == "release" ]]; then
   run_and_capture security_assessment bash scripts/run_security_assessment.sh
 
   # Rename the newest security-assessment tarball to a stable, label-based name.
+  set_step security_assessment_rename
   SECURITY_TAR=""
   if command -v python3 >/dev/null 2>&1; then
     SECURITY_TAR="$(
@@ -278,56 +406,4 @@ PY
   fi
 fi
 
-# Package logs/metadata into a single evidence bundle.
-tar -C "${DIST_DIR}" -czf "${DIST_DIR}/ga-qualification-${LABEL}.tar.gz" "$(basename "${OUT_DIR}")"
-
-# Emit a machine-readable summary alongside the detailed evidence tarball.
-python3 - "${DIST_DIR}/ga-qualification-${LABEL}.json" <<'PY'
-import json
-import os
-from pathlib import Path
-import sys
-
-out = Path(sys.argv[1])
-label = out.stem.removeprefix("ga-qualification-")
-
-dist = Path("dist")
-compat = None
-try:
-    txt = Path("crates/briefcase-core/src/types.rs").read_text()
-    import re
-    m = re.search(r'COMPATIBILITY_PROFILE_VERSION:\s*&str\s*=\s*"([^"]+)"', txt)
-    compat = m.group(1) if m else None
-except Exception:
-    compat = None
-
-artifacts = []
-for p in [
-    dist / f"provider-contract-{label}.json",
-    dist / f"security-assessment-{label}.tar.gz",
-    dist / f"ga-qualification-{label}.tar.gz",
-]:
-    if p.exists():
-        artifacts.append(str(p.relative_to(dist)))
-
-meta_path = dist / f"ga-qualification-{label}" / "meta.txt"
-meta = {}
-if meta_path.exists():
-    for line in meta_path.read_text().splitlines():
-        if "=" in line:
-            k, v = line.split("=", 1)
-            meta[k.strip()] = v.strip()
-
-doc = {
-    "label": label,
-    "mode": meta.get("mode"),
-    "generated_at_utc": meta.get("timestamp_utc"),
-    "git_sha_short": meta.get("git_sha_short"),
-    "compatibility_profile": compat,
-    "artifacts": artifacts,
-}
-out.write_text(json.dumps(doc, indent=2, sort_keys=True) + "\n")
-PY
-
-echo "ok: wrote ${DIST_DIR}/ga-qualification-${LABEL}.json"
-echo "ok: wrote ${DIST_DIR}/ga-qualification-${LABEL}.tar.gz"
+# Evidence bundle + summary are produced by the EXIT trap (success or failure).

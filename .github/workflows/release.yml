@@ -51,6 +51,7 @@ jobs:
             dist/*.json
             dist/*.tar.gz
             dist/*.txt
+            dist/ga-qualification-*/
 
   rust:
     name: rust binaries (${{ matrix.os }})

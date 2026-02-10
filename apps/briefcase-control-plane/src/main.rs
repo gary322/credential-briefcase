@@ -1060,7 +1060,7 @@ async fn require_device_sync_dpop(
         .map_err(internal_error)?;
 
     let mut used = HashMap::new();
-    let claims = briefcase_dpop::verify_dpop_jwt(
+    let verified = briefcase_dpop::verify_dpop_jwt(
         jwt,
         method.as_str(),
         &expected_url,
@@ -1070,6 +1070,7 @@ async fn require_device_sync_dpop(
     )
     .map_err(|_| unauthorized("invalid_dpop"))?;
 
+    let claims = verified.payload;
     let jti = claims.get("jti").and_then(|v| v.as_str()).unwrap_or("");
     let iat = claims.get("iat").and_then(|v| v.as_i64()).unwrap_or(0);
     if jti.is_empty() || iat <= 0 {

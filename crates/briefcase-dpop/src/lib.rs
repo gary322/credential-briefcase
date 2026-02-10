@@ -164,7 +164,7 @@ pub fn verify_dpop_jwt(
     access_token: Option<&str>,
     expected_jkt: Option<&str>,
     used_jtis: &mut HashMap<String, i64>,
-) -> anyhow::Result<serde_json::Value> {
+) -> anyhow::Result<VerifiedDpopJwt> {
     let parts: Vec<&str> = jwt.split('.').collect();
     if parts.len() != 3 {
         anyhow::bail!("invalid jwt format");
@@ -323,5 +323,15 @@ pub fn verify_dpop_jwt(
     }
     used_jtis.insert(replay_key, iat);
 
-    Ok(jwk)
+    Ok(VerifiedDpopJwt { jwk, payload, jkt })
+}
+
+#[derive(Debug, Clone)]
+pub struct VerifiedDpopJwt {
+    /// Public key presented in the DPoP header.
+    pub jwk: serde_json::Value,
+    /// Verified JWT payload (contains `htu`, `htm`, `iat`, `jti`, and optional `ath`).
+    pub payload: serde_json::Value,
+    /// RFC 7638 thumbprint of `jwk` (base64url-encoded sha256 of the canonical JWK JSON).
+    pub jkt: String,
 }

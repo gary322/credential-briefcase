@@ -709,11 +709,11 @@ async fn token(State(st): State<AppState>, uri: Uri, headers: HeaderMap) -> Resp
             }
         };
 
-        let jwk = {
+        let verified = {
             let mut used = st.used_dpop_jtis.lock().await;
             prune_used_dpop_jtis(&mut used);
             match verify_dpop_jwt(dpop, "POST", &expected_url, None, None, &mut used) {
-                Ok(jwk) => jwk,
+                Ok(v) => v,
                 Err(e) => {
                     if e.to_string().contains("replayed jti") {
                         return briefcase_error(
@@ -730,16 +730,7 @@ async fn token(State(st): State<AppState>, uri: Uri, headers: HeaderMap) -> Resp
             }
         };
 
-        match jwk_thumbprint_b64url(&jwk) {
-            Ok(jkt) => Some(jkt),
-            Err(_) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({"error":"invalid_dpop_jwk"})),
-                )
-                    .into_response();
-            }
-        }
+        Some(verified.jkt)
     } else {
         // Backwards-compatible v1 PoP header: `x-briefcase-pop-pub` (Ed25519 x coordinate).
         match headers
