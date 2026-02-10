@@ -180,7 +180,7 @@ graph LR
 
 Prereqs:
 
-- Rust toolchain pinned by `rust-toolchain.toml`
+- Rust toolchain pinned by `rust-toolchain.toml` (use `rustup`; ensure `~/.cargo/bin` is first in `PATH`)
 - Node.js 20+ (for the extension)
 - `pnpm` via Corepack (for the extension)
 - Docker (optional, for payment/key custody harnesses)
@@ -265,6 +265,7 @@ Release and GA evidence gates (see `docs/RELEASING.md`):
 Rust unit/integration tests:
 
 ```bash
+export PATH="$HOME/.cargo/bin:$PATH"
 cargo fmt --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --all
