@@ -18,7 +18,7 @@ Practical approach:
 1. Deploy staging with `BRIEFCASE_PROFILE_MODE=ga` (and `BRIEFCASE_STRICT_HOST=1` where applicable).
 2. Ensure observability is enabled (OTel exporter + log collection).
 3. Run a continuous or periodic soak loop to generate availability/latency evidence:
-   - `briefcase diagnostics soak --duration-secs 3600 --interval-ms 1000 --tool quote --out dist/soak-report.json`
+   - `cargo run -p briefcase-cli -- diagnostics soak --duration-secs 3600 --interval-ms 1000 --tool quote --out dist/soak-report.json`
 4. Keep the JSON reports plus dashboard screenshots/exports as the 30-day evidence bundle.
 
 ## Core diagnostics

@@ -334,7 +334,7 @@ cargo run -p briefcase-cli -- receipts verify
 Release and GA evidence gates (see `docs/RELEASING.md`):
 
 - Generate a release-grade evidence bundle: `bash scripts/ga_qualification.sh --mode release --label vX.Y.Z`
-- Generate a staging soak report (JSON): `briefcase diagnostics soak --duration-secs 3600 --interval-ms 1000 --tool quote --out dist/soak-report.json`
+- Generate a staging soak report (JSON): `cargo run -p briefcase-cli -- diagnostics soak --duration-secs 3600 --interval-ms 1000 --tool quote --out dist/soak-report.json`
 - For the final GA cut (`v1.0.0`), fill `docs/GA_SIGNOFF_v1.0.0.md` with named approvers.
 
 ## Testing

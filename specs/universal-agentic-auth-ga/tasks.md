@@ -273,7 +273,7 @@ For each task, include:
   - **Files**: `docs/OPERATIONS.md`, observability dashboards/configs
   - **Done when**: SLO compliance achieved for 30 consecutive days.
   - **Verify**:
-    - Use `briefcase diagnostics soak --duration-secs 3600 --interval-ms 1000 --tool quote --out dist/soak-report.json` (or equivalent) to generate periodic JSON evidence.
+    - Use `cargo run -p briefcase-cli -- diagnostics soak --duration-secs 3600 --interval-ms 1000 --tool quote --out dist/soak-report.json` (or equivalent) to generate periodic JSON evidence.
     - Attach the 30-day SLO report (dates + dashboards + soak reports) to the GA release ticket.
   - _Reqs: AC-4.1_
 
