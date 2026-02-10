@@ -38,6 +38,14 @@ jobs:
           toolchain: "1.89.0"
           components: rustfmt, clippy
 
+      - name: Install PKCS#11/TPM test deps
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends softhsm2 swtpm tpm2-tools
+          sudo rm -rf /var/lib/apt/lists/*
+
       - name: Run GA qualification script
         shell: bash
         run: bash scripts/ga_qualification.sh --mode release --label "${GITHUB_REF_NAME}" --dist-dir dist

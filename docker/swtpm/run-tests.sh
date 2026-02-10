@@ -10,8 +10,16 @@ swtpm socket \
   --tpmstate "dir=${STATE_DIR}" \
   --ctrl "type=tcp,port=2322" \
   --server "type=tcp,port=2321" \
-  --flags "not-need-init,startup-clear" \
-  --daemon
+  --flags "not-need-init,startup-clear" &
+SWTPM_PID="$!"
+
+cleanup() {
+  if [[ -n "${SWTPM_PID:-}" ]]; then
+    kill "${SWTPM_PID}" >/dev/null 2>&1 || true
+    wait "${SWTPM_PID}" >/dev/null 2>&1 || true
+  fi
+}
+trap cleanup EXIT
 
 TCTI="swtpm:port=2321"
 export TPM2TOOLS_TCTI="${TCTI}"

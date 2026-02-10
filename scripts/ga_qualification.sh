@@ -148,15 +148,15 @@ run_and_capture() {
 
   if "$@" >"${LOG_DIR}/${name}.out" 2>&1; then
     return 0
+  else
+    local ec="$?"
+    FAILED_STEP="${name}"
+    FAILED_EXIT_CODE="${ec}"
+    echo "${FAILED_STEP}" >"${OUT_DIR}/failed_step.txt"
+    echo "${FAILED_EXIT_CODE}" >"${OUT_DIR}/failed_exit_code.txt"
+    echo "ERROR: step ${name} failed (exit ${ec}); see ${LOG_DIR}/${name}.out" >&2
+    return "${ec}"
   fi
-
-  local ec="$?"
-  FAILED_STEP="${name}"
-  FAILED_EXIT_CODE="${ec}"
-  echo "${FAILED_STEP}" >"${OUT_DIR}/failed_step.txt"
-  echo "${FAILED_EXIT_CODE}" >"${OUT_DIR}/failed_exit_code.txt"
-  echo "ERROR: step ${name} failed (exit ${ec}); see ${LOG_DIR}/${name}.out" >&2
-  return "${ec}"
 }
 
 wait_for_health() {
@@ -253,7 +253,8 @@ doc = {
     "generated_at_utc": meta.get("timestamp_utc"),
     "git_sha_short": meta.get("git_sha_short"),
     "compatibility_profile": compat,
-    "status": "failed" if exit_code not in (None, 0) else "ok",
+    # Defensive: treat any recorded failed_step as a failure, even if exit_code parsing went sideways.
+    "status": "failed" if (failed_step is not None) or (exit_code not in (None, 0)) else "ok",
     "failed_step": failed_step,
     "exit_code": exit_code,
     "artifacts": artifacts,
@@ -388,11 +389,22 @@ PY
   run_and_capture lightning_harness bash docker/lightning-regtest/run-tests.sh all
 
   # Hardware-custody contract harnesses (docker-based).
-  run_and_capture pkcs11_build docker build -f docker/softhsm/Dockerfile -t credential-briefcase-softhsm .
-  run_and_capture pkcs11_tests docker run --rm -v "${ROOT_DIR}:/workspace" -w /workspace credential-briefcase-softhsm bash docker/softhsm/run-tests.sh
+  #
+  # In CI we prefer host-installed dependencies to avoid pulling a full Rust toolchain image,
+  # which can exceed runner disk limits. Locally, Docker remains a convenient fallback.
+  if [[ "$(uname)" == "Linux" ]] && command -v softhsm2-util >/dev/null 2>&1; then
+    run_and_capture pkcs11_tests bash docker/softhsm/run-tests.sh
+  else
+    run_and_capture pkcs11_build docker build -f docker/softhsm/Dockerfile -t credential-briefcase-softhsm .
+    run_and_capture pkcs11_tests docker run --rm -v "${ROOT_DIR}:/workspace" -w /workspace credential-briefcase-softhsm bash docker/softhsm/run-tests.sh
+  fi
 
-  run_and_capture tpm2_build docker build -f docker/swtpm/Dockerfile -t credential-briefcase-swtpm .
-  run_and_capture tpm2_tests docker run --rm -v "${ROOT_DIR}:/workspace" -w /workspace credential-briefcase-swtpm bash docker/swtpm/run-tests.sh
+  if [[ "$(uname)" == "Linux" ]] && command -v swtpm >/dev/null 2>&1 && command -v tpm2_getcap >/dev/null 2>&1; then
+    run_and_capture tpm2_tests bash docker/swtpm/run-tests.sh
+  else
+    run_and_capture tpm2_build docker build -f docker/swtpm/Dockerfile -t credential-briefcase-swtpm .
+    run_and_capture tpm2_tests docker run --rm -v "${ROOT_DIR}:/workspace" -w /workspace credential-briefcase-swtpm bash docker/swtpm/run-tests.sh
+  fi
 
   # Browser extension E2E (Playwright).
   #
