@@ -136,14 +136,13 @@ async fn main() -> anyhow::Result<()> {
     {
         if args.tcp_addr.is_none() {
             let default_pipe = briefcase_api::default_named_pipe_name(&auth_token);
-            if args.strict_host {
-                if let Some(p) = args.named_pipe.as_deref()
-                    && p != default_pipe.as_str()
-                {
-                    anyhow::bail!(
-                        "strict host mode requires the default named pipe path (set BRIEFCASE_NAMED_PIPE to the derived default or unset it)"
-                    );
-                }
+            if args.strict_host
+                && let Some(p) = args.named_pipe.as_deref()
+                && p != default_pipe.as_str()
+            {
+                anyhow::bail!(
+                    "strict host mode requires the default named pipe path (set BRIEFCASE_NAMED_PIPE to the derived default or unset it)"
+                );
             }
 
             let pipe_name = if args.strict_host {
