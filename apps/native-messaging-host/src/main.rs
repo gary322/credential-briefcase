@@ -63,46 +63,53 @@ fn load_auth_token(path: &Path) -> anyhow::Result<String> {
     Ok(tok)
 }
 
+#[cfg(unix)]
 fn resolve_endpoint(
     args: &Args,
     data_dir: &Path,
-    auth_token: &str,
+    _auth_token: &str,
 ) -> anyhow::Result<DaemonEndpoint> {
-    let _ = auth_token; // Used for Windows named-pipe defaulting.
-
     if let Some(base_url) = &args.tcp_base_url {
         return Ok(DaemonEndpoint::Tcp {
             base_url: base_url.clone(),
         });
     }
 
-    #[cfg(unix)]
-    {
-        if let Some(p) = &args.unix_socket {
-            return Ok(DaemonEndpoint::Unix {
-                socket_path: p.clone(),
-            });
-        }
-        let default_sock = data_dir.join("briefcased.sock");
-        if default_sock.exists() {
-            return Ok(DaemonEndpoint::Unix {
-                socket_path: default_sock,
-            });
-        }
+    if let Some(p) = &args.unix_socket {
+        return Ok(DaemonEndpoint::Unix {
+            socket_path: p.clone(),
+        });
     }
 
-    #[cfg(windows)]
-    {
-        let pipe_name = args
-            .named_pipe
-            .clone()
-            .unwrap_or_else(|| briefcase_api::default_named_pipe_name(auth_token));
-        return Ok(DaemonEndpoint::NamedPipe { pipe_name });
+    let default_sock = data_dir.join("briefcased.sock");
+    if default_sock.exists() {
+        return Ok(DaemonEndpoint::Unix {
+            socket_path: default_sock,
+        });
     }
 
     anyhow::bail!(
-        "no daemon endpoint configured (set BRIEFCASE_UNIX_SOCKET, BRIEFCASE_TCP_BASE_URL, or BRIEFCASE_NAMED_PIPE)"
+        "no daemon endpoint configured (set BRIEFCASE_UNIX_SOCKET or BRIEFCASE_TCP_BASE_URL)"
     );
+}
+
+#[cfg(windows)]
+fn resolve_endpoint(
+    args: &Args,
+    _data_dir: &Path,
+    auth_token: &str,
+) -> anyhow::Result<DaemonEndpoint> {
+    if let Some(base_url) = &args.tcp_base_url {
+        return Ok(DaemonEndpoint::Tcp {
+            base_url: base_url.clone(),
+        });
+    }
+
+    let pipe_name = args
+        .named_pipe
+        .clone()
+        .unwrap_or_else(|| briefcase_api::default_named_pipe_name(auth_token));
+    Ok(DaemonEndpoint::NamedPipe { pipe_name })
 }
 
 #[tokio::main]
