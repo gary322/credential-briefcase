@@ -1,6 +1,8 @@
 # Observability (OpenTelemetry)
 
-`credential-briefcase` uses `tracing` for structured logs, and can optionally export **OpenTelemetry traces and metrics** over **OTLP/HTTP (protobuf)**.
+Agentic Auth uses `tracing` for structured logs, and can optionally export **OpenTelemetry traces and metrics** over **OTLP/HTTP (protobuf)**.
+
+Note: some identifiers (for example the OpenTelemetry meter name) may still use `credential-briefcase` for backward compatibility.
 
 The goal is to make the full execution chain visible:
 
@@ -102,4 +104,3 @@ cargo run -p briefcase-cli -- tools call quote --args-json '{"symbol":"AAPL"}'
 ```bash
 cargo test -p briefcased observability_otel_trace_contains_policy_and_upstream_spans
 ```
-

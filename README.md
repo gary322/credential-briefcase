@@ -1,31 +1,52 @@
-# Credential Briefcase
+# Agentic Auth
 
-A production-grade, open-source reference implementation of a **credential briefcase** system:
+Agentic Auth is a production-grade, open-source reference implementation of an **authentication and authorization boundary for tool-using LLM agents**.
 
-- **The LLM/agent runtime is untrusted**.
-- **Raw secrets never cross the agent boundary** (OAuth refresh tokens, private keys, payment proofs).
-- The agent connects to **one MCP server** (`mcp-gateway`) which routes all tool calls through a local (or enterprise-managed) **Briefcase** daemon (`briefcased`).
-- Every tool call is **policy/budget gated**, **sandboxed**, and **audited** with tamper-evident receipts.
+Core properties:
 
-This repo is a practical answer to: "How do I let agents use powerful tools, OAuth, paid APIs, and remote MCP servers without handing them credentials or a blank check?"
+- **The agent runtime is untrusted** (prompt-injectable; tool output is untrusted).
+- **Raw secrets never cross the agent boundary** (OAuth refresh/access tokens, capability tokens, private keys, payment proofs).
+- The agent connects to **one MCP server** (`mcp-gateway`) which routes all tool calls through a local (or enterprise-managed) **daemon** (`briefcased`).
+- Every tool call is **schema validated**, **policy/budget gated**, **sandboxed**, and **audited** with tamper-evident receipts.
 
-## Reference vs GA Contract
+This repo answers: "How do I let agents use powerful tools, OAuth, paid APIs, and remote MCP servers without giving them credentials or a blank check?"
 
-- The **trusted boundary** is `briefcased` (custody + enforcement) plus `mcp-gateway` (the only agent-facing MCP surface).
-- The interoperability contract is the **Agentic Auth Compatibility Profile**: `aacp_v1` (see `docs/COMPATIBILITY_PROFILE.md`).
-  - `BRIEFCASE_PROFILE_MODE=ga` enables the strict production behavior required by that contract.
-- `agent-access-gateway` and `briefcase-control-plane` are **reference implementations** and conformance targets that help providers/enterprises integrate without bespoke assumptions.
+## What "Agentic Auth" Means Here
 
-## Why This Exists
+Traditional auth assumes the caller is trusted enough to hold credentials. Agents are not.
 
-Tool-using agents create a sharp new security problem:
+In this system, agentic auth is the end-to-end flow where:
 
-- Prompts and tool outputs are untrusted and can be prompt-injected.
-- Direct API keys and OAuth tokens inside an agent runtime are easy to leak (logs, model outputs, tool-chaining).
-- MCP ecosystems naturally fragment into many servers, each with its own auth quirks.
-- Paid tools need budgets, approvals, receipts, and chargeback-grade audit trails.
+1. The agent emits an **intent** (`tools/call name args`) to a single MCP surface.
+2. A trusted daemon:
+   - validates tool inputs against a strict JSON Schema
+   - evaluates allow/deny policy, budgets, and non-authoritative risk scoring
+   - requests explicit approval when required (optionally with a strong signer)
+   - obtains or mints a **short-lived, caveated capability** (OAuth/VC/payments behind the boundary)
+   - binds high-value capabilities to a proof key (DPoP / PoP) and enforces replay defenses
+3. The daemon executes the outbound request and returns a **redacted result** plus **provenance** and a **receipt**.
 
-Credential Briefcase centralizes **custody, enforcement, payment, and auditing** into one place that can be hardened and tested like a real security boundary.
+The agent never sees the underlying secrets or the enforcement logic; it only sees allowed tool results and approval metadata.
+
+## Trust Boundary
+
+- Trusted: `briefcased` (secrets, keys, policy, approvals, payments, sandboxing, receipts).
+- Agent-facing (untrusted input surface): `mcp-gateway` (the only MCP server the agent should talk to).
+- Everything else is either:
+  - downstream dependencies (providers, remote MCP servers), or
+  - admin/operator surfaces (CLI/UI/control plane).
+
+## Naming
+
+This GitHub repo is named **Agentic Auth**, but many components still use the historical **Briefcase** naming (`briefcased`, `briefcase-cli`, etc.). Some persistent identifiers also still use `credential-briefcase` for backward compatibility (for example data directory and keyring service names). Renaming those internal IDs would be a breaking change.
+
+## Interoperability Contract (AACP)
+
+The public contract is the **Agentic Auth Compatibility Profile**: `aacp_v1` (see `docs/COMPATIBILITY_PROFILE.md`).
+
+- `BRIEFCASE_PROFILE_MODE=reference|staging|ga` controls strictness.
+- `BRIEFCASE_PROFILE_MODE=ga` is the intended "production enforcement" posture.
+- Provider-side `agent-access-gateway` and enterprise `briefcase-control-plane` are **reference implementations** and conformance targets.
 
 ## Architecture (At A Glance)
 
@@ -137,6 +158,14 @@ graph LR
 7. `briefcased` executes the outbound call, redacts/sanitizes the result, and appends a tamper-evident receipt.
 8. `mcp-gateway` returns the sanitized result to the agent along with provenance metadata.
 
+## How To Use This Repo
+
+There are three primary "users" of this codebase:
+
+- Agent integrators: run `mcp-gateway` + `briefcased` and point your agent at the gateway.
+- Tool operators: author policy/budget rules, handle approvals, manage providers, and export receipts.
+- Providers/enterprises: implement or validate capability issuance (provider gateway) and/or manage fleets (control plane).
+
 ## What You Can Build With This
 
 - **Paid research assistants**: pay-per-call tools (market data, paywalled content) with budgets and receipts.
@@ -242,6 +271,8 @@ Streamable HTTP transport (for agent clients that speak MCP over HTTP):
 ```bash
 export BRIEFCASE_DATA_DIR="$PWD/.briefcase"
 export BRIEFCASE_MCP_HTTP_ADDR="127.0.0.1:8888"
+# Optional:
+# export BRIEFCASE_MCP_HTTP_PATH="/mcp"
 cargo run -p mcp-gateway -- --no-stdio
 ```
 
@@ -252,6 +283,52 @@ For strict production enforcement, run `briefcased` in `ga` mode:
 ```bash
 export BRIEFCASE_PROFILE_MODE=ga
 export BRIEFCASE_STRICT_HOST=1
+```
+
+Operational docs you will want for real deployments:
+
+- Policy authoring and enforcement: `docs/POLICY.md`
+- Threat model and residual risks: `docs/THREAT_MODEL.md`
+- Ops runbooks and SLOs: `docs/OPERATIONS.md`
+- Capability token and PoP binding details: `docs/CAPABILITY_TOKENS.md`
+- Compatibility profile: `docs/COMPATIBILITY_PROFILE.md`
+
+### Common Workflows (CLI)
+
+List and manage providers (OAuth/VC live behind the daemon and are never printed):
+
+```bash
+cargo run -p briefcase-cli -- providers list
+cargo run -p briefcase-cli -- providers upsert demo http://127.0.0.1:19099
+cargo run -p briefcase-cli -- providers oauth-login --id demo
+cargo run -p briefcase-cli -- providers vc-fetch --id demo
+cargo run -p briefcase-cli -- providers oauth-revoke --id demo
+```
+
+List and manage remote MCP servers (discovered/authorized behind the daemon):
+
+```bash
+cargo run -p briefcase-cli -- mcp servers list
+cargo run -p briefcase-cli -- mcp servers upsert my-server https://example.com/mcp
+cargo run -p briefcase-cli -- mcp servers oauth-login my-server --scope "mcp:tools"
+cargo run -p briefcase-cli -- mcp servers oauth-revoke my-server
+```
+
+Budgets (category is policy-defined):
+
+```bash
+cargo run -p briefcase-cli -- budgets list
+cargo run -p briefcase-cli -- budgets set --daily-limit-usd 3.0 payments
+```
+
+Approvals + receipts:
+
+```bash
+cargo run -p briefcase-cli -- approvals list
+cargo run -p briefcase-cli -- approvals approve <APPROVAL_UUID>
+
+cargo run -p briefcase-cli -- receipts list
+cargo run -p briefcase-cli -- receipts verify
 ```
 
 Release and GA evidence gates (see `docs/RELEASING.md`):

@@ -135,10 +135,10 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Build SoftHSM test image
-        run: docker build -f docker/softhsm/Dockerfile -t credential-briefcase-softhsm .
+        run: docker build -f docker/softhsm/Dockerfile -t agentic-auth-softhsm .
 
       - name: Run PKCS#11 tests (SoftHSM)
-        run: docker run --rm -v ${{ github.workspace }}:/workspace -w /workspace credential-briefcase-softhsm bash docker/softhsm/run-tests.sh
+        run: docker run --rm -v ${{ github.workspace }}:/workspace -w /workspace agentic-auth-softhsm bash docker/softhsm/run-tests.sh
 
   tpm2:
     name: tpm2 (swtpm)
@@ -147,10 +147,10 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Build swtpm test image
-        run: docker build -f docker/swtpm/Dockerfile -t credential-briefcase-swtpm .
+        run: docker build -f docker/swtpm/Dockerfile -t agentic-auth-swtpm .
 
       - name: Run TPM2 tests (swtpm)
-        run: docker run --rm -v ${{ github.workspace }}:/workspace -w /workspace credential-briefcase-swtpm bash docker/swtpm/run-tests.sh
+        run: docker run --rm -v ${{ github.workspace }}:/workspace -w /workspace agentic-auth-swtpm bash docker/swtpm/run-tests.sh
 
   x402:
     name: x402 (stablecoin v2)
@@ -159,10 +159,10 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Build x402 harness image
-        run: docker build -f docker/x402-harness/Dockerfile -t credential-briefcase-x402 .
+        run: docker build -f docker/x402-harness/Dockerfile -t agentic-auth-x402 .
 
       - name: Run x402 v2 harness
-        run: docker run --rm -v ${{ github.workspace }}:/workspace -w /workspace credential-briefcase-x402 bash docker/x402-harness/run-tests.sh
+        run: docker run --rm -v ${{ github.workspace }}:/workspace -w /workspace agentic-auth-x402 bash docker/x402-harness/run-tests.sh
 
   lightning:
     name: lightning (L402 regtest)

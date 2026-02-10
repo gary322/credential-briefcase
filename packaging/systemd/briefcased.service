@@ -1,5 +1,5 @@
 [Unit]
-Description=Credential Briefcase daemon
+Description=Agentic Auth daemon (briefcased)
 After=network.target
 
 [Service]
@@ -54,4 +54,3 @@ StateDirectory=briefcase
 
 [Install]
 WantedBy=multi-user.target
-

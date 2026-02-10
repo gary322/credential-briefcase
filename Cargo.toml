@@ -33,7 +33,7 @@ members = [
 version = "0.1.13"
 edition = "2024"
 license = "Apache-2.0"
-repository = "https://github.com/gary322/credential-briefcase"
+repository = "https://github.com/gary322/agentic-auth"
 
 [workspace.dependencies]
 anyhow = "1.0.97"

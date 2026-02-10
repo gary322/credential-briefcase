@@ -1,6 +1,6 @@
 openapi: 3.1.0
 info:
-  title: Credential Briefcase Daemon API
+  title: Agentic Auth Daemon API
   version: 0.1.9
   description: |
     Local admin API for `briefcased`.

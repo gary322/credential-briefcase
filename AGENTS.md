@@ -1,6 +1,6 @@
 # Agent Instructions (Repository Local)
 
-This repo implements a **credential briefcase** system where the **LLM/agent runtime is untrusted** and must never receive raw secrets.
+This repo implements an **agentic auth ("credential briefcase")** system where the **LLM/agent runtime is untrusted** and must never receive raw secrets.
 
 ## Hard Rules
 
@@ -52,4 +52,3 @@ Risk scoring is **non-authoritative**:
 
 - It may require approval.
 - It must never override allow/deny policy decisions.
-

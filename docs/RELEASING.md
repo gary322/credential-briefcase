@@ -99,8 +99,8 @@ The `release` workflow will:
 - Generate an SPDX JSON SBOM (`sbom-<tag>.spdx.json`).
 - Generate a release evidence manifest (`release-manifest-<tag>.json`) via `scripts/release_manifest.sh`.
 - Build, push, and keylessly sign the control plane container image to GHCR:
-  - `ghcr.io/<owner>/credential-briefcase-control-plane:<tag>`
-  - `ghcr.io/<owner>/credential-briefcase-control-plane:latest`
+  - `ghcr.io/<owner>/agentic-auth-control-plane:<tag>`
+  - `ghcr.io/<owner>/agentic-auth-control-plane:latest`
 - Generate `SHA256SUMS.txt`.
 - Sign release artifacts using keyless Sigstore `cosign sign-blob`.
 - Publish a GitHub Release with all artifacts + signatures.

@@ -3,14 +3,14 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 COMPOSE_FILE="$ROOT/docker/lightning-regtest/docker-compose.yml"
-PROJECT="credential-briefcase-lightning"
+PROJECT="agentic-auth-lightning"
 MODE="${1:-all}"
 WAIT_SECS="${WAIT_SECS:-240}"
 
 DEFAULT_PROJECT_DIR="$ROOT/docker/lightning-regtest"
 if [ "${GITHUB_ACTIONS:-}" = "true" ] || [ "${CI:-}" = "true" ]; then
   # Keep Unix domain socket paths short (CLN JSON-RPC) to avoid `SUN_LEN` limits.
-  PROJECT_DIR="${BRIEFCASE_LIGHTNING_PROJECT_DIR:-/tmp/credential-briefcase-lightning}"
+  PROJECT_DIR="${BRIEFCASE_LIGHTNING_PROJECT_DIR:-/tmp/agentic-auth-lightning}"
 else
   PROJECT_DIR="${BRIEFCASE_LIGHTNING_PROJECT_DIR:-$DEFAULT_PROJECT_DIR}"
 fi
@@ -99,8 +99,8 @@ ${BITCOIN_CLI[@]} createwallet miner >/dev/null 2>&1 || true
 MINER_ADDR="$(${BITCOIN_CLI[@]} -rpcwallet=miner getnewaddress | tr -d '\r')"
 ${BITCOIN_CLI[@]} -rpcwallet=miner generatetoaddress 110 "$MINER_ADDR" >/dev/null
 
-wait_for "lnd-alice synced" bash -lc 'docker compose -p credential-briefcase-lightning -f "'"$COMPOSE_FILE"'" exec -T lnd-alice lncli --network=regtest getinfo | python3 -c "import json,sys; sys.exit(0 if json.load(sys.stdin).get(\"synced_to_chain\") else 1)"'
-wait_for "lnd-bob synced" bash -lc 'docker compose -p credential-briefcase-lightning -f "'"$COMPOSE_FILE"'" exec -T lnd-bob lncli --network=regtest getinfo | python3 -c "import json,sys; sys.exit(0 if json.load(sys.stdin).get(\"synced_to_chain\") else 1)"'
+wait_for "lnd-alice synced" bash -lc 'docker compose -p agentic-auth-lightning -f "'"$COMPOSE_FILE"'" exec -T lnd-alice lncli --network=regtest getinfo | python3 -c "import json,sys; sys.exit(0 if json.load(sys.stdin).get(\"synced_to_chain\") else 1)"'
+wait_for "lnd-bob synced" bash -lc 'docker compose -p agentic-auth-lightning -f "'"$COMPOSE_FILE"'" exec -T lnd-bob lncli --network=regtest getinfo | python3 -c "import json,sys; sys.exit(0 if json.load(sys.stdin).get(\"synced_to_chain\") else 1)"'
 
 wait_for "lnd-alice macaroon" dc exec -T lnd-alice sh -lc 'test -f /root/.lnd/data/chain/bitcoin/regtest/admin.macaroon'
 wait_for "lnd-bob macaroon" dc exec -T lnd-bob sh -lc 'test -f /root/.lnd/data/chain/bitcoin/regtest/admin.macaroon'
@@ -196,7 +196,7 @@ cln_channel_active() {
 wait_for "cln channel active" cln_channel_active
 
 # Build helper with Lightning features and run the L402 tests.
-export CARGO_TARGET_DIR="/tmp/credential-briefcase-lightning-target"
+export CARGO_TARGET_DIR="/tmp/agentic-auth-lightning-target"
 export RUST_TEST_THREADS=1
 
 HELPER_FEATURES="l402-lnd,l402-cln"

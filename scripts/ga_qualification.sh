@@ -395,15 +395,15 @@ PY
   if [[ "$(uname)" == "Linux" ]] && command -v softhsm2-util >/dev/null 2>&1; then
     run_and_capture pkcs11_tests bash docker/softhsm/run-tests.sh
   else
-    run_and_capture pkcs11_build docker build -f docker/softhsm/Dockerfile -t credential-briefcase-softhsm .
-    run_and_capture pkcs11_tests docker run --rm -v "${ROOT_DIR}:/workspace" -w /workspace credential-briefcase-softhsm bash docker/softhsm/run-tests.sh
+    run_and_capture pkcs11_build docker build -f docker/softhsm/Dockerfile -t agentic-auth-softhsm .
+    run_and_capture pkcs11_tests docker run --rm -v "${ROOT_DIR}:/workspace" -w /workspace agentic-auth-softhsm bash docker/softhsm/run-tests.sh
   fi
 
   if [[ "$(uname)" == "Linux" ]] && command -v swtpm >/dev/null 2>&1 && command -v tpm2_getcap >/dev/null 2>&1; then
     run_and_capture tpm2_tests bash docker/swtpm/run-tests.sh
   else
-    run_and_capture tpm2_build docker build -f docker/swtpm/Dockerfile -t credential-briefcase-swtpm .
-    run_and_capture tpm2_tests docker run --rm -v "${ROOT_DIR}:/workspace" -w /workspace credential-briefcase-swtpm bash docker/swtpm/run-tests.sh
+    run_and_capture tpm2_build docker build -f docker/swtpm/Dockerfile -t agentic-auth-swtpm .
+    run_and_capture tpm2_tests docker run --rm -v "${ROOT_DIR}:/workspace" -w /workspace agentic-auth-swtpm bash docker/swtpm/run-tests.sh
   fi
 
   # Browser extension E2E (Playwright).

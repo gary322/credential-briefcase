@@ -6,7 +6,7 @@ set -euo pipefail
 # - runs the briefcased integration test that exercises PAYMENT-REQUIRED/PAYMENT-SIGNATURE headers
 
 # Use an isolated target dir so local runs on non-Linux hosts don't get confused by mixed artifacts.
-export CARGO_TARGET_DIR="/tmp/credential-briefcase-target"
+export CARGO_TARGET_DIR="/tmp/agentic-auth-target"
 
 cargo build -p briefcase-payment-helper
 

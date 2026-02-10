@@ -86,7 +86,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist
-          name="credential-briefcase-${GITHUB_REF_NAME}-${RUNNER_OS}"
+          name="agentic-auth-${GITHUB_REF_NAME}-${RUNNER_OS}"
           mkdir -p "dist/${name}"
           cp target/release/briefcased "dist/${name}/"
           cp target/release/briefcase-cli "dist/${name}/"
@@ -102,7 +102,7 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path dist | Out-Null
-          $name = "credential-briefcase-$env:GITHUB_REF_NAME-$env:RUNNER_OS"
+          $name = "agentic-auth-$env:GITHUB_REF_NAME-$env:RUNNER_OS"
           New-Item -ItemType Directory -Force -Path "dist/$name" | Out-Null
           Copy-Item "target/release/briefcased.exe" "dist/$name/"
           Copy-Item "target/release/briefcase-cli.exe" "dist/$name/"
@@ -277,7 +277,7 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: |
-            ghcr.io/${{ github.repository_owner }}/credential-briefcase-control-plane
+            ghcr.io/${{ github.repository_owner }}/agentic-auth-control-plane
           tags: |
             type=ref,event=tag
             type=raw,value=latest
@@ -299,7 +299,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          image="ghcr.io/${{ github.repository_owner }}/credential-briefcase-control-plane"
+          image="ghcr.io/${{ github.repository_owner }}/agentic-auth-control-plane"
           cosign sign --yes "${image}@${{ steps.build.outputs.digest }}"
 
       - name: Write image digest file
@@ -307,7 +307,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist
-          image="ghcr.io/${{ github.repository_owner }}/credential-briefcase-control-plane"
+          image="ghcr.io/${{ github.repository_owner }}/agentic-auth-control-plane"
           echo "${image}@${{ steps.build.outputs.digest }}" > "dist/control-plane-image-${GITHUB_REF_NAME}.txt"
 
       - name: Upload digest artifact
