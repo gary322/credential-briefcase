@@ -35,6 +35,44 @@ jobs:
           # There is no fixed upgrade available as of 2026-02-07.
           ignore: RUSTSEC-2024-0388, RUSTSEC-2024-0384, RUSTSEC-2023-0071
 
+  assessment_bundle:
+    name: security assessment bundle (evidence)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install pnpm
+        shell: bash
+        run: corepack enable
+
+      - name: pnpm install
+        shell: bash
+        env:
+          PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
+        run: pnpm install --frozen-lockfile
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.89.0"
+          components: rustfmt, clippy
+
+      - name: Run security assessment harness
+        shell: bash
+        run: bash scripts/run_security_assessment.sh
+
+      - name: Upload security assessment bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-assessment-bundle
+          path: dist/security-assessment-*.tar.gz
+
   fuzz:
     name: fuzz (scheduled)
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'

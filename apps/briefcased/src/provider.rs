@@ -101,6 +101,12 @@ impl ProviderClient {
             .await?
             .context("unknown provider_id")?;
 
+        // Defense-in-depth: validate on read as well, since older DBs may contain values that
+        // predate stricter normalization.
+        let parsed = Url::parse(&base_url).context("parse provider base_url")?;
+        crate::net_policy::validate_provider_base_url(&parsed)
+            .context("provider base_url violates egress policy")?;
+
         // Retry once on transient auth failures, including explicit capability revocation.
         for attempt in 0..2 {
             let tok = self.get_or_refresh_token(provider_id, &base_url).await?;

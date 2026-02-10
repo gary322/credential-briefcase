@@ -241,10 +241,24 @@ pub async fn sync_once(state: &AppState) -> anyhow::Result<ControlPlaneSyncOutco
         .into_inner();
     let device_token = String::from_utf8(device_token).context("device token is not utf8")?;
 
+    let signer = identity_signer(state).await?;
+    let base_url =
+        url::Url::parse(&cfg.base_url).context("parse control plane base_url for dpop")?;
+
     let client = ControlPlaneClient::new(&cfg.base_url)?;
 
+    let policy_url = base_url
+        .join(&format!("/v1/devices/{}/policy", cfg.device_id))
+        .context("join policy url")?;
+    let policy_dpop = briefcase_dpop::dpop_proof_for_resource_request(
+        signer.as_ref(),
+        &policy_url,
+        "GET",
+        &device_token,
+    )
+    .await?;
     let policy: DevicePolicyResponse = client
-        .device_get_policy(&cfg.device_id, &device_token)
+        .device_get_policy(&cfg.device_id, &device_token, Some(&policy_dpop))
         .await?;
 
     verify_policy_bundle_signature(
@@ -270,7 +284,15 @@ pub async fn sync_once(state: &AppState) -> anyhow::Result<ControlPlaneSyncOutco
     }
 
     // Upload new receipts (best-effort).
-    let uploaded = upload_new_receipts(state, &client, &cfg, &device_token).await?;
+    let uploaded = upload_new_receipts(
+        state,
+        &client,
+        &cfg,
+        &device_token,
+        signer.as_ref(),
+        &base_url,
+    )
+    .await?;
     outcome.receipts_uploaded = uploaded;
 
     let _ = state
@@ -285,6 +307,8 @@ async fn upload_new_receipts(
     client: &ControlPlaneClient,
     cfg: &ControlPlaneRecord,
     device_token: &str,
+    signer: &dyn briefcase_keys::Signer,
+    base_url: &url::Url,
 ) -> anyhow::Result<usize> {
     let mut receipts =
         collect_receipts_after_id(&state.receipts, cfg.last_receipt_upload_id).await?;
@@ -300,10 +324,21 @@ async fn upload_new_receipts(
             .last()
             .map(|r| r.id)
             .unwrap_or(cfg.last_receipt_upload_id);
+        let receipts_url = base_url
+            .join(&format!("/v1/devices/{}/receipts", cfg.device_id))
+            .context("join receipts url")?;
+        let dpop = briefcase_dpop::dpop_proof_for_resource_request(
+            signer,
+            &receipts_url,
+            "POST",
+            device_token,
+        )
+        .await?;
         let resp = client
             .device_upload_receipts(
                 &cfg.device_id,
                 device_token,
+                Some(&dpop),
                 UploadReceiptsRequest {
                     receipts: chunk.to_vec(),
                 },
@@ -363,6 +398,27 @@ async fn apply_policy_bundle(
     signed: &briefcase_control_plane_api::types::SignedPolicyBundle,
 ) -> anyhow::Result<()> {
     verify_policy_bundle_signature(policy_pubkey_b64, &signed.bundle, &signed.signature_b64)?;
+
+    if state.profile_mode == briefcase_core::ProfileMode::Ga
+        && signed.bundle.compatibility_profile != briefcase_core::COMPATIBILITY_PROFILE_VERSION
+    {
+        let got = signed.bundle.compatibility_profile.as_str();
+        let _ = state
+            .receipts
+            .append(serde_json::json!({
+                "kind": "control_plane_policy_bundle_incompatible",
+                "bundle_id": signed.bundle.bundle_id,
+                "expected_compatibility_profile": briefcase_core::COMPATIBILITY_PROFILE_VERSION,
+                "got_compatibility_profile": got,
+                "ts": Utc::now().to_rfc3339(),
+            }))
+            .await;
+        anyhow::bail!(
+            "incompatible policy bundle: expected {}, got {}",
+            briefcase_core::COMPATIBILITY_PROFILE_VERSION,
+            got
+        );
+    }
 
     let engine = CedarPolicyEngine::new(CedarPolicyEngineOptions {
         policy_text: signed.bundle.policy_text.clone(),

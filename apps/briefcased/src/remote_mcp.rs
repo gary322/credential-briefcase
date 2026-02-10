@@ -4,7 +4,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 use briefcase_core::{
-    AuthMethod, OutputFirewall, ToolCategory, ToolCost, ToolSpec, util::sha256_hex,
+    AuthMethod, COMPATIBILITY_PROFILE_VERSION, OutputFirewall, ProfileMode, ToolCategory, ToolCost,
+    ToolSpec, util::sha256_hex,
 };
 use briefcase_keys::{KeyAlgorithm, KeyHandle, SoftwareKeyManager};
 use briefcase_mcp::{
@@ -15,11 +16,27 @@ use briefcase_oauth_discovery::OAuthDiscoveryClient;
 use briefcase_secrets::SecretStore;
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
+use thiserror::Error;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{info, warn};
 use url::Url;
 
 use crate::db::{Db, RemoteMcpServerRecord};
+
+#[derive(Debug, Error)]
+pub enum RemoteMcpCompatibilityError {
+    #[error("remote mcp server `{server_id}` missing compatibility_profile (expected {expected})")]
+    MissingProfile {
+        server_id: String,
+        expected: &'static str,
+    },
+    #[error("remote mcp server `{server_id}` incompatible: expected {expected} got {got}")]
+    ProfileMismatch {
+        server_id: String,
+        expected: &'static str,
+        got: String,
+    },
+}
 
 #[derive(Debug, Clone)]
 struct RemoteToolDef {
@@ -58,6 +75,7 @@ impl PerRequestHeaderProvider for DpopHeaderProvider {
 struct RemoteSession {
     endpoint_url: String,
     client: HttpMcpClient,
+    compatibility_profile: Option<String>,
     oauth_token_endpoint: Option<String>,
     oauth_dpop_algs: Option<Vec<String>>,
     dpop_signer: Option<Arc<dyn briefcase_keys::Signer>>,
@@ -75,6 +93,7 @@ pub struct RemoteMcpManager {
     oauth: Arc<OAuthDiscoveryClient>,
     keys: SoftwareKeyManager,
     http: reqwest::Client,
+    profile_mode: ProfileMode,
     dpop_override: Arc<RwLock<Option<Arc<dyn briefcase_keys::Signer>>>>,
     sessions: Arc<Mutex<HashMap<String, Arc<Mutex<RemoteSession>>>>>, // server_id -> session
     ttl: Duration,
@@ -85,6 +104,7 @@ impl RemoteMcpManager {
         db: Db,
         secrets: Arc<dyn SecretStore>,
         oauth: Arc<OAuthDiscoveryClient>,
+        profile_mode: ProfileMode,
     ) -> anyhow::Result<Self> {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(20))
@@ -98,6 +118,7 @@ impl RemoteMcpManager {
             oauth,
             keys,
             http,
+            profile_mode,
             dpop_override: Arc::new(RwLock::new(None)),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             ttl: Duration::from_secs(30),
@@ -175,10 +196,13 @@ impl RemoteMcpManager {
         if guard.endpoint_url != server.endpoint_url {
             let endpoint =
                 Url::parse(&server.endpoint_url).context("parse remote mcp endpoint_url")?;
+            crate::net_policy::validate_mcp_endpoint_url(&endpoint)
+                .context("remote mcp endpoint_url violates egress policy")?;
             guard.client = HttpMcpClient::new(HttpMcpClientOptions::new(endpoint))?;
             guard.endpoint_url = server.endpoint_url.clone();
             guard.tools.clear();
             guard.fetched_at = None;
+            guard.compatibility_profile = None;
             guard.oauth_token_endpoint = None;
             guard.oauth_dpop_algs = None;
             guard.dpop_signer = None;
@@ -214,6 +238,7 @@ impl RemoteMcpManager {
             .call_tool(CallToolParams {
                 name: def.remote_name.clone(),
                 arguments: Some(args.clone()),
+                approval_token: None,
             })
             .await?;
 
@@ -276,11 +301,14 @@ impl RemoteMcpManager {
         }
 
         let endpoint = Url::parse(&server.endpoint_url).context("parse remote mcp endpoint_url")?;
+        crate::net_policy::validate_mcp_endpoint_url(&endpoint)
+            .context("remote mcp endpoint_url violates egress policy")?;
         let client = HttpMcpClient::new(HttpMcpClientOptions::new(endpoint))?;
 
         let sess = Arc::new(Mutex::new(RemoteSession {
             endpoint_url: server.endpoint_url.clone(),
             client,
+            compatibility_profile: None,
             oauth_token_endpoint: None,
             oauth_dpop_algs: None,
             dpop_signer: None,
@@ -305,10 +333,13 @@ impl RemoteMcpManager {
         if guard.endpoint_url != server.endpoint_url {
             let endpoint =
                 Url::parse(&server.endpoint_url).context("parse remote mcp endpoint_url")?;
+            crate::net_policy::validate_mcp_endpoint_url(&endpoint)
+                .context("remote mcp endpoint_url violates egress policy")?;
             guard.client = HttpMcpClient::new(HttpMcpClientOptions::new(endpoint))?;
             guard.endpoint_url = server.endpoint_url.clone();
             guard.tools.clear();
             guard.fetched_at = None;
+            guard.compatibility_profile = None;
             guard.oauth_token_endpoint = None;
             guard.oauth_dpop_algs = None;
             guard.dpop_signer = None;
@@ -339,10 +370,51 @@ impl RemoteMcpManager {
 
         if !session.client.is_ready() {
             info!(server_id, "initializing remote mcp session");
-            let _ = session
+            let init = session
                 .client
                 .initialize("briefcased", env!("CARGO_PKG_VERSION"))
                 .await?;
+
+            let remote_profile = init
+                .capabilities
+                .get("briefcase")
+                .and_then(|v| v.get("compatibility_profile"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            session.compatibility_profile = remote_profile.clone();
+
+            if !self.profile_mode.strict_enforcement()
+                && let Some(p) = remote_profile
+                && p != COMPATIBILITY_PROFILE_VERSION
+            {
+                warn!(
+                    server_id,
+                    expected = COMPATIBILITY_PROFILE_VERSION,
+                    got = %p,
+                    "remote mcp server profile mismatch (allowed in non-GA mode)"
+                );
+            }
+        }
+
+        if self.profile_mode.strict_enforcement() {
+            match session.compatibility_profile.as_deref() {
+                Some(p) if p == COMPATIBILITY_PROFILE_VERSION => {}
+                Some(p) => {
+                    return Err(RemoteMcpCompatibilityError::ProfileMismatch {
+                        server_id: server_id.to_string(),
+                        expected: COMPATIBILITY_PROFILE_VERSION,
+                        got: p.to_string(),
+                    }
+                    .into());
+                }
+                None => {
+                    return Err(RemoteMcpCompatibilityError::MissingProfile {
+                        server_id: server_id.to_string(),
+                        expected: COMPATIBILITY_PROFILE_VERSION,
+                    }
+                    .into());
+                }
+            }
         }
 
         let list = session
@@ -470,6 +542,8 @@ impl RemoteMcpManager {
                 } else {
                     let endpoint = Url::parse(&server.endpoint_url)
                         .context("parse remote mcp endpoint_url")?;
+                    crate::net_policy::validate_mcp_endpoint_url(&endpoint)
+                        .context("remote mcp endpoint_url violates egress policy")?;
                     let d = self.oauth.discover(&endpoint).await?;
                     let dpop_algs = d
                         .dpop_signing_alg_values_supported

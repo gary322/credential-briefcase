@@ -2,6 +2,9 @@
 /target
 **/target
 
+# Release / evidence artifacts
+/dist
+
 # Node (if added later)
 node_modules
 

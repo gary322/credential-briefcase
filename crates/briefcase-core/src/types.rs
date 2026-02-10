@@ -4,6 +4,54 @@ use uuid::Uuid;
 
 pub type ToolId = String;
 
+pub const COMPATIBILITY_PROFILE_VERSION: &str = "aacp_v1";
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProfileMode {
+    Reference,
+    Staging,
+    Ga,
+}
+
+impl ProfileMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Reference => "reference",
+            Self::Staging => "staging",
+            Self::Ga => "ga",
+        }
+    }
+
+    pub fn strict_enforcement(self) -> bool {
+        matches!(self, Self::Ga)
+    }
+}
+
+impl std::str::FromStr for ProfileMode {
+    type Err = &'static str;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let s = s.trim();
+        if s.eq_ignore_ascii_case("reference") {
+            return Ok(Self::Reference);
+        }
+        if s.eq_ignore_ascii_case("staging") {
+            return Ok(Self::Staging);
+        }
+        if s.eq_ignore_ascii_case("ga") {
+            return Ok(Self::Ga);
+        }
+        Err("expected one of: reference, staging, ga")
+    }
+}
+
+impl Default for ProfileMode {
+    fn default() -> Self {
+        Self::Reference
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolCategory {

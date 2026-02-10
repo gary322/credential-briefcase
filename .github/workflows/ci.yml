@@ -3,6 +3,7 @@ name: ci
 on:
   push:
   pull_request:
+  workflow_dispatch:
 
 jobs:
   test:
@@ -43,6 +44,10 @@ jobs:
         shell: bash
         run: pnpm -r test
 
+      - name: Validate support matrix / ops scripts
+        shell: bash
+        run: bash scripts/validate_support_matrix.sh
+
       - name: briefcase-extension build artifacts (must be committed)
         if: matrix.os == 'ubuntu-latest'
         shell: bash
@@ -64,6 +69,23 @@ jobs:
 
       - name: Cargo test
         run: cargo test --all
+
+      - name: GA qualification evidence (provider contract)
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/ga_qualification.sh --mode ci --label "${GITHUB_SHA}" --dist-dir dist
+
+      - name: Upload GA qualification artifacts
+        if: matrix.os == 'ubuntu-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ga-qualification
+          path: |
+            dist/ga-qualification-*.json
+            dist/ga-qualification-*.tar.gz
+            dist/provider-contract-*.json
 
       - name: briefcase-keys (apple backend)
         if: matrix.os == 'macos-latest'

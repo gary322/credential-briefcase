@@ -36,6 +36,11 @@ struct Args {
     #[arg(long, env = "BRIEFCASE_DAEMON_UNIX_SOCKET")]
     unix_socket: Option<PathBuf>,
 
+    /// Override the Windows named pipe path (Windows only), e.g. `\\\\.\\pipe\\briefcased-...`.
+    #[cfg(windows)]
+    #[arg(long, env = "BRIEFCASE_DAEMON_NAMED_PIPE")]
+    named_pipe: Option<String>,
+
     /// Override the daemon auth token (otherwise read from <data_dir>/auth_token).
     #[arg(long, env = "BRIEFCASE_AUTH_TOKEN")]
     auth_token: Option<String>,
@@ -82,9 +87,16 @@ async fn main() -> anyhow::Result<()> {
                     .unwrap_or_else(|| data_dir.join("briefcased.sock"));
                 DaemonEndpoint::Unix { socket_path }
             }
-            #[cfg(not(unix))]
+            #[cfg(windows)]
             {
-                anyhow::bail!("unix sockets not supported; set --daemon-base-url");
+                let pipe_name = args
+                    .named_pipe
+                    .unwrap_or_else(|| briefcase_api::default_named_pipe_name(&auth_token));
+                DaemonEndpoint::NamedPipe { pipe_name }
+            }
+            #[cfg(all(not(unix), not(windows)))]
+            {
+                anyhow::bail!("no default IPC transport on this platform; set --daemon-base-url");
             }
         }
     };

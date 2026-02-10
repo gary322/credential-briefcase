@@ -36,6 +36,13 @@ struct Args {
     #[cfg(unix)]
     #[arg(long, env = "BRIEFCASE_UNIX_SOCKET")]
     unix_socket: Option<PathBuf>,
+
+    /// Connect to the daemon over a Windows named pipe.
+    ///
+    /// Default (Windows only): derived from the daemon auth token.
+    #[cfg(windows)]
+    #[arg(long, env = "BRIEFCASE_NAMED_PIPE")]
+    named_pipe: Option<String>,
 }
 
 fn resolve_data_dir(cli: Option<&Path>) -> anyhow::Result<PathBuf> {
@@ -56,21 +63,12 @@ fn load_auth_token(path: &Path) -> anyhow::Result<String> {
     Ok(tok)
 }
 
-fn resolve_endpoint(args: &Args, _data_dir: &Path) -> anyhow::Result<DaemonEndpoint> {
-    #[cfg(unix)]
-    {
-        if let Some(p) = &args.unix_socket {
-            return Ok(DaemonEndpoint::Unix {
-                socket_path: p.clone(),
-            });
-        }
-        let default_sock = _data_dir.join("briefcased.sock");
-        if default_sock.exists() {
-            return Ok(DaemonEndpoint::Unix {
-                socket_path: default_sock,
-            });
-        }
-    }
+fn resolve_endpoint(
+    args: &Args,
+    data_dir: &Path,
+    auth_token: &str,
+) -> anyhow::Result<DaemonEndpoint> {
+    let _ = auth_token; // Used for Windows named-pipe defaulting.
 
     if let Some(base_url) = &args.tcp_base_url {
         return Ok(DaemonEndpoint::Tcp {
@@ -78,8 +76,32 @@ fn resolve_endpoint(args: &Args, _data_dir: &Path) -> anyhow::Result<DaemonEndpo
         });
     }
 
+    #[cfg(unix)]
+    {
+        if let Some(p) = &args.unix_socket {
+            return Ok(DaemonEndpoint::Unix {
+                socket_path: p.clone(),
+            });
+        }
+        let default_sock = data_dir.join("briefcased.sock");
+        if default_sock.exists() {
+            return Ok(DaemonEndpoint::Unix {
+                socket_path: default_sock,
+            });
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        let pipe_name = args
+            .named_pipe
+            .clone()
+            .unwrap_or_else(|| briefcase_api::default_named_pipe_name(auth_token));
+        return Ok(DaemonEndpoint::NamedPipe { pipe_name });
+    }
+
     anyhow::bail!(
-        "no daemon endpoint configured (set BRIEFCASE_UNIX_SOCKET or BRIEFCASE_TCP_BASE_URL)"
+        "no daemon endpoint configured (set BRIEFCASE_UNIX_SOCKET, BRIEFCASE_TCP_BASE_URL, or BRIEFCASE_NAMED_PIPE)"
     );
 }
 
@@ -96,13 +118,13 @@ async fn main() -> anyhow::Result<()> {
 
     let args = Args::parse();
     let data_dir = resolve_data_dir(args.data_dir.as_deref())?;
-    let endpoint = resolve_endpoint(&args, &data_dir)?;
     let auth_token_path = args
         .auth_token_path
         .clone()
         .unwrap_or_else(|| data_dir.join("auth_token"));
 
     let auth_token = load_auth_token(&auth_token_path)?;
+    let endpoint = resolve_endpoint(&args, &data_dir, &auth_token)?;
     let client = BriefcaseClient::new(endpoint, auth_token);
 
     // Eager check so failures happen before we block waiting for messages.

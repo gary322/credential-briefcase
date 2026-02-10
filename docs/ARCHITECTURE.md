@@ -8,6 +8,17 @@ Provide a "credential briefcase" where:
 - secrets are not exposed to the agent runtime
 - tool calls are policy-bounded and auditable
 
+## Reference vs GA contract
+
+This repo contains both:
+
+- **GA contract surfaces**: `briefcased` (enforcement + custody) and `mcp-gateway` (the only agent-facing MCP surface).
+- **Reference implementations** (useful in production, but not the cross-vendor contract itself):
+  - `agent-access-gateway` (provider-side reference gateway)
+  - `briefcase-control-plane` (enterprise reference control plane)
+
+The cross-component interoperability contract is the **Agentic Auth Compatibility Profile** (`aacp_v1`) defined in `docs/COMPATIBILITY_PROFILE.md` and enforced most strictly in `BRIEFCASE_PROFILE_MODE=ga`.
+
 ## Components
 
 1. `briefcased` (daemon, enforcement point)
@@ -61,7 +72,10 @@ Provide a "credential briefcase" where:
 ## Data Flow (Happy Path)
 
 1. Agent calls `tools/call` on `mcp-gateway`.
-2. Gateway forwards to `briefcased` via local API with a session token.
+2. Gateway forwards to `briefcased` via local IPC with a session token:
+   - Unix: domain socket (default)
+   - Windows: named pipe (default)
+   - TCP loopback is supported as a fallback (`BRIEFCASE_TCP_ADDR`)
 3. Daemon validates args, evaluates policy and budgets, runs sandboxed execution, and executes connector.
 4. Daemon stores a receipt and returns a redacted result with provenance.
 
@@ -74,6 +88,7 @@ Provide a "credential briefcase" where:
    - `kind=mobile_signer`: via a paired mobile signer (signature-based auth).
    This yields an `approval_token`.
 4. Tool call is retried with the `approval_token`.
+   - On MCP, pass this as `tools/call` `approvalToken`.
 
 ## Provider Auth Strategy
 
@@ -84,3 +99,19 @@ For tools that call a provider connector, the daemon prefers:
 3. Micropayment challenge (x402 / l402 demo), then fetch capability
 
 The agent only ever receives redacted tool outputs and provenance; raw secrets remain inside the daemon.
+
+## Compatibility Profile
+
+The platform exposes a versioned compatibility profile (`aacp_v1`) and runtime mode:
+
+- `reference`
+- `staging`
+- `ga`
+
+Mode/profile can be discovered via daemon APIs:
+
+- `GET /v1/identity`
+- `GET /v1/profile`
+- `GET /v1/diagnostics/compat`
+
+See `docs/COMPATIBILITY_PROFILE.md` for normative requirements.

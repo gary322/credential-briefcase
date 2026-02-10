@@ -9,20 +9,23 @@ use hyper::body::Incoming;
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
+#[cfg(windows)]
+use hyper_util::rt::TokioIo;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use thiserror::Error;
 
 use crate::types::{
     AiAnomaliesResponse, ApproveResponse, BudgetRecord, CallToolRequest, CallToolResponse,
-    ControlPlaneEnrollRequest, ControlPlaneStatusResponse, ControlPlaneSyncResponse,
-    DeleteMcpServerResponse, DeleteProviderResponse, ErrorResponse, FetchVcResponse,
-    IdentityResponse, ListApprovalsResponse, ListBudgetsResponse, ListMcpServersResponse,
-    ListProvidersResponse, ListReceiptsResponse, ListToolsResponse, McpOAuthExchangeRequest,
-    McpOAuthExchangeResponse, McpOAuthStartRequest, McpOAuthStartResponse, McpServerSummary,
-    OAuthExchangeRequest, OAuthExchangeResponse, PolicyApplyResponse, PolicyCompileRequest,
-    PolicyCompileResponse, PolicyGetResponse, ProviderSummary, RevokeMcpOAuthResponse,
-    RevokeProviderOAuthResponse, SetBudgetRequest, SignerPairCompleteRequest,
+    CompatibilityDiagnosticsResponse, ControlPlaneEnrollRequest, ControlPlaneStatusResponse,
+    ControlPlaneSyncResponse, DeleteMcpServerResponse, DeleteProviderResponse, ErrorResponse,
+    FetchVcResponse, IdentityResponse, ListApprovalsResponse, ListBudgetsResponse,
+    ListMcpServersResponse, ListProvidersResponse, ListReceiptsResponse, ListToolsResponse,
+    McpOAuthExchangeRequest, McpOAuthExchangeResponse, McpOAuthStartRequest, McpOAuthStartResponse,
+    McpServerSummary, OAuthExchangeRequest, OAuthExchangeResponse, PolicyApplyResponse,
+    PolicyCompileRequest, PolicyCompileResponse, PolicyGetResponse, ProfileResponse,
+    ProviderSummary, RevokeMcpOAuthResponse, RevokeProviderOAuthResponse,
+    SecurityDiagnosticsResponse, SetBudgetRequest, SignerPairCompleteRequest,
     SignerPairCompleteResponse, SignerPairStartResponse, UpsertMcpServerRequest,
     UpsertProviderRequest, VerifyReceiptsResponse,
 };
@@ -35,6 +38,11 @@ pub enum DaemonEndpoint {
     #[cfg(unix)]
     Unix {
         socket_path: PathBuf,
+    },
+    #[cfg(windows)]
+    NamedPipe {
+        /// Full Windows named pipe path, e.g. `\\\\.\\pipe\\briefcased`.
+        pipe_name: String,
     },
 }
 
@@ -77,6 +85,22 @@ impl BriefcaseClient {
 
     pub async fn identity(&self) -> Result<IdentityResponse, BriefcaseClientError> {
         self.get_json("/v1/identity").await
+    }
+
+    pub async fn profile(&self) -> Result<ProfileResponse, BriefcaseClientError> {
+        self.get_json("/v1/profile").await
+    }
+
+    pub async fn compat_diagnostics(
+        &self,
+    ) -> Result<CompatibilityDiagnosticsResponse, BriefcaseClientError> {
+        self.get_json("/v1/diagnostics/compat").await
+    }
+
+    pub async fn security_diagnostics(
+        &self,
+    ) -> Result<SecurityDiagnosticsResponse, BriefcaseClientError> {
+        self.get_json("/v1/diagnostics/security").await
     }
 
     pub async fn control_plane_status(
@@ -375,6 +399,8 @@ impl BriefcaseClient {
                 let u = hyperlocal::Uri::new(socket_path, path);
                 u.into()
             }
+            #[cfg(windows)]
+            DaemonEndpoint::NamedPipe { .. } => format!("http://localhost{path}").parse()?,
         };
 
         let mut builder = Request::builder()
@@ -416,6 +442,29 @@ impl BriefcaseClient {
                     Client::builder(TokioExecutor::new()).build(hyperlocal::UnixConnector);
                 client
                     .request(req)
+                    .await
+                    .map_err(|e| BriefcaseClientError::Http(e.to_string()))?
+            }
+            #[cfg(windows)]
+            DaemonEndpoint::NamedPipe { pipe_name } => {
+                use tokio::net::windows::named_pipe::ClientOptions;
+
+                let pipe = ClientOptions::new()
+                    .open(pipe_name)
+                    .map_err(|e| BriefcaseClientError::Http(e.to_string()))?;
+
+                let io = TokioIo::new(pipe);
+                let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
+                    .await
+                    .map_err(|e| BriefcaseClientError::Http(e.to_string()))?;
+
+                // Drive the connection in the background.
+                tokio::spawn(async move {
+                    let _ = conn.await;
+                });
+
+                sender
+                    .send_request(req)
                     .await
                     .map_err(|e| BriefcaseClientError::Http(e.to_string()))?
             }

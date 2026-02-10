@@ -1,9 +1,29 @@
+use std::net::SocketAddr;
+
 use axum::body::Body;
+use axum::extract::ConnectInfo;
 use axum::extract::State;
 use axum::http::{Request, StatusCode};
 use axum::middleware::Next;
 use axum::response::Response;
 use subtle::ConstantTimeEq;
+
+pub async fn require_loopback(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    if !addr.ip().is_loopback() {
+        return Response::builder()
+            .status(StatusCode::FORBIDDEN)
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"code":"forbidden","message":"loopback_only"}"#,
+            ))
+            .unwrap_or_else(|_| Response::new(Body::empty()));
+    }
+    next.run(request).await
+}
 
 pub async fn require_auth(
     State(auth_token): State<String>,

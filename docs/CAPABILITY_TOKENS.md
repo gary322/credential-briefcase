@@ -1,48 +1,76 @@
-# Capability Tokens (v0.1)
+# Capability Tokens (AACP v1)
 
 ## Purpose
 
-Providers should return **short-lived, caveated capability tokens** to minimize blast radius:
+Providers should return short-lived, caveated capability tokens to limit blast radius:
 
 - short TTL (minutes)
 - endpoint/tool scope
-- max calls / max bytes
-- proof-of-possession (PoP) binding
+- call limits and usage caveats
+- proof-of-possession (PoP) binding when supported
 
-## Reference Implementation
+## Profile contract (AACP v1)
+
+The following are treated as **stable** interoperability points under `aacp_v1`:
+
+- Providers SHOULD include a compatibility marker on responses:
+  - Response header: `x-briefcase-compatibility-profile: aacp_v1`
+  - Token response field: `compatibility_profile: "aacp_v1"`
+- Capability JWTs SHOULD include:
+  - `exp` / `iat`
+  - `jti` (used for metering/revocation and replay-adjacent audit)
+  - `scope` (resource/tool scope)
+  - `max_calls` (usage caveat when supported)
+- If PoP binding is used, capabilities MUST be bound using `cnf.jkt` and verified with DPoP proofs on protected calls.
+
+Additional claims/fields may exist, but should be treated as **non-contractual** unless explicitly documented as profile-governed.
+
+## Reference implementation
 
 `apps/agent-access-gateway` issues JWT capability tokens with:
 
 - `exp` / `iat`
 - `jti` (usage metering key)
-- `scope` (e.g. `quote`)
+- `scope` (for example `quote`)
 - `max_calls`
-- `cost_microusd` (for demo metering)
-- `pop_pk_b64` (optional): Ed25519 public key (base64url-no-pad) that must sign each request
+- `cost_microusd` (reference metering field; not required for interop)
+- `cnf.jkt` (optional): JWK thumbprint for DPoP-bound capabilities
 
-`briefcased` caches capability tokens and uses them to call the provider.
+`briefcased` caches capability tokens and uses them for provider calls.
 
-## PoP Binding (v0.1)
+### Profile markers
 
-To bind a capability to a client key (DPoP-like):
+Provider gateways should include a stable compatibility marker so clients can detect mismatches:
 
-1. `briefcased` includes `x-briefcase-pop-pub: <pk_b64url>` on `/token` requests.
-2. The provider mints a capability with `pop_pk_b64`.
-3. For each protected API call, the client includes:
+- Response header: `x-briefcase-compatibility-profile: aacp_v1`
+- Token response field: `compatibility_profile: "aacp_v1"`
 
-- `x-briefcase-pop-ver: 1`
-- `x-briefcase-pop-ts: <unix_seconds>`
-- `x-briefcase-pop-nonce: <random_b64url>`
-- `x-briefcase-pop-sig: <ed25519_sig_b64url>`
+## PoP binding
 
-Signature message:
+The preferred PoP mechanism is DPoP:
 
-```
-v1\n<METHOD>\n<PATH?QUERY>\n<TS>\n<NONCE>\n<SHA256_B64URL(CAPABILITY_JWT)>
-```
+1. Client includes `DPoP` proof when requesting `/token`.
+2. Provider derives the proof key thumbprint and mints capability with `cnf.jkt`.
+3. For each protected API call, client sends:
+   - `Authorization: DPoP <capability_jwt>`
+   - `DPoP: <proof_jwt>`
+4. Provider verifies:
+   - proof method + URL binding
+   - `ath` binding to the presented access token
+   - `jti` replay defense window
+   - key thumbprint equals `cnf.jkt`
 
-The provider verifies the signature and enforces nonce uniqueness to prevent replay.
+Legacy compatibility path:
 
-## Planned / Future
+- `x-briefcase-pop-pub` is accepted by the reference provider for backward compatibility and mapped to a `cnf.jkt` value.
 
-- macaroon-like caveats and attenuation profiles
+## Replay defense
+
+Providers must enforce replay protection for DPoP proofs and payment nonces.
+The reference gateway keeps bounded replay caches and rejects reused identifiers.
+
+## Notes
+
+- Capability tokens are bearer-like unless PoP-bound.
+- Capability revocation and max-call exhaustion are treated as authorization failures.
+- Breaking claim/behavior changes require a new compatibility profile version.

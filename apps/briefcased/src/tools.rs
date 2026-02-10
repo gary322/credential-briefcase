@@ -409,6 +409,9 @@ impl HttpHandler for QuoteSandboxHttpHandler {
             .context("unknown provider_id")?;
 
         let parsed = Url::parse(&base_url).context("parse provider base_url")?;
+        if let Err(e) = crate::net_policy::validate_provider_base_url(&parsed) {
+            anyhow::bail!("sandbox violation: provider base_url violates egress policy: {e}");
+        }
         if !self.policy.allows_url(&parsed) {
             anyhow::bail!("sandbox violation: egress denied");
         }

@@ -1,10 +1,42 @@
-use briefcase_core::{ApprovalRequest, ReceiptRecord, ToolCall, ToolResult, ToolSpec};
+use briefcase_core::{ApprovalRequest, ProfileMode, ReceiptRecord, ToolCall, ToolResult, ToolSpec};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IdentityResponse {
     pub did: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_mode: Option<ProfileMode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compatibility_profile: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProfileResponse {
+    pub mode: ProfileMode,
+    pub compatibility_profile: String,
+    pub strict_enforcement: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompatibilityCheck {
+    pub name: String,
+    pub ok: bool,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompatibilityDiagnosticsResponse {
+    pub mode: ProfileMode,
+    pub compatibility_profile: String,
+    pub checks: Vec<CompatibilityCheck>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecurityDiagnosticsResponse {
+    pub mode: ProfileMode,
+    pub compatibility_profile: String,
+    pub checks: Vec<CompatibilityCheck>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

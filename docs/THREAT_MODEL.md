@@ -1,36 +1,56 @@
-# Threat Model (v0.1)
+# Threat Model (AACP v1)
 
 ## Assumptions
 
-- The LLM is untrusted and may be prompt-injected.
-- Tool outputs are untrusted (output poisoning).
-- The local machine is the trust boundary; other local processes should not gain access to secrets by default.
+- The LLM runtime is untrusted and may be prompt-injected.
+- Tool outputs are untrusted and may attempt output poisoning.
+- Remote MCP and provider services may be malicious or compromised.
+- Local host hardening differs by OS and deployment profile.
 
-## Goals
+## Security goals
 
-- Never provide raw long-lived secrets (refresh tokens, private keys) to the agent runtime.
-- Minimize blast radius with approvals, budgets, and short-lived capability tokens.
-- Provide auditability via tamper-evident receipts.
+- Never expose raw long-lived secrets to agent-facing surfaces.
+- Keep authorization decisions authoritative in policy/budget/approval engines.
+- Minimize blast radius using short-lived caveated capabilities + PoP + replay defenses.
+- Produce auditable, tamper-evident execution records.
 
-## Key Controls Implemented
+## Trust boundaries
 
-- **Local auth token**: `briefcased` requires `Authorization: Bearer <token>` for its API. Token is stored on disk with restrictive permissions on Unix.
-- **Secret storage**: refresh tokens and private key material are stored via `briefcase-secrets` (keyring by default; encrypted-file backend supported).
-- **Hardware-backed keys (where available)**: signing keys can be non-exportable (PKCS#11/TPM2/Secure Enclave/CNG; optional remote signer for enterprise mode).
-- **Policy gating**: Cedar allow/deny + derived "require approval" via a stricter action.
-- **Risk scoring**: non-authoritative heuristics (and optional HTTP classifier) can require approval for suspicious calls.
-- **Budgets**: category-based daily limits; overruns require approval.
-- **Schema validation**: tool args validated against JSON Schema before execution.
-- **Tool isolation**: per-tool deny-by-default network/filesystem using a WASM sandbox + explicit allowlists.
-- **Output firewall**: allowlisted paths/fields for tool output where configured.
-- **Receipts**: every tool call produces a chained-hash receipt record.
-- **Capability tokens**: provider issues short-lived JWTs with caveats (`max_calls`, TTL) and optional PoP binding + replay defense.
-- **Trusted approval surfaces**: extension/CLI/UI for local approvals; optional mobile signer for high-risk approvals (signature-based auth).
-- **Local UI proxy**: `briefcase-ui` proxies to the daemon and enforces a per-process CSRF token for write actions.
-- **Remote MCP routing**: remote MCP servers are accessed by `briefcased` (as a client) so policy/receipts still apply.
+- Trusted boundary: `briefcased` daemon + secret/key stores + policy engine + receipt store.
+- Agent boundary: `mcp-gateway` is the only agent-facing MCP server.
+- Admin boundary: CLI/UI/extension/mobile signer are approval/admin surfaces, not secret exfiltration channels.
 
-## Known Gaps / Planned Hardening
+## Key controls
 
-- Multi-user machines: the local-first model assumes per-user install; additional OS-level isolation may be needed for shared hosts.
-- Packaging hardening: default install/service recipes are provided, but production deployments should review platform-specific service isolation.
-- Windows local IPC: the daemon defaults to loopback TCP; named pipe support is a planned improvement.
+- Bearer-authenticated daemon APIs with constant-time token comparison.
+- Secret storage abstraction (`keyring`/encrypted file; memory backend only for tests/dev).
+- Non-exportable signing key backends where supported.
+- JSON-schema validation before tool execution.
+- Cedar policy allow/deny + approval derivation semantics.
+- Risk scoring is non-authoritative and can only tighten to approval.
+- Category budgets and approval overrides.
+- Per-tool sandbox deny-by-default egress/filesystem policies.
+- Output firewall filtering before agent-visible return values.
+- Chained-hash receipts for all tool-call outcomes.
+- Capability tokens with TTL/max_calls and optional DPoP `cnf.jkt` binding.
+- Replay protection for DPoP JTIs and payment nonces.
+
+## Residual risks
+
+- Shared/multi-user hosts require additional OS isolation hardening.
+- Windows local IPC currently uses loopback TCP; named-pipe hardening remains planned.
+- Profile `reference` mode allows less strict defaults for developer ergonomics.
+- Third-party provider correctness still depends on external contract adherence.
+
+## Deployment profiles
+
+- `reference`: dev/demo profile, permissive local assumptions.
+- `staging`: pre-production verification profile.
+- `ga`: production profile, strict compatibility/security expectations.
+
+## Validation strategy
+
+- CI quality gates: fmt/clippy/tests.
+- Adversarial regressions: secret canary + replay + approval-binding paths.
+- Receipt integrity checks in daemon and control-plane pathways.
+- Release evidence: signed artifacts, SBOM, and compatibility docs.

@@ -9,6 +9,13 @@ A production-grade, open-source reference implementation of a **credential brief
 
 This repo is a practical answer to: "How do I let agents use powerful tools, OAuth, paid APIs, and remote MCP servers without handing them credentials or a blank check?"
 
+## Reference vs GA Contract
+
+- The **trusted boundary** is `briefcased` (custody + enforcement) plus `mcp-gateway` (the only agent-facing MCP surface).
+- The interoperability contract is the **Agentic Auth Compatibility Profile**: `aacp_v1` (see `docs/COMPATIBILITY_PROFILE.md`).
+  - `BRIEFCASE_PROFILE_MODE=ga` enables the strict production behavior required by that contract.
+- `agent-access-gateway` and `briefcase-control-plane` are **reference implementations** and conformance targets that help providers/enterprises integrate without bespoke assumptions.
+
 ## Why This Exists
 
 Tool-using agents create a sharp new security problem:
@@ -191,7 +198,8 @@ This keeps all runtime state in a local directory you can delete safely:
 ```bash
 export BRIEFCASE_DATA_DIR="$PWD/.briefcase"
 export BRIEFCASE_SECRET_BACKEND=file
-export BRIEFCASE_MASTER_PASSPHRASE='dev-passphrase-change-me'
+export BRIEFCASE_MASTER_PASSPHRASE='<dev-passphrase>'
+export BRIEFCASE_PROFILE_MODE=reference
 
 cargo run -p briefcased
 ```
@@ -236,6 +244,21 @@ export BRIEFCASE_DATA_DIR="$PWD/.briefcase"
 export BRIEFCASE_MCP_HTTP_ADDR="127.0.0.1:8888"
 cargo run -p mcp-gateway -- --no-stdio
 ```
+
+## Production Mode
+
+For strict production enforcement, run `briefcased` in `ga` mode:
+
+```bash
+export BRIEFCASE_PROFILE_MODE=ga
+export BRIEFCASE_STRICT_HOST=1
+```
+
+Release and GA evidence gates (see `docs/RELEASING.md`):
+
+- Generate a release-grade evidence bundle: `bash scripts/ga_qualification.sh --mode release --label vX.Y.Z`
+- Generate a staging soak report (JSON): `briefcase diagnostics soak --duration-secs 3600 --interval-ms 1000 --tool quote --out dist/soak-report.json`
+- For the final GA cut (`v1.0.0`), fill `docs/GA_SIGNOFF_v1.0.0.md` with named approvers.
 
 ## Testing
 
@@ -301,6 +324,7 @@ Docs:
 - `docs/THREAT_MODEL.md`
 - `docs/POLICY.md`
 - `docs/CAPABILITY_TOKENS.md`
+- `docs/COMPATIBILITY_PROFILE.md`
 - `docs/PAIRING.md`
 - `docs/OBSERVABILITY.md`
 - `docs/AI_SAFETY.md`

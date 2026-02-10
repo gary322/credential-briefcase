@@ -80,6 +80,8 @@ pub struct CallToolParams {
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub arguments: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approval_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -99,4 +101,27 @@ pub struct CallToolResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "_meta")]
     pub meta: Option<serde_json::Value>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn call_tool_params_roundtrip_with_approval_token() {
+        let p = CallToolParams {
+            name: "note_add".to_string(),
+            arguments: Some(serde_json::json!({ "text": "hi" })),
+            approval_token: Some("00000000-0000-0000-0000-000000000000".to_string()),
+        };
+        let v = serde_json::to_value(&p).expect("serialize");
+        assert_eq!(
+            v.get("approvalToken")
+                .and_then(|x| x.as_str())
+                .expect("approvalToken string"),
+            "00000000-0000-0000-0000-000000000000"
+        );
+        let got: CallToolParams = serde_json::from_value(v).expect("deserialize");
+        assert_eq!(got.approval_token.as_deref(), p.approval_token.as_deref());
+    }
 }

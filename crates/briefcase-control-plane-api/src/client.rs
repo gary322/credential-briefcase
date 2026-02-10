@@ -29,7 +29,7 @@ impl ControlPlaneClient {
     }
 
     pub async fn health(&self) -> anyhow::Result<HealthResponse> {
-        self.get_json("/health", None::<&str>).await
+        self.get_json("/health", None::<&str>, None).await
     }
 
     pub async fn admin_set_policy(
@@ -37,7 +37,7 @@ impl ControlPlaneClient {
         admin_token: &str,
         req: AdminSetPolicyRequest,
     ) -> anyhow::Result<AdminSetPolicyResponse> {
-        self.post_json("/v1/admin/policy", Some(admin_token), req)
+        self.post_json("/v1/admin/policy", Some(admin_token), None, req)
             .await
     }
 
@@ -46,7 +46,7 @@ impl ControlPlaneClient {
         admin_token: &str,
         req: EnrollDeviceRequest,
     ) -> anyhow::Result<EnrollDeviceResponse> {
-        self.post_json("/v1/admin/devices/enroll", Some(admin_token), req)
+        self.post_json("/v1/admin/devices/enroll", Some(admin_token), None, req)
             .await
     }
 
@@ -54,10 +54,12 @@ impl ControlPlaneClient {
         &self,
         device_id: &Uuid,
         device_token: &str,
+        dpop_proof: Option<&str>,
     ) -> anyhow::Result<DevicePolicyResponse> {
         self.get_json(
             &format!("/v1/devices/{device_id}/policy"),
             Some(device_token),
+            dpop_proof,
         )
         .await
     }
@@ -66,11 +68,13 @@ impl ControlPlaneClient {
         &self,
         device_id: &Uuid,
         device_token: &str,
+        dpop_proof: Option<&str>,
         req: UploadReceiptsRequest,
     ) -> anyhow::Result<UploadReceiptsResponse> {
         self.post_json(
             &format!("/v1/devices/{device_id}/receipts"),
             Some(device_token),
+            dpop_proof,
             req,
         )
         .await
@@ -84,6 +88,7 @@ impl ControlPlaneClient {
         self.get_json(
             &format!("/v1/devices/{device_id}/remote-signer"),
             Some(device_token),
+            None,
         )
         .await
     }
@@ -97,6 +102,7 @@ impl ControlPlaneClient {
         self.post_json(
             &format!("/v1/devices/{device_id}/remote-signer/sign"),
             Some(device_token),
+            None,
             req,
         )
         .await
@@ -121,26 +127,31 @@ impl ControlPlaneClient {
                 qp.append_pair("device_id", &id.to_string());
             }
         }
-        self.get_json_absolute(url, Some(auditor_token)).await
+        self.get_json_absolute(url, Some(auditor_token), None).await
     }
 
     async fn get_json<T: DeserializeOwned>(
         &self,
         path: &str,
         token: Option<&str>,
+        dpop_proof: Option<&str>,
     ) -> anyhow::Result<T> {
         let url = self.base_url.join(path).context("join url")?;
-        self.get_json_absolute(url, token).await
+        self.get_json_absolute(url, token, dpop_proof).await
     }
 
     async fn get_json_absolute<T: DeserializeOwned>(
         &self,
         url: Url,
         token: Option<&str>,
+        dpop_proof: Option<&str>,
     ) -> anyhow::Result<T> {
         let mut req = self.http.get(url).header("accept", "application/json");
         if let Some(t) = token {
             req = req.header(reqwest::header::AUTHORIZATION, format!("Bearer {t}"));
+        }
+        if let Some(p) = dpop_proof {
+            req = req.header("dpop", p);
         }
         let resp = req.send().await.context("send request")?;
         parse_json_response(resp).await
@@ -150,6 +161,7 @@ impl ControlPlaneClient {
         &self,
         path: &str,
         token: Option<&str>,
+        dpop_proof: Option<&str>,
         body: Req,
     ) -> anyhow::Result<Res> {
         let url = self.base_url.join(path).context("join url")?;
@@ -160,6 +172,9 @@ impl ControlPlaneClient {
             .json(&body);
         if let Some(t) = token {
             req = req.header(reqwest::header::AUTHORIZATION, format!("Bearer {t}"));
+        }
+        if let Some(p) = dpop_proof {
+            req = req.header("dpop", p);
         }
         let resp = req.send().await.context("send request")?;
         parse_json_response(resp).await

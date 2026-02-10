@@ -4,12 +4,15 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Context as _;
+use axum::body::Body;
 use axum::extract::{Form, Query, State};
-use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri};
+use axum::http::{HeaderMap, HeaderValue, Request, StatusCode, Uri};
+use axum::middleware::Next;
 use axum::response::{IntoResponse as _, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::Engine as _;
+use briefcase_core::COMPATIBILITY_PROFILE_VERSION;
 use briefcase_dpop::{jwk_thumbprint_b64url, verify_dpop_jwt};
 use briefcase_payments::x402 as x402_v2;
 use chrono::{DateTime, Utc};
@@ -28,8 +31,12 @@ use uuid::Uuid;
 type HmacSha256 = Hmac<Sha256>;
 
 const HEADER_BRIEFCASE_ERROR: &str = "x-briefcase-error";
+const HEADER_BRIEFCASE_COMPATIBILITY_PROFILE: &str = "x-briefcase-compatibility-profile";
 const BRIEFCASE_ERROR_CAPABILITY_REVOKED: &str = "capability_revoked";
+const BRIEFCASE_ERROR_REPLAY_DETECTED: &str = "replay_detected";
 const HEADER_AAG_ADMIN_SECRET: &str = "x-aag-admin-secret";
+const MAX_DPOP_REPLAY_ENTRIES: usize = 20_000;
+const MAX_X402_NONCE_ENTRIES: usize = 20_000;
 
 // x402 v2 offer defaults for the reference provider gateway.
 const X402_V2_NETWORK: &str = "eip155:84532"; // Base Sepolia
@@ -187,6 +194,7 @@ struct TokenResponse {
     token: String,
     expires_at_rfc3339: String,
     max_calls: i64,
+    compatibility_profile: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -419,6 +427,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/vc/issue", post(vc_issue))
         .route("/api/revoke", post(revoke))
         .route("/api/quote", get(quote))
+        .layer(axum::middleware::from_fn(attach_profile_headers))
         .layer(TraceLayer::new_for_http())
         .with_state(st);
 
@@ -430,6 +439,22 @@ async fn main() -> anyhow::Result<()> {
 
 async fn health() -> Json<serde_json::Value> {
     Json(serde_json::json!({"status":"ok"}))
+}
+
+async fn attach_profile_headers(req: Request<Body>, next: Next) -> Response {
+    let mut resp = next.run(req).await;
+    resp.headers_mut().insert(
+        HEADER_BRIEFCASE_COMPATIBILITY_PROFILE,
+        HeaderValue::from_static(COMPATIBILITY_PROFILE_VERSION),
+    );
+    resp
+}
+
+fn briefcase_error(status: StatusCode, code: &'static str) -> Response {
+    let mut resp = (status, Json(serde_json::json!({ "error": code }))).into_response();
+    resp.headers_mut()
+        .insert(HEADER_BRIEFCASE_ERROR, HeaderValue::from_static(code));
+    resp
 }
 
 async fn oauth_authorize(
@@ -597,14 +622,31 @@ fn prune_used_dpop_jtis(used: &mut HashMap<String, i64>) {
     let now = Utc::now().timestamp();
     // Capability TTL is 10 minutes; keep DPoP JTIs a bit longer.
     let cutoff = now - (20 * 60);
-    used.retain(|_, iat| *iat >= cutoff);
+    prune_and_cap_replay_cache(used, cutoff, MAX_DPOP_REPLAY_ENTRIES);
 }
 
 fn prune_used_x402_nonces(used: &mut HashMap<String, i64>) {
     let now = Utc::now().timestamp();
     // x402 authorizations are short-lived; keep a bounded replay cache.
     let cutoff = now - (60 * 60);
+    prune_and_cap_replay_cache(used, cutoff, MAX_X402_NONCE_ENTRIES);
+}
+
+fn prune_and_cap_replay_cache(used: &mut HashMap<String, i64>, cutoff: i64, max_entries: usize) {
     used.retain(|_, iat| *iat >= cutoff);
+    if used.len() <= max_entries {
+        return;
+    }
+
+    let mut by_age = used
+        .iter()
+        .map(|(k, ts)| (k.clone(), *ts))
+        .collect::<Vec<_>>();
+    by_age.sort_by_key(|(_, ts)| *ts);
+    let to_remove = used.len().saturating_sub(max_entries);
+    for (k, _) in by_age.into_iter().take(to_remove) {
+        let _ = used.remove(&k);
+    }
 }
 
 fn prune_revoked_capabilities(revoked: &mut HashMap<String, i64>) {
@@ -672,7 +714,13 @@ async fn token(State(st): State<AppState>, uri: Uri, headers: HeaderMap) -> Resp
             prune_used_dpop_jtis(&mut used);
             match verify_dpop_jwt(dpop, "POST", &expected_url, None, None, &mut used) {
                 Ok(jwk) => jwk,
-                Err(_) => {
+                Err(e) => {
+                    if e.to_string().contains("replayed jti") {
+                        return briefcase_error(
+                            StatusCode::CONFLICT,
+                            BRIEFCASE_ERROR_REPLAY_DETECTED,
+                        );
+                    }
                     return (
                         StatusCode::BAD_REQUEST,
                         Json(serde_json::json!({"error":"invalid_dpop"})),
@@ -822,11 +870,10 @@ async fn token(State(st): State<AppState>, uri: Uri, headers: HeaderMap) -> Resp
             let mut used = st.used_x402_nonces.lock().await;
             prune_used_x402_nonces(&mut used);
             if used.contains_key(&scheme_payload.authorization.nonce) {
-                return (
+                return briefcase_error(
                     StatusCode::PAYMENT_REQUIRED,
-                    Json(serde_json::json!({"error":"payment_replay"})),
-                )
-                    .into_response();
+                    BRIEFCASE_ERROR_REPLAY_DETECTED,
+                );
             }
             used.insert(scheme_payload.authorization.nonce, Utc::now().timestamp());
         }
@@ -1231,16 +1278,7 @@ async fn quote(
         let mut guard = st.revoked_cap_jtis.lock().await;
         prune_revoked_capabilities(&mut guard);
         if guard.contains_key(&claims.jti) {
-            let mut resp = (
-                StatusCode::FORBIDDEN,
-                Json(serde_json::json!({"error": BRIEFCASE_ERROR_CAPABILITY_REVOKED})),
-            )
-                .into_response();
-            resp.headers_mut().insert(
-                HEADER_BRIEFCASE_ERROR,
-                HeaderValue::from_static(BRIEFCASE_ERROR_CAPABILITY_REVOKED),
-            );
-            return resp;
+            return briefcase_error(StatusCode::FORBIDDEN, BRIEFCASE_ERROR_CAPABILITY_REVOKED);
         }
     }
 
@@ -1273,21 +1311,25 @@ async fn quote(
 
         let mut used = st.used_dpop_jtis.lock().await;
         prune_used_dpop_jtis(&mut used);
-        if verify_dpop_jwt(
+        match verify_dpop_jwt(
             dpop,
             "GET",
             &expected_url,
             Some(token),
             Some(&cnf.jkt),
             &mut used,
-        )
-        .is_err()
-        {
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(serde_json::json!({"error":"invalid_dpop"})),
-            )
-                .into_response();
+        ) {
+            Ok(_) => {}
+            Err(e) => {
+                if e.to_string().contains("replayed jti") {
+                    return briefcase_error(StatusCode::CONFLICT, BRIEFCASE_ERROR_REPLAY_DETECTED);
+                }
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    Json(serde_json::json!({"error":"invalid_dpop"})),
+                )
+                    .into_response();
+            }
         }
     }
 
@@ -1467,6 +1509,7 @@ fn issue_capability_jwt(st: &AppState, cnf_jkt: Option<String>) -> TokenResponse
         token,
         expires_at_rfc3339: exp.to_rfc3339(),
         max_calls: st.max_calls,
+        compatibility_profile: COMPATIBILITY_PROFILE_VERSION.to_string(),
     }
 }
 
@@ -1596,6 +1639,39 @@ mod tests {
 
     use axum::routing::{get, post};
     use ed25519_dalek::{Signer as _, SigningKey};
+
+    #[test]
+    fn capability_docs_match_dpop_cnf_profile() {
+        let docs = include_str!("../../../docs/CAPABILITY_TOKENS.md");
+        assert!(docs.contains("cnf.jkt"));
+        assert!(docs.contains("DPoP"));
+        assert!(docs.contains("x-briefcase-pop-pub"));
+    }
+
+    #[test]
+    fn replay_cache_helper_caps_entries() {
+        let mut used = HashMap::new();
+        for i in 0..10 {
+            used.insert(format!("k{i}"), 1_000 + i);
+        }
+        prune_and_cap_replay_cache(&mut used, 0, 5);
+        assert_eq!(used.len(), 5);
+        assert!(used.values().all(|ts| *ts >= 1_005));
+    }
+
+    #[test]
+    fn replay_cache_helper_drops_stale_entries_first() {
+        let mut used = HashMap::new();
+        for i in 0..5 {
+            used.insert(format!("old{i}"), 10 + i);
+        }
+        for i in 0..5 {
+            used.insert(format!("new{i}"), 1_000 + i);
+        }
+        prune_and_cap_replay_cache(&mut used, 500, 8);
+        assert_eq!(used.len(), 5);
+        assert!(used.keys().all(|k| k.starts_with("new")));
+    }
 
     fn b64url(bytes: &[u8]) -> String {
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
@@ -1757,6 +1833,7 @@ mod tests {
             .route("/vc/issue", post(vc_issue))
             .route("/api/revoke", post(revoke))
             .route("/api/quote", get(quote))
+            .layer(axum::middleware::from_fn(attach_profile_headers))
             .with_state(st);
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
@@ -1853,7 +1930,13 @@ mod tests {
             .header("DPoP", &dpop)
             .send()
             .await?;
-        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            resp.headers()
+                .get(HEADER_BRIEFCASE_ERROR)
+                .and_then(|h| h.to_str().ok()),
+            Some(BRIEFCASE_ERROR_REPLAY_DETECTED)
+        );
 
         handle.abort();
         Ok(())
@@ -1939,7 +2022,55 @@ mod tests {
             .header("DPoP", &dpop)
             .send()
             .await?;
-        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            resp.headers()
+                .get(HEADER_BRIEFCASE_ERROR)
+                .and_then(|h| h.to_str().ok()),
+            Some(BRIEFCASE_ERROR_REPLAY_DETECTED)
+        );
+
+        handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn aacp_provider_advertises_compatibility_profile_header() -> anyhow::Result<()> {
+        let (base_url, handle) = start_test_server().await?;
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()?;
+
+        let resp = http.get(format!("{base_url}/health")).send().await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get(HEADER_BRIEFCASE_COMPATIBILITY_PROFILE)
+                .and_then(|h| h.to_str().ok()),
+            Some(COMPATIBILITY_PROFILE_VERSION)
+        );
+
+        handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn provider_contract_reference_gateway_conformance_smoke() -> anyhow::Result<()> {
+        let (base_url, handle) = start_test_server().await?;
+        let base = Url::parse(&base_url)?;
+
+        let mut opts = briefcase_conformance::provider_contract::ProviderContractOptions::new(base);
+        // Reference gateway in tests uses `test-secret` for both capability signing and admin ops.
+        opts.admin_secret = Some(briefcase_core::Sensitive("test-secret".to_string()));
+        opts.run_oauth = true;
+        opts.run_revocation = true;
+
+        let report = briefcase_conformance::provider_contract::run_provider_contract(opts).await?;
+        assert!(
+            report.ok,
+            "provider contract report failed: {:?}",
+            report.checks
+        );
 
         handle.abort();
         Ok(())

@@ -13,7 +13,10 @@ use briefcase_control_plane_api::types::{
     HealthResponse, PolicyBundle, RemoteSignRequest, RemoteSignResponse, RemoteSignerKeyInfo,
     SignedPolicyBundle, UploadReceiptsRequest, UploadReceiptsResponse,
 };
-use briefcase_core::util::{sha256_hex, sha256_hex_concat};
+use briefcase_core::{
+    COMPATIBILITY_PROFILE_VERSION,
+    util::{sha256_hex, sha256_hex_concat},
+};
 use chrono::{DateTime, Utc};
 use clap::Parser;
 use ed25519_dalek::{Signature, Signer as _, SigningKey, VerifyingKey};
@@ -26,6 +29,7 @@ use sqlx::{PgPool, Row};
 use subtle::ConstantTimeEq as _;
 use tower_http::trace::TraceLayer;
 use tracing::{error, info};
+use url::Url;
 use uuid::Uuid;
 
 const DEFAULT_BIND_ADDR: &str = "127.0.0.1:9797";
@@ -43,6 +47,12 @@ struct Args {
     /// Address to bind.
     #[arg(long, env = "CONTROL_PLANE_BIND_ADDR", default_value = DEFAULT_BIND_ADDR)]
     bind_addr: SocketAddr,
+
+    /// Public base URL used for DPoP `htu` verification on device endpoints.
+    ///
+    /// If unset, defaults to `http://<bind_addr>`.
+    #[arg(long, env = "CONTROL_PLANE_PUBLIC_BASE_URL")]
+    public_base_url: Option<String>,
 
     /// Postgres connection string, e.g. `postgres://user:pass@127.0.0.1:5432/db`.
     #[arg(long, env = "CONTROL_PLANE_DATABASE_URL")]
@@ -100,6 +110,7 @@ struct AppState {
     policy_signer: SigningKey,
     policy_pubkey_b64: String,
     remote_signer: RemoteSignerBackend,
+    public_base_url: Url,
 }
 
 #[derive(Debug, Clone)]
@@ -554,6 +565,12 @@ async fn main() -> anyhow::Result<()> {
     init_db(&pool).await?;
     seed_default_policy_bundle(&pool).await?;
 
+    let public_base_url = match args.public_base_url.as_deref() {
+        Some(raw) if !raw.trim().is_empty() => Url::parse(raw).context("parse public_base_url")?,
+        _ => Url::parse(&format!("http://{}", args.bind_addr))
+            .context("build public_base_url from bind_addr")?,
+    };
+
     let st = AppState {
         pool,
         admin_token: args.admin_token,
@@ -561,6 +578,7 @@ async fn main() -> anyhow::Result<()> {
         policy_signer,
         policy_pubkey_b64,
         remote_signer,
+        public_base_url,
     };
 
     let app = Router::new()
@@ -653,6 +671,18 @@ async fn admin_devices_enroll(
         return Err(bad_request("invalid_device_pubkey"));
     }
 
+    // Device public key is used for DPoP binding; validate it's a real Ed25519 public key.
+    let pk = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(req.device_pubkey_b64.as_bytes())
+        .map_err(|_| bad_request("invalid_device_pubkey"))?;
+    if pk.len() != 32 {
+        return Err(bad_request("invalid_device_pubkey"));
+    }
+    let mut pk_arr = [0u8; 32];
+    pk_arr.copy_from_slice(&pk);
+    let _vk =
+        VerifyingKey::from_bytes(&pk_arr).map_err(|_| bad_request("invalid_device_pubkey"))?;
+
     let device_token = random_token_b64url(32);
     let token_hash_hex = sha256_hex(device_token.as_bytes());
 
@@ -690,8 +720,11 @@ async fn device_policy_get(
     State(st): State<AppState>,
     headers: axum::http::HeaderMap,
     Path(device_id): Path<Uuid>,
+    method: axum::http::Method,
+    uri: axum::http::Uri,
 ) -> Result<Json<DevicePolicyResponse>, (StatusCode, Json<ErrorResponse>)> {
-    require_device(&st, &headers, device_id).await?;
+    let ctx = require_device_bearer(&st, &headers, device_id).await?;
+    require_device_sync_dpop(&st, &headers, device_id, &ctx, &method, &uri).await?;
     let bundle = latest_policy_bundle(&st.pool)
         .await
         .map_err(internal_error)?;
@@ -705,9 +738,12 @@ async fn device_receipts_upload(
     State(st): State<AppState>,
     headers: axum::http::HeaderMap,
     Path(device_id): Path<Uuid>,
+    method: axum::http::Method,
+    uri: axum::http::Uri,
     Json(req): Json<UploadReceiptsRequest>,
 ) -> Result<Json<UploadReceiptsResponse>, (StatusCode, Json<ErrorResponse>)> {
-    require_device(&st, &headers, device_id).await?;
+    let ctx = require_device_bearer(&st, &headers, device_id).await?;
+    require_device_sync_dpop(&st, &headers, device_id, &ctx, &method, &uri).await?;
 
     if req.receipts.len() > MAX_RECEIPTS_PER_UPLOAD {
         return Err(bad_request("too_many_receipts"));
@@ -937,27 +973,34 @@ fn require_auditor(
     Ok(())
 }
 
-async fn require_device(
+#[derive(Debug, Clone)]
+struct DeviceAuthContext {
+    token: String,
+    device_pubkey_b64: String,
+}
+
+async fn require_device_bearer(
     st: &AppState,
     headers: &axum::http::HeaderMap,
     device_id: Uuid,
-) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+) -> Result<DeviceAuthContext, (StatusCode, Json<ErrorResponse>)> {
     let Some(tok) = bearer_token(headers) else {
         return Err(unauthorized("missing_token"));
     };
     let token_hash_hex = sha256_hex(tok.as_bytes());
 
-    let row: Option<(String,)> = sqlx::query_as("SELECT token_hash_hex FROM devices WHERE id=$1")
-        .bind(device_id)
-        .fetch_optional(&st.pool)
-        .await
-        .map_err(internal_error)?;
-    let Some((expected,)) = row else {
+    let row: Option<(String, String)> =
+        sqlx::query_as("SELECT token_hash_hex, device_pubkey_b64 FROM devices WHERE id=$1")
+            .bind(device_id)
+            .fetch_optional(&st.pool)
+            .await
+            .map_err(internal_error)?;
+    let Some((expected_hash, device_pubkey_b64)) = row else {
         return Err(unauthorized("unknown_device"));
     };
     if token_hash_hex
         .as_bytes()
-        .ct_eq(expected.as_bytes())
+        .ct_eq(expected_hash.as_bytes())
         .unwrap_u8()
         != 1
     {
@@ -969,6 +1012,91 @@ async fn require_device(
         .bind(device_id)
         .execute(&st.pool)
         .await;
+
+    Ok(DeviceAuthContext {
+        token: tok,
+        device_pubkey_b64,
+    })
+}
+
+async fn require_device(
+    st: &AppState,
+    headers: &axum::http::HeaderMap,
+    device_id: Uuid,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    let _ = require_device_bearer(st, headers, device_id).await?;
+    Ok(())
+}
+
+async fn require_device_sync_dpop(
+    st: &AppState,
+    headers: &axum::http::HeaderMap,
+    device_id: Uuid,
+    ctx: &DeviceAuthContext,
+    method: &axum::http::Method,
+    uri: &axum::http::Uri,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    use std::collections::HashMap;
+
+    let Some(jwt) = headers.get("dpop").and_then(|h| h.to_str().ok()) else {
+        return Err(unauthorized("missing_dpop"));
+    };
+
+    let expected_jwk = serde_json::json!({
+        "kty": "OKP",
+        "crv": "Ed25519",
+        "x": ctx.device_pubkey_b64.as_str(),
+    });
+    let expected_jkt = briefcase_dpop::jwk_thumbprint_b64url(&expected_jwk)
+        .map_err(|_| unauthorized("invalid_dpop"))?;
+
+    let path_and_query = uri
+        .path_and_query()
+        .map(|pq| pq.as_str())
+        .unwrap_or_else(|| uri.path());
+    let expected_url = st
+        .public_base_url
+        .join(path_and_query)
+        .map_err(internal_error)?;
+
+    let mut used = HashMap::new();
+    let claims = briefcase_dpop::verify_dpop_jwt(
+        jwt,
+        method.as_str(),
+        &expected_url,
+        Some(&ctx.token),
+        Some(&expected_jkt),
+        &mut used,
+    )
+    .map_err(|_| unauthorized("invalid_dpop"))?;
+
+    let jti = claims.get("jti").and_then(|v| v.as_str()).unwrap_or("");
+    let iat = claims.get("iat").and_then(|v| v.as_i64()).unwrap_or(0);
+    if jti.is_empty() || iat <= 0 {
+        return Err(unauthorized("invalid_dpop"));
+    }
+
+    // Best-effort cleanup to prevent unbounded growth.
+    let _ = sqlx::query(
+        "DELETE FROM device_dpop_jtis WHERE device_id=$1 AND inserted_at < now() - interval '10 minutes'",
+    )
+    .bind(device_id)
+    .execute(&st.pool)
+    .await;
+
+    let res = sqlx::query(
+        "INSERT INTO device_dpop_jtis(device_id, jti, iat) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+    )
+    .bind(device_id)
+    .bind(jti)
+    .bind(iat)
+    .execute(&st.pool)
+    .await
+    .map_err(internal_error)?;
+    if res.rows_affected() == 0 {
+        return Err(conflict("replay_detected"));
+    }
+
     Ok(())
 }
 
@@ -992,6 +1120,7 @@ async fn init_db(pool: &PgPool) -> anyhow::Result<()> {
         r#"
         CREATE TABLE IF NOT EXISTS policy_bundles (
           bundle_id     BIGSERIAL PRIMARY KEY,
+          compatibility_profile TEXT NOT NULL DEFAULT 'aacp_v1',
           policy_text   TEXT NOT NULL,
           budgets_json  JSONB NOT NULL,
           created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -1001,6 +1130,14 @@ async fn init_db(pool: &PgPool) -> anyhow::Result<()> {
     .execute(&mut *tx)
     .await
     .context("create policy_bundles")?;
+
+    // Best-effort migration for older DBs.
+    sqlx::query(
+        "ALTER TABLE policy_bundles ADD COLUMN IF NOT EXISTS compatibility_profile TEXT NOT NULL DEFAULT 'aacp_v1'",
+    )
+    .execute(&mut *tx)
+    .await
+    .context("alter policy_bundles compatibility_profile")?;
 
     sqlx::query(
         r#"
@@ -1017,6 +1154,28 @@ async fn init_db(pool: &PgPool) -> anyhow::Result<()> {
     .execute(&mut *tx)
     .await
     .context("create devices")?;
+
+    // DPoP replay cache: store used `jti` values for device sync requests.
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS device_dpop_jtis (
+          device_id    UUID NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+          jti          TEXT NOT NULL,
+          iat          BIGINT NOT NULL,
+          inserted_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+          PRIMARY KEY (device_id, jti)
+        )
+        "#,
+    )
+    .execute(&mut *tx)
+    .await
+    .context("create device_dpop_jtis")?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS device_dpop_jtis_inserted_idx ON device_dpop_jtis(inserted_at)",
+    )
+    .execute(&mut *tx)
+    .await
+    .context("create device_dpop_jtis_inserted_idx")?;
     sqlx::query("CREATE INDEX IF NOT EXISTS devices_token_hash_idx ON devices(token_hash_hex)")
         .execute(&mut *tx)
         .await
@@ -1079,8 +1238,9 @@ async fn insert_policy_bundle(
     budgets: &BTreeMap<String, i64>,
 ) -> anyhow::Result<PolicyBundle> {
     let row = sqlx::query(
-        "INSERT INTO policy_bundles(policy_text, budgets_json) VALUES ($1, $2) RETURNING bundle_id, created_at",
+        "INSERT INTO policy_bundles(compatibility_profile, policy_text, budgets_json) VALUES ($1, $2, $3) RETURNING bundle_id, created_at",
     )
+    .bind(COMPATIBILITY_PROFILE_VERSION)
     .bind(policy_text)
     .bind(sqlx::types::Json(budgets))
     .fetch_one(pool)
@@ -1091,6 +1251,7 @@ async fn insert_policy_bundle(
     let created_at: DateTime<Utc> = row.get(1);
     Ok(PolicyBundle {
         bundle_id,
+        compatibility_profile: COMPATIBILITY_PROFILE_VERSION.to_string(),
         policy_text: policy_text.to_string(),
         budgets: budgets.clone(),
         updated_at_rfc3339: created_at.to_rfc3339(),
@@ -1099,7 +1260,7 @@ async fn insert_policy_bundle(
 
 async fn latest_policy_bundle(pool: &PgPool) -> anyhow::Result<PolicyBundle> {
     let row = sqlx::query(
-        "SELECT bundle_id, policy_text, budgets_json, created_at
+        "SELECT bundle_id, compatibility_profile, policy_text, budgets_json, created_at
          FROM policy_bundles ORDER BY bundle_id DESC LIMIT 1",
     )
     .fetch_one(pool)
@@ -1107,12 +1268,14 @@ async fn latest_policy_bundle(pool: &PgPool) -> anyhow::Result<PolicyBundle> {
     .context("fetch latest policy bundle")?;
 
     let bundle_id: i64 = row.get(0);
-    let policy_text: String = row.get(1);
+    let compatibility_profile: String = row.get(1);
+    let policy_text: String = row.get(2);
     let budgets: BTreeMap<String, i64> =
-        row.get::<sqlx::types::Json<BTreeMap<String, i64>>, _>(2).0;
-    let created_at: DateTime<Utc> = row.get(3);
+        row.get::<sqlx::types::Json<BTreeMap<String, i64>>, _>(3).0;
+    let created_at: DateTime<Utc> = row.get(4);
     Ok(PolicyBundle {
         bundle_id,
+        compatibility_profile,
         policy_text,
         budgets,
         updated_at_rfc3339: created_at.to_rfc3339(),
@@ -1177,6 +1340,16 @@ fn unauthorized(code: &str) -> (StatusCode, Json<ErrorResponse>) {
     )
 }
 
+fn conflict(code: &str) -> (StatusCode, Json<ErrorResponse>) {
+    (
+        StatusCode::CONFLICT,
+        Json(ErrorResponse {
+            code: code.to_string(),
+            message: code.to_string(),
+        }),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1222,6 +1395,7 @@ mod tests {
         let vk = signer.verifying_key();
         let bundle = PolicyBundle {
             bundle_id: 1,
+            compatibility_profile: COMPATIBILITY_PROFILE_VERSION.to_string(),
             policy_text: "permit(principal, action, resource);".to_string(),
             budgets: BTreeMap::from([("read".to_string(), 1)]),
             updated_at_rfc3339: "2026-01-01T00:00:00Z".to_string(),

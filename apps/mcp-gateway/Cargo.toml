@@ -24,3 +24,11 @@ briefcase-api = { path = "../../crates/briefcase-api" }
 briefcase-core = { path = "../../crates/briefcase-core" }
 briefcase-mcp = { path = "../../crates/briefcase-mcp" }
 briefcase-otel = { path = "../../crates/briefcase-otel" }
+
+[dev-dependencies]
+chrono.workspace = true
+tempfile.workspace = true
+
+# Test harness: use the daemon router in-process to validate MCP approval interop.
+briefcased = { path = "../briefcased" }
+briefcase-secrets = { path = "../../crates/briefcase-secrets" }

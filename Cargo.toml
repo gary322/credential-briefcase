@@ -12,6 +12,7 @@ members = [
   "crates/briefcase-ai",
   "crates/briefcase-api",
   "crates/briefcase-control-plane-api",
+  "crates/briefcase-conformance",
   "crates/briefcase-core",
   "crates/briefcase-dpop",
   "crates/briefcase-identity",

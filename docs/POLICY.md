@@ -27,6 +27,8 @@ In `crates/briefcase-policy`:
   - `category == write`, and
   - the tool has network egress and/or filesystem access configured via its `ToolManifest`.
 
+This default policy is a **reference starting point**. The AACP profile governs the *mechanics* of approvals, receipts, and boundary enforcement; it does not require a specific default allow/deny policy.
+
 ## Budgets
 
 Budgets are enforced in `briefcased`:
@@ -36,6 +38,24 @@ Budgets are enforced in `briefcased`:
   - `read`: $3/day
   - `write`: $0/day (forces approval for any paid write tool)
   - `admin`: $0/day
+
+## Signed Policy Bundles (Control Plane)
+
+In enterprise deployments, the control plane issues **signed policy bundles** that include:
+
+- `policy_text`
+- `budgets`
+- `compatibility_profile` (e.g. `aacp_v1`)
+
+`briefcased` verifies the signature over the entire bundle (`serde_json::to_vec(&bundle)`) before applying any updates.
+
+### Compatibility Guards (GA Mode)
+
+In `ga` mode, `briefcased` enforces:
+
+- `bundle.compatibility_profile == COMPATIBILITY_PROFILE_VERSION`
+
+If the profile is missing or incompatible, the bundle is rejected, the previous policy remains active, and a receipt event is recorded (`kind=control_plane_policy_bundle_incompatible`).
 
 ## VC Revocation (Status Unknown)
 

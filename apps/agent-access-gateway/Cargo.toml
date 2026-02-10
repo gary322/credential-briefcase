@@ -33,8 +33,10 @@ url.workspace = true
 uuid.workspace = true
 
 briefcase-dpop = { path = "../../crates/briefcase-dpop" }
+briefcase-core = { path = "../../crates/briefcase-core" }
 briefcase-payments = { path = "../../crates/briefcase-payments" }
 
 [dev-dependencies]
 p256.workspace = true
 reqwest.workspace = true
+briefcase-conformance = { path = "../../crates/briefcase-conformance" }

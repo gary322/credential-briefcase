@@ -18,6 +18,18 @@ export interface paths {
     /** Get holder identity DID */
     get: operations["getIdentity"];
   };
+  "/v1/profile": {
+    /** Get compatibility profile mode/status */
+    get: operations["getProfile"];
+  };
+  "/v1/diagnostics/compat": {
+    /** Get compatibility diagnostics */
+    get: operations["getCompatibilityDiagnostics"];
+  };
+  "/v1/diagnostics/security": {
+    /** Get security diagnostics */
+    get: operations["getSecurityDiagnostics"];
+  };
   "/v1/control-plane": {
     /** Get enterprise control plane enrollment status */
     get: operations["controlPlaneStatus"];
@@ -159,6 +171,30 @@ export interface components {
     };
     IdentityResponse: {
       did: string;
+      profile_mode?: components["schemas"]["ProfileMode"];
+      compatibility_profile?: string;
+    };
+    /** @enum {string} */
+    ProfileMode: "reference" | "staging" | "ga";
+    ProfileResponse: {
+      mode: components["schemas"]["ProfileMode"];
+      compatibility_profile: string;
+      strict_enforcement: boolean;
+    };
+    CompatibilityCheck: {
+      name: string;
+      ok: boolean;
+      detail: string;
+    };
+    CompatibilityDiagnosticsResponse: {
+      mode: components["schemas"]["ProfileMode"];
+      compatibility_profile: string;
+      checks: components["schemas"]["CompatibilityCheck"][];
+    };
+    SecurityDiagnosticsResponse: {
+      mode: components["schemas"]["ProfileMode"];
+      compatibility_profile: string;
+      checks: components["schemas"]["CompatibilityCheck"][];
     };
     ControlPlaneStatusResponse: OneOf<[{
       /** @constant */
@@ -545,6 +581,57 @@ export interface operations {
       200: {
         content: {
           "application/json": components["schemas"]["IdentityResponse"];
+        };
+      };
+      /** @description unauthorized */
+      401: {
+        content: {
+          "application/json": components["schemas"]["ErrorResponse"];
+        };
+      };
+    };
+  };
+  /** Get compatibility profile mode/status */
+  getProfile: {
+    responses: {
+      /** @description ok */
+      200: {
+        content: {
+          "application/json": components["schemas"]["ProfileResponse"];
+        };
+      };
+      /** @description unauthorized */
+      401: {
+        content: {
+          "application/json": components["schemas"]["ErrorResponse"];
+        };
+      };
+    };
+  };
+  /** Get compatibility diagnostics */
+  getCompatibilityDiagnostics: {
+    responses: {
+      /** @description ok */
+      200: {
+        content: {
+          "application/json": components["schemas"]["CompatibilityDiagnosticsResponse"];
+        };
+      };
+      /** @description unauthorized */
+      401: {
+        content: {
+          "application/json": components["schemas"]["ErrorResponse"];
+        };
+      };
+    };
+  };
+  /** Get security diagnostics */
+  getSecurityDiagnostics: {
+    responses: {
+      /** @description ok */
+      200: {
+        content: {
+          "application/json": components["schemas"]["SecurityDiagnosticsResponse"];
         };
       };
       /** @description unauthorized */

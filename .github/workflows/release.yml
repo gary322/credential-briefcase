@@ -11,6 +11,46 @@ permissions:
   packages: write
 
 jobs:
+  qualification:
+    name: ga qualification (evidence bundle)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install pnpm
+        shell: bash
+        run: corepack enable
+
+      - name: pnpm install
+        shell: bash
+        env:
+          PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
+        run: pnpm install --frozen-lockfile
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.89.0"
+          components: rustfmt, clippy
+
+      - name: Run GA qualification script
+        shell: bash
+        run: bash scripts/ga_qualification.sh --mode release --label "${GITHUB_REF_NAME}" --dist-dir dist
+
+      - name: Upload qualification artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: qualification-artifacts
+          path: |
+            dist/*.json
+            dist/*.tar.gz
+            dist/*.txt
+
   rust:
     name: rust binaries (${{ matrix.os }})
     strategy:
@@ -291,6 +331,7 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     needs:
+      - qualification
       - rust
       - extension
       - mobile_android
@@ -298,6 +339,8 @@ jobs:
       - control_plane_container
       - sbom
     steps:
+      - uses: actions/checkout@v4
+
       # Download only the artifacts we intentionally publish.
       # GitHub can attach extra artifacts (e.g. build provenance) that are not
       # required for the release and can be flaky to download/extract.
@@ -348,6 +391,18 @@ jobs:
         with:
           name: sbom
           path: dist
+
+      - name: Download artifacts (qualification)
+        uses: actions/download-artifact@v4
+        with:
+          name: qualification-artifacts
+          path: dist
+
+      - name: Generate release manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/release_manifest.sh --dist-dir dist --out "dist/release-manifest-${GITHUB_REF_NAME}.json"
 
       - name: Install cosign
         uses: sigstore/cosign-installer@v3

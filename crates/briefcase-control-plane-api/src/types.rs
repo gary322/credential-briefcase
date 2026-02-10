@@ -56,6 +56,12 @@ pub struct EnrollDeviceRequest {
 pub struct PolicyBundle {
     /// Monotonic bundle ID (DB primary key).
     pub bundle_id: i64,
+    /// Compatibility profile the bundle targets (e.g. `aacp_v1`).
+    ///
+    /// This field is signed as part of the bundle. In GA mode, devices must reject bundles that
+    /// target an incompatible profile.
+    #[serde(default)]
+    pub compatibility_profile: String,
     pub policy_text: String,
     /// Category -> daily_limit_microusd.
     pub budgets: BTreeMap<String, i64>,

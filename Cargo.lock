@@ -59,6 +59,8 @@ dependencies = [
  "anyhow",
  "axum",
  "base64",
+ "briefcase-conformance",
+ "briefcase-core",
  "briefcase-dpop",
  "briefcase-payments",
  "chrono",
@@ -743,6 +745,7 @@ dependencies = [
  "base64",
  "briefcase-api",
  "briefcase-core",
+ "chrono",
  "clap",
  "directories",
  "rand 0.9.2",
@@ -757,6 +760,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "briefcase-conformance"
+version = "0.1.9"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "base64",
+ "briefcase-control-plane-api",
+ "briefcase-core",
+ "briefcase-dpop",
+ "briefcase-keys",
+ "briefcase-secrets",
+ "chrono",
+ "clap",
+ "ed25519-dalek",
+ "rand 0.9.2",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "url",
+ "uuid",
+]
+
+[[package]]
 name = "briefcase-control-plane"
 version = "0.1.9"
 dependencies = [
@@ -765,6 +793,7 @@ dependencies = [
  "base64",
  "briefcase-control-plane-api",
  "briefcase-core",
+ "briefcase-dpop",
  "briefcase-policy",
  "chrono",
  "clap",
@@ -781,6 +810,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "url",
  "uuid",
 ]
 
@@ -1102,6 +1132,8 @@ dependencies = [
  "ed25519-dalek",
  "flate2",
  "hex",
+ "hyper",
+ "hyper-util",
  "jsonschema",
  "opentelemetry",
  "opentelemetry_sdk",
@@ -1119,6 +1151,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-rusqlite",
+ "tower",
  "tower-http",
  "tracing",
  "tracing-opentelemetry",
@@ -3304,10 +3337,14 @@ dependencies = [
  "briefcase-core",
  "briefcase-mcp",
  "briefcase-otel",
+ "briefcase-secrets",
+ "briefcased",
+ "chrono",
  "clap",
  "directories",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tower-http",
  "tracing",

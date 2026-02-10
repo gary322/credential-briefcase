@@ -11,19 +11,21 @@ use axum::{Json, Router};
 use base64::Engine as _;
 use briefcase_api::types::{
     AiAnomaliesResponse, AiAnomaly, AiAnomalyKind, AiSeverity, ApproveResponse, BudgetRecord,
-    CallToolRequest, CallToolResponse, ControlPlaneEnrollRequest, ControlPlaneStatusResponse,
-    ControlPlaneSyncResponse, DeleteMcpServerResponse, DeleteProviderResponse, ErrorResponse,
-    FetchVcResponse, IdentityResponse, ListApprovalsResponse, ListBudgetsResponse,
-    ListMcpServersResponse, ListProvidersResponse, ListReceiptsResponse, ListToolsResponse,
-    McpOAuthExchangeRequest, McpOAuthExchangeResponse, McpOAuthStartRequest, McpOAuthStartResponse,
-    OAuthExchangeRequest, OAuthExchangeResponse, ProviderSummary, RevokeMcpOAuthResponse,
-    RevokeProviderOAuthResponse, SetBudgetRequest, SignerAlgorithm, SignerPairCompleteRequest,
-    SignerPairCompleteResponse, SignerPairStartResponse, SignerSignedRequest,
-    UpsertMcpServerRequest, UpsertProviderRequest, VerifyReceiptsResponse,
+    CallToolRequest, CallToolResponse, CompatibilityCheck, CompatibilityDiagnosticsResponse,
+    ControlPlaneEnrollRequest, ControlPlaneStatusResponse, ControlPlaneSyncResponse,
+    DeleteMcpServerResponse, DeleteProviderResponse, ErrorResponse, FetchVcResponse,
+    IdentityResponse, ListApprovalsResponse, ListBudgetsResponse, ListMcpServersResponse,
+    ListProvidersResponse, ListReceiptsResponse, ListToolsResponse, McpOAuthExchangeRequest,
+    McpOAuthExchangeResponse, McpOAuthStartRequest, McpOAuthStartResponse, OAuthExchangeRequest,
+    OAuthExchangeResponse, ProfileResponse, ProviderSummary, RevokeMcpOAuthResponse,
+    RevokeProviderOAuthResponse, SecurityDiagnosticsResponse, SetBudgetRequest, SignerAlgorithm,
+    SignerPairCompleteRequest, SignerPairCompleteResponse, SignerPairStartResponse,
+    SignerSignedRequest, UpsertMcpServerRequest, UpsertProviderRequest, VerifyReceiptsResponse,
 };
 use briefcase_core::{
-    ApprovalKind, PolicyDecision, ToolCall, ToolEgressPolicy, ToolFilesystemPolicy, ToolLimits,
-    ToolManifest, ToolResult, ToolRuntimeKind, util::sha256_hex,
+    ApprovalKind, COMPATIBILITY_PROFILE_VERSION, PolicyDecision, ProfileMode, ToolCall,
+    ToolEgressPolicy, ToolFilesystemPolicy, ToolLimits, ToolManifest, ToolResult, ToolRuntimeKind,
+    util::sha256_hex,
 };
 use chrono::Utc;
 use rand::RngCore as _;
@@ -38,7 +40,7 @@ use crate::db::Db;
 use crate::middleware::require_auth;
 use crate::pairing::{PairingManager, SignerReplayCache};
 use crate::provider::ProviderClient;
-use crate::remote_mcp::RemoteMcpManager;
+use crate::remote_mcp::{RemoteMcpCompatibilityError, RemoteMcpManager};
 use crate::tools::ToolRegistry;
 use briefcase_keys::remote::RemoteKeyManager;
 use briefcase_keys::{KeyAlgorithm, KeyBackendKind, KeyHandle, SoftwareKeyManager};
@@ -52,6 +54,8 @@ use tokio::sync::RwLock;
 pub struct AppOptions {
     pub require_signer_for_approvals: bool,
     pub vc_status_unknown_mode: VcStatusUnknownMode,
+    pub profile_mode: ProfileMode,
+    pub strict_host: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,25 +104,11 @@ pub struct AppState {
     pub signer_replay: Arc<SignerReplayCache>,
     pub require_signer_for_approvals: bool,
     pub vc_status_unknown_mode: VcStatusUnknownMode,
+    pub profile_mode: ProfileMode,
+    pub strict_host: bool,
 }
 
 impl AppState {
-    pub async fn init(
-        db_path: &Path,
-        auth_token: String,
-        provider_base_url: String,
-        secrets: Arc<dyn SecretStore>,
-    ) -> anyhow::Result<Self> {
-        Self::init_with_options(
-            db_path,
-            auth_token,
-            provider_base_url,
-            secrets,
-            AppOptions::default(),
-        )
-        .await
-    }
-
     pub async fn init_with_options(
         db_path: &Path,
         auth_token: String,
@@ -181,10 +171,27 @@ impl AppState {
             std::time::Duration::from_secs(300),
         )?);
 
+        let profile_mode = match std::env::var("BRIEFCASE_PROFILE_MODE") {
+            Ok(raw) if !raw.trim().is_empty() => raw
+                .parse::<ProfileMode>()
+                .map_err(|e| anyhow::anyhow!("invalid BRIEFCASE_PROFILE_MODE ({raw}): {e}"))?,
+            _ => opts.profile_mode,
+        };
+
+        let strict_host = match std::env::var("BRIEFCASE_STRICT_HOST") {
+            Ok(raw) if !raw.trim().is_empty() => match raw.trim() {
+                "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON" => true,
+                "0" | "false" | "FALSE" | "no" | "NO" | "off" | "OFF" => false,
+                other => anyhow::bail!("invalid BRIEFCASE_STRICT_HOST value: {other}"),
+            },
+            _ => opts.strict_host,
+        };
+
         let remote_mcp = Arc::new(RemoteMcpManager::new(
             db.clone(),
             secrets.clone(),
             oauth_discovery.clone(),
+            profile_mode,
         )?);
 
         // Identity key is stored as an opaque handle; private bytes remain inside `SecretStore`.
@@ -320,6 +327,8 @@ impl AppState {
             signer_replay,
             require_signer_for_approvals: opts.require_signer_for_approvals,
             vc_status_unknown_mode,
+            profile_mode,
+            strict_host,
         })
     }
 }
@@ -331,11 +340,29 @@ pub async fn serve_tcp(addr: SocketAddr, state: AppState) -> anyhow::Result<()> 
     let local_addr = listener.local_addr()?;
     info!(addr = %local_addr, "briefcased listening");
     let control_plane_worker = crate::control_plane::spawn_control_plane_worker(state.clone());
-    let app = router(state);
-    axum::serve(listener, app)
+    let strict_host = state.strict_host;
+    let app = if strict_host {
+        router(state).layer(axum::middleware::from_fn(
+            crate::middleware::require_loopback,
+        ))
+    } else {
+        router(state)
+    };
+
+    if strict_host {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
         .with_graceful_shutdown(shutdown_signal())
         .await
         .context("serve tcp")?;
+    } else {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(shutdown_signal())
+            .await
+            .context("serve tcp")?;
+    }
     control_plane_worker.abort();
     Ok(())
 }
@@ -350,6 +377,15 @@ pub async fn serve_unix(path: PathBuf, state: AppState) -> anyhow::Result<()> {
 
     let listener = tokio::net::UnixListener::bind(&path)
         .with_context(|| format!("bind unix socket {}", path.display()))?;
+
+    // Ensure the socket file is user-only. This prevents other local users from probing the
+    // daemon even if they can guess the path (auth token is still required, but avoid phishing).
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("chmod 600 {}", path.display()))?;
+    }
+
     info!(path = %path.display(), "briefcased listening");
     let control_plane_worker = crate::control_plane::spawn_control_plane_worker(state.clone());
     let app = router(state);
@@ -361,9 +397,60 @@ pub async fn serve_unix(path: PathBuf, state: AppState) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn router(state: AppState) -> Router {
+#[cfg(windows)]
+pub async fn serve_named_pipe(pipe_name: String, state: AppState) -> anyhow::Result<()> {
+    use hyper::body::Incoming;
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+    use hyper_util::server::conn::auto::Builder;
+    use hyper_util::service::TowerToHyperService;
+    use tokio::net::windows::named_pipe::ServerOptions;
+    use tower::ServiceExt as _;
+
+    info!(pipe_name = %pipe_name, "briefcased listening");
+    let control_plane_worker = crate::control_plane::spawn_control_plane_worker(state.clone());
+    let app = router(state);
+
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
+
+    loop {
+        let server = ServerOptions::new()
+            .create(&pipe_name)
+            .with_context(|| format!("create named pipe {pipe_name}"))?;
+
+        tokio::select! {
+            res = server.connect() => {
+                res.with_context(|| format!("connect named pipe {pipe_name}"))?;
+
+                // Map `hyper::body::Incoming` to `axum::body::Body`.
+                let tower_service = app
+                    .clone()
+                    .into_service()
+                    .map_request(|req: Request<Incoming>| req.map(axum::body::Body::new));
+                let hyper_service = TowerToHyperService::new(tower_service);
+
+                tokio::spawn(async move {
+                    let io = TokioIo::new(server);
+                    let mut builder = Builder::new(TokioExecutor::new());
+                    let _ = builder.serve_connection_with_upgrades(io, hyper_service).await;
+                });
+            }
+            _ = &mut shutdown => {
+                break;
+            }
+        }
+    }
+
+    control_plane_worker.abort();
+    Ok(())
+}
+
+pub fn router(state: AppState) -> Router {
     let authed = Router::new()
         .route("/v1/identity", get(get_identity))
+        .route("/v1/profile", get(get_profile))
+        .route("/v1/diagnostics/compat", get(get_compat_diagnostics))
+        .route("/v1/diagnostics/security", get(get_security_diagnostics))
         .route("/v1/providers", get(list_providers))
         .route("/v1/providers/{id}", post(upsert_provider))
         .route("/v1/providers/{id}/delete", post(delete_provider))
@@ -451,6 +538,91 @@ async fn list_tools(State(state): State<AppState>) -> Json<ListToolsResponse> {
 async fn get_identity(State(state): State<AppState>) -> Json<IdentityResponse> {
     Json(IdentityResponse {
         did: state.identity_did.clone(),
+        profile_mode: Some(state.profile_mode),
+        compatibility_profile: Some(COMPATIBILITY_PROFILE_VERSION.to_string()),
+    })
+}
+
+async fn get_profile(State(state): State<AppState>) -> Json<ProfileResponse> {
+    Json(ProfileResponse {
+        mode: state.profile_mode,
+        compatibility_profile: COMPATIBILITY_PROFILE_VERSION.to_string(),
+        strict_enforcement: state.profile_mode.strict_enforcement(),
+    })
+}
+
+async fn get_compat_diagnostics(
+    State(state): State<AppState>,
+) -> Json<CompatibilityDiagnosticsResponse> {
+    let checks = vec![
+        CompatibilityCheck {
+            name: "profile_mode_set".to_string(),
+            ok: true,
+            detail: format!("mode={}", state.profile_mode.as_str()),
+        },
+        CompatibilityCheck {
+            name: "compatibility_profile_version".to_string(),
+            ok: true,
+            detail: COMPATIBILITY_PROFILE_VERSION.to_string(),
+        },
+        CompatibilityCheck {
+            name: "strict_enforcement".to_string(),
+            ok: true,
+            detail: if state.profile_mode.strict_enforcement() {
+                "enabled".to_string()
+            } else {
+                "disabled".to_string()
+            },
+        },
+    ];
+
+    Json(CompatibilityDiagnosticsResponse {
+        mode: state.profile_mode,
+        compatibility_profile: COMPATIBILITY_PROFILE_VERSION.to_string(),
+        checks,
+    })
+}
+
+async fn get_security_diagnostics(
+    State(state): State<AppState>,
+) -> Json<SecurityDiagnosticsResponse> {
+    let configured_backend = std::env::var("BRIEFCASE_SECRET_BACKEND")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "auto".to_string());
+    let memory_backend = configured_backend.eq_ignore_ascii_case("memory");
+    let backend_ok = !(state.profile_mode.strict_enforcement() && memory_backend);
+
+    let checks = vec![
+        CompatibilityCheck {
+            name: "daemon_auth_required".to_string(),
+            ok: true,
+            detail: "bearer auth enforced for /v1/* routes".to_string(),
+        },
+        CompatibilityCheck {
+            name: "risk_non_authoritative".to_string(),
+            ok: true,
+            detail: "risk scoring can only tighten into approval".to_string(),
+        },
+        CompatibilityCheck {
+            name: "http_redirects_disabled".to_string(),
+            ok: true,
+            detail: "daemon/provider HTTP clients disable redirects".to_string(),
+        },
+        CompatibilityCheck {
+            name: "secret_backend_policy".to_string(),
+            ok: backend_ok,
+            detail: format!(
+                "configured backend={configured_backend}; strict_mode={}",
+                state.profile_mode.strict_enforcement()
+            ),
+        },
+    ];
+
+    Json(SecurityDiagnosticsResponse {
+        mode: state.profile_mode,
+        compatibility_profile: COMPATIBILITY_PROFILE_VERSION.to_string(),
+        checks,
     })
 }
 
@@ -1749,12 +1921,20 @@ async fn call_tool_impl(state: &AppState, call: ToolCall) -> anyhow::Result<Call
     }
 
     let tool = if RemoteMcpManager::is_remote_tool_id(&call.tool_id) {
-        match state.remote_mcp.resolve_tool_spec(&call.tool_id).await? {
-            Some(spec) => ResolvedTool::Remote(Box::new(spec)),
-            None => {
+        match state.remote_mcp.resolve_tool_spec(&call.tool_id).await {
+            Ok(Some(spec)) => ResolvedTool::Remote(Box::new(spec)),
+            Ok(None) => {
                 return Ok(CallToolResponse::Denied {
                     reason: "unknown_tool".to_string(),
                 });
+            }
+            Err(e) => {
+                if e.is::<RemoteMcpCompatibilityError>() {
+                    return Ok(CallToolResponse::Denied {
+                        reason: "remote_mcp_incompatible".to_string(),
+                    });
+                }
+                return Err(e);
             }
         }
     } else {
@@ -2171,6 +2351,7 @@ async fn oauth_exchange(
     let url = format!("{base_url}/oauth/token");
     let http = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(20))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(internal_error)?;
     let resp = http
@@ -2246,6 +2427,7 @@ async fn fetch_vc(
 
     let http = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(20))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(internal_error)?;
 
@@ -2885,6 +3067,9 @@ mod tests {
     use ed25519_dalek::Signer as _;
     use tempfile::tempdir;
 
+    const MOCK_PROVIDER_CAPABILITY_TOKEN: &str = "cap_mock_canary_token";
+    const MOCK_PROVIDER_PAYMENT_PROOF: &str = "payproof_mock_canary";
+
     #[derive(Clone)]
     struct TestTelemetry {
         log_buf: Arc<StdMutex<Vec<u8>>>,
@@ -2996,6 +3181,12 @@ mod tests {
 
     async fn start_mock_remote_mcp()
     -> anyhow::Result<(SocketAddr, MockRemoteMcpState, tokio::task::JoinHandle<()>)> {
+        start_mock_remote_mcp_with_profile(Some(COMPATIBILITY_PROFILE_VERSION)).await
+    }
+
+    async fn start_mock_remote_mcp_with_profile(
+        compatibility_profile: Option<&str>,
+    ) -> anyhow::Result<(SocketAddr, MockRemoteMcpState, tokio::task::JoinHandle<()>)> {
         use axum::Router;
         use axum::body::Bytes;
         use axum::extract::State as AxumState;
@@ -3083,7 +3274,13 @@ mod tests {
             tool_calls: Arc::new(tokio::sync::Mutex::new(0)),
         };
         let handler = Arc::new(Handler { st: st.clone() });
-        let cfg = McpServerConfig::default_for_binary("mock-remote-mcp", "0.0.0");
+        let mut cfg = McpServerConfig::default_for_binary("mock-remote-mcp", "0.0.0");
+        if let Some(p) = compatibility_profile {
+            cfg.capabilities = serde_json::json!({
+                "tools": { "listChanged": false },
+                "briefcase": { "compatibility_profile": p }
+            });
+        }
         let conn = Arc::new(tokio::sync::Mutex::new(McpConnection::new(cfg, handler)));
 
         let app = Router::new()
@@ -3328,7 +3525,11 @@ mod tests {
         let mcp_calls = Arc::new(tokio::sync::Mutex::new(0));
         let mcp_ok_calls = Arc::new(tokio::sync::Mutex::new(0));
         let handler = Arc::new(Handler);
-        let cfg = McpServerConfig::default_for_binary("mock-oauth-mcp", "0.0.0");
+        let mut cfg = McpServerConfig::default_for_binary("mock-oauth-mcp", "0.0.0");
+        cfg.capabilities = serde_json::json!({
+            "tools": { "listChanged": false },
+            "briefcase": { "compatibility_profile": COMPATIBILITY_PROFILE_VERSION }
+        });
         let conn = Arc::new(tokio::sync::Mutex::new(McpConnection::new(cfg, handler)));
         let app = Router::new()
             .route("/.well-known/oauth-protected-resource", get(prm))
@@ -3800,7 +4001,11 @@ mod tests {
         let mcp_calls = Arc::new(tokio::sync::Mutex::new(0));
         let mcp_ok_calls = Arc::new(tokio::sync::Mutex::new(0));
         let handler = Arc::new(Handler);
-        let cfg = McpServerConfig::default_for_binary("mock-oauth-dpop-mcp", "0.0.0");
+        let mut cfg = McpServerConfig::default_for_binary("mock-oauth-dpop-mcp", "0.0.0");
+        cfg.capabilities = serde_json::json!({
+            "tools": { "listChanged": false },
+            "briefcase": { "compatibility_profile": COMPATIBILITY_PROFILE_VERSION }
+        });
         let conn = Arc::new(tokio::sync::Mutex::new(McpConnection::new(cfg, handler)));
         let app = Router::new()
             .route("/.well-known/oauth-protected-resource", get(prm))
@@ -3857,7 +4062,7 @@ mod tests {
                 return (
                     StatusCode::OK,
                     Json(serde_json::json!({
-                        "token": "cap",
+                        "token": MOCK_PROVIDER_CAPABILITY_TOKEN,
                         "expires_at_rfc3339": (Utc::now() + chrono::Duration::minutes(10)).to_rfc3339(),
                         "max_calls": 50
                     })),
@@ -3874,7 +4079,7 @@ mod tests {
                 return (
                     StatusCode::OK,
                     Json(serde_json::json!({
-                        "token": "cap",
+                        "token": MOCK_PROVIDER_CAPABILITY_TOKEN,
                         "expires_at_rfc3339": (Utc::now() + chrono::Duration::minutes(10)).to_rfc3339(),
                         "max_calls": 50
                     })),
@@ -3885,7 +4090,7 @@ mod tests {
                 return (
                     StatusCode::OK,
                     Json(serde_json::json!({
-                        "token": "cap",
+                        "token": MOCK_PROVIDER_CAPABILITY_TOKEN,
                         "expires_at_rfc3339": (Utc::now() + chrono::Duration::minutes(10)).to_rfc3339(),
                         "max_calls": 50
                     })),
@@ -3897,7 +4102,7 @@ mod tests {
                 return (
                     StatusCode::OK,
                     Json(serde_json::json!({
-                        "token": "cap",
+                        "token": MOCK_PROVIDER_CAPABILITY_TOKEN,
                         "expires_at_rfc3339": (Utc::now() + chrono::Duration::minutes(10)).to_rfc3339(),
                         "max_calls": 50
                     })),
@@ -3921,7 +4126,7 @@ mod tests {
         ) -> Json<serde_json::Value> {
             *st.pay_calls.lock().await += 1;
             *st.paid.lock().await = true;
-            Json(serde_json::json!({ "proof": "p1" }))
+            Json(serde_json::json!({ "proof": MOCK_PROVIDER_PAYMENT_PROOF }))
         }
 
         #[derive(Debug, serde::Deserialize)]
@@ -4108,7 +4313,10 @@ mod tests {
             let ok = headers
                 .get("authorization")
                 .and_then(|h| h.to_str().ok())
-                .map(|v| v == "Bearer cap" || v == "DPoP cap")
+                .map(|v| {
+                    v == format!("Bearer {MOCK_PROVIDER_CAPABILITY_TOKEN}")
+                        || v == format!("DPoP {MOCK_PROVIDER_CAPABILITY_TOKEN}")
+                })
                 .unwrap_or(false);
             if !ok {
                 return (
@@ -4160,8 +4368,11 @@ mod tests {
 
     #[derive(Clone)]
     struct MockControlPlaneState {
+        base_url: String,
         admin_token: String,
         device_token: String,
+        device_pubkey_b64: Arc<tokio::sync::Mutex<String>>,
+        used_dpop_jtis: Arc<tokio::sync::Mutex<std::collections::HashMap<String, i64>>>,
         signing_key: ed25519_dalek::SigningKey,
         bundle: Arc<tokio::sync::Mutex<briefcase_control_plane_api::types::PolicyBundle>>,
         receipts: Arc<tokio::sync::Mutex<Vec<briefcase_core::ReceiptRecord>>>,
@@ -4194,6 +4405,16 @@ mod tests {
                 Json(briefcase_control_plane_api::ErrorResponse {
                     code: "unauthorized".to_string(),
                     message: "unauthorized".to_string(),
+                }),
+            )
+        }
+
+        fn conflict(code: &str) -> (StatusCode, Json<briefcase_control_plane_api::ErrorResponse>) {
+            (
+                StatusCode::CONFLICT,
+                Json(briefcase_control_plane_api::ErrorResponse {
+                    code: code.to_string(),
+                    message: code.to_string(),
                 }),
             )
         }
@@ -4234,6 +4455,8 @@ mod tests {
             if !ok {
                 return Err(unauthorized());
             }
+
+            *st.device_pubkey_b64.lock().await = req.device_pubkey_b64.clone();
 
             // The control plane issues a signed policy bundle and a device token.
             let bundle = st.bundle.lock().await.clone();
@@ -4386,6 +4609,8 @@ mod tests {
             AxumState(st): AxumState<MockControlPlaneState>,
             AxumPath(_device_id): AxumPath<uuid::Uuid>,
             headers: HeaderMap,
+            method: axum::http::Method,
+            uri: axum::http::Uri,
         ) -> Result<
             Json<DevicePolicyResponse>,
             (StatusCode, Json<briefcase_control_plane_api::ErrorResponse>),
@@ -4397,6 +4622,46 @@ mod tests {
                 .map(|t| t == st.device_token)
                 .unwrap_or(false);
             if !ok {
+                return Err(unauthorized());
+            }
+
+            let pubkey_b64 = st.device_pubkey_b64.lock().await.clone();
+            if pubkey_b64.is_empty() {
+                return Err(unauthorized());
+            }
+            let expected_jwk = serde_json::json!({
+                "kty": "OKP",
+                "crv": "Ed25519",
+                "x": pubkey_b64.as_str(),
+            });
+            let expected_jkt =
+                briefcase_dpop::jwk_thumbprint_b64url(&expected_jwk).map_err(|_| unauthorized())?;
+
+            let jwt = headers
+                .get("dpop")
+                .and_then(|h| h.to_str().ok())
+                .unwrap_or("");
+            if jwt.is_empty() {
+                return Err(unauthorized());
+            }
+            let base = url::Url::parse(&st.base_url).map_err(|_| unauthorized())?;
+            let path_and_query = uri
+                .path_and_query()
+                .map(|pq| pq.as_str())
+                .unwrap_or_else(|| uri.path());
+            let expected_url = base.join(path_and_query).map_err(|_| unauthorized())?;
+            let mut used = st.used_dpop_jtis.lock().await;
+            if let Err(e) = briefcase_dpop::verify_dpop_jwt(
+                jwt,
+                method.as_str(),
+                &expected_url,
+                Some(&st.device_token),
+                Some(&expected_jkt),
+                &mut used,
+            ) {
+                if e.to_string().contains("replayed jti") {
+                    return Err(conflict("replay_detected"));
+                }
                 return Err(unauthorized());
             }
 
@@ -4417,6 +4682,8 @@ mod tests {
             AxumState(st): AxumState<MockControlPlaneState>,
             AxumPath(_device_id): AxumPath<uuid::Uuid>,
             headers: HeaderMap,
+            method: axum::http::Method,
+            uri: axum::http::Uri,
             Json(req): Json<UploadReceiptsRequest>,
         ) -> Result<
             Json<UploadReceiptsResponse>,
@@ -4432,10 +4699,54 @@ mod tests {
                 return Err(unauthorized());
             }
 
+            let pubkey_b64 = st.device_pubkey_b64.lock().await.clone();
+            if pubkey_b64.is_empty() {
+                return Err(unauthorized());
+            }
+            let expected_jwk = serde_json::json!({
+                "kty": "OKP",
+                "crv": "Ed25519",
+                "x": pubkey_b64.as_str(),
+            });
+            let expected_jkt =
+                briefcase_dpop::jwk_thumbprint_b64url(&expected_jwk).map_err(|_| unauthorized())?;
+
+            let jwt = headers
+                .get("dpop")
+                .and_then(|h| h.to_str().ok())
+                .unwrap_or("");
+            if jwt.is_empty() {
+                return Err(unauthorized());
+            }
+            let base = url::Url::parse(&st.base_url).map_err(|_| unauthorized())?;
+            let path_and_query = uri
+                .path_and_query()
+                .map(|pq| pq.as_str())
+                .unwrap_or_else(|| uri.path());
+            let expected_url = base.join(path_and_query).map_err(|_| unauthorized())?;
+            let mut used = st.used_dpop_jtis.lock().await;
+            if let Err(e) = briefcase_dpop::verify_dpop_jwt(
+                jwt,
+                method.as_str(),
+                &expected_url,
+                Some(&st.device_token),
+                Some(&expected_jkt),
+                &mut used,
+            ) {
+                if e.to_string().contains("replayed jti") {
+                    return Err(conflict("replay_detected"));
+                }
+                return Err(unauthorized());
+            }
+
             let stored = req.receipts.len();
             st.receipts.lock().await.extend(req.receipts);
             Ok(Json(UploadReceiptsResponse { stored }))
         }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let base_url = format!("http://{addr}");
 
         let signing_key = ed25519_dalek::SigningKey::from_bytes(&[42u8; 32]);
         let remote_signer_sk = if enable_remote_signer {
@@ -4447,8 +4758,11 @@ mod tests {
         };
 
         let st = MockControlPlaneState {
+            base_url,
             admin_token: "admin".to_string(),
             device_token: "device-token".to_string(),
+            device_pubkey_b64: Arc::new(tokio::sync::Mutex::new(String::new())),
+            used_dpop_jtis: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             signing_key,
             bundle: Arc::new(tokio::sync::Mutex::new(initial_bundle)),
             receipts: Arc::new(tokio::sync::Mutex::new(Vec::new())),
@@ -4467,9 +4781,6 @@ mod tests {
                 post(device_remote_signer_sign),
             )
             .with_state(st.clone());
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-        let addr = listener.local_addr()?;
         let handle = tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
@@ -4531,6 +4842,150 @@ mod tests {
         tokio::task::JoinHandle<()>,
     )> {
         start_daemon_with_options(provider_base_url, AppOptions::default()).await
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_ipc_named_pipe_health_works() -> anyhow::Result<()> {
+        let (provider_addr, _provider_state, provider_task) = start_mock_provider().await?;
+        let provider_base_url = format!("http://{provider_addr}");
+
+        let dir = tempdir()?;
+        let db_path = dir.path().join("briefcase.sqlite");
+        let auth_token = "test-token";
+
+        let secrets = Arc::new(briefcase_secrets::InMemorySecretStore::default());
+        let state = AppState::init_with_options(
+            &db_path,
+            auth_token.to_string(),
+            provider_base_url,
+            secrets,
+            AppOptions::default(),
+        )
+        .await?;
+
+        let pipe_name = format!(r"\\.\pipe\briefcased-test-{}", Uuid::new_v4());
+        let state_for_server = state.clone();
+        let pipe_for_server = pipe_name.clone();
+        let daemon_task = tokio::spawn(async move {
+            let _ = serve_named_pipe(pipe_for_server, state_for_server).await;
+        });
+
+        let client = BriefcaseClient::new(
+            DaemonEndpoint::NamedPipe {
+                pipe_name: pipe_name.clone(),
+            },
+            auth_token.to_string(),
+        );
+
+        // Named pipe creation is asynchronous; allow a short retry window for the server loop.
+        let mut last_err = None;
+        for _ in 0..50u32 {
+            match client.health().await {
+                Ok(()) => {
+                    last_err = None;
+                    break;
+                }
+                Err(e) => {
+                    last_err = Some(e);
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            }
+        }
+        if let Some(e) = last_err {
+            return Err(anyhow::anyhow!(e)).context("named pipe health");
+        }
+
+        daemon_task.abort();
+        provider_task.abort();
+        Ok(())
+    }
+
+    #[test]
+    fn host_isolation_strict_rejects_non_loopback_tcp_bind() {
+        let addr = std::net::SocketAddr::from(([0, 0, 0, 0], 8787));
+        assert!(crate::host::validate_loopback_tcp_bind(addr).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn host_isolation_strict_enforces_data_dir_and_auth_token_permissions() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempdir()?;
+        let data_dir = dir.path();
+        std::fs::set_permissions(data_dir, std::fs::Permissions::from_mode(0o777))?;
+
+        let auth_token_path = data_dir.join("auth_token");
+        std::fs::write(&auth_token_path, "test-token\n")?;
+        std::fs::set_permissions(&auth_token_path, std::fs::Permissions::from_mode(0o644))?;
+
+        crate::host::enforce_strict_host_fs(data_dir, &auth_token_path)?;
+
+        let mode_dir = std::fs::metadata(data_dir)?.permissions().mode() & 0o777;
+        let mode_tok = std::fs::metadata(&auth_token_path)?.permissions().mode() & 0o777;
+        assert_eq!(mode_dir, 0o700);
+        assert_eq!(mode_tok, 0o600);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn host_isolation_strict_rejects_unix_socket_outside_data_dir() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let data_dir = dir.path();
+        std::fs::create_dir_all(data_dir)?;
+
+        let outside = std::env::temp_dir().join("briefcased.sock");
+        assert!(crate::host::validate_unix_socket_within_data_dir(data_dir, &outside).is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn profile_and_compat_diagnostics_surface_mode() -> anyhow::Result<()> {
+        let (provider_addr, _provider_state, provider_task) = start_mock_provider().await?;
+        let provider_base_url = format!("http://{provider_addr}");
+
+        let opts = AppOptions {
+            profile_mode: ProfileMode::Ga,
+            ..AppOptions::default()
+        };
+        let (_state, _daemon_base, client, daemon_task) =
+            start_daemon_with_options(provider_base_url, opts).await?;
+
+        let id = client.identity().await?;
+        assert_eq!(id.profile_mode, Some(ProfileMode::Ga));
+        assert_eq!(
+            id.compatibility_profile.as_deref(),
+            Some(COMPATIBILITY_PROFILE_VERSION)
+        );
+
+        let profile = client.profile().await?;
+        assert_eq!(profile.mode, ProfileMode::Ga);
+        assert_eq!(profile.compatibility_profile, COMPATIBILITY_PROFILE_VERSION);
+        assert!(profile.strict_enforcement);
+
+        let diag = client.compat_diagnostics().await?;
+        assert_eq!(diag.mode, ProfileMode::Ga);
+        assert_eq!(diag.compatibility_profile, COMPATIBILITY_PROFILE_VERSION);
+        assert!(
+            diag.checks.iter().any(|c| c.name == "strict_enforcement"),
+            "missing strict_enforcement check"
+        );
+
+        let sec = client.security_diagnostics().await?;
+        assert_eq!(sec.mode, ProfileMode::Ga);
+        assert_eq!(sec.compatibility_profile, COMPATIBILITY_PROFILE_VERSION);
+        assert!(
+            sec.checks
+                .iter()
+                .any(|c| c.name == "daemon_auth_required" && c.ok),
+            "missing daemon_auth_required check"
+        );
+
+        daemon_task.abort();
+        provider_task.abort();
+        Ok(())
     }
 
     #[tokio::test]
@@ -5023,7 +5478,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sandbox_manifest_denies_quote_egress() -> anyhow::Result<()> {
+    async fn egress_policy_sandbox_manifest_denies_quote_egress() -> anyhow::Result<()> {
         let (provider_addr, _provider_state, provider_task) = start_mock_provider().await?;
         let provider_base_url = format!("http://{provider_addr}");
 
@@ -5040,6 +5495,112 @@ mod tests {
                 call: ToolCall {
                     tool_id: "quote".to_string(),
                     args: serde_json::json!({ "symbol": "TEST" }),
+                    context: ToolCallContext::new(),
+                    approval_token: None,
+                },
+            })
+            .await?;
+
+        let reason = match resp {
+            CallToolResponse::Denied { reason } => reason,
+            other => anyhow::bail!("expected denied, got {other:?}"),
+        };
+        assert!(
+            reason.contains("sandbox_violation"),
+            "unexpected reason: {reason}"
+        );
+
+        let receipts = client.list_receipts().await?.receipts;
+        let found = receipts.iter().any(|r| {
+            r.event
+                .get("decision")
+                .and_then(|d| d.as_str())
+                .unwrap_or_default()
+                == "deny"
+                && r.event
+                    .get("tool_id")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or_default()
+                    == "quote"
+        });
+        assert!(found, "expected a deny receipt for quote");
+
+        daemon_task.abort();
+        provider_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn egress_policy_rejects_non_loopback_http_provider_base_url() -> anyhow::Result<()> {
+        let (provider_addr, _provider_state, provider_task) = start_mock_provider().await?;
+        let provider_base_url = format!("http://{provider_addr}");
+        let (_state, _daemon_base, client, daemon_task) = start_daemon(provider_base_url).await?;
+
+        let err = client
+            .upsert_provider("p1", "http://example.com".to_string())
+            .await
+            .expect_err("expected invalid_base_url");
+        match err {
+            BriefcaseClientError::Daemon { code, .. } => {
+                assert_eq!(code, "invalid_base_url");
+            }
+            other => anyhow::bail!("expected daemon error, got {other:?}"),
+        }
+
+        daemon_task.abort();
+        provider_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn egress_policy_rejects_non_loopback_http_mcp_endpoint_url() -> anyhow::Result<()> {
+        let (provider_addr, _provider_state, provider_task) = start_mock_provider().await?;
+        let provider_base_url = format!("http://{provider_addr}");
+        let (_state, _daemon_base, client, daemon_task) = start_daemon(provider_base_url).await?;
+
+        let err = client
+            .upsert_mcp_server("s1", "http://example.com".to_string())
+            .await
+            .expect_err("expected invalid_endpoint_url");
+        match err {
+            BriefcaseClientError::Daemon { code, .. } => {
+                assert_eq!(code, "invalid_endpoint_url");
+            }
+            other => anyhow::bail!("expected daemon error, got {other:?}"),
+        }
+
+        daemon_task.abort();
+        provider_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn egress_policy_blocks_insecure_provider_base_url_even_if_host_allowed()
+    -> anyhow::Result<()> {
+        let (provider_addr, _provider_state, provider_task) = start_mock_provider().await?;
+        let provider_base_url = format!("http://{provider_addr}");
+
+        let (state, _daemon_base, client, daemon_task) = start_daemon(provider_base_url).await?;
+
+        // Simulate a legacy DB write that bypasses normalization.
+        state
+            .db
+            .upsert_provider("evil", "http://example.com")
+            .await?;
+
+        // Allowlist the host so the sandbox host check would pass, and verify we still deny
+        // due to insecure scheme (non-loopback http).
+        let mut m =
+            briefcase_core::ToolManifest::deny_all("quote", briefcase_core::ToolRuntimeKind::Wasm);
+        m.egress.allowed_hosts = vec!["example.com".to_string()];
+        m.egress.allowed_http_path_prefixes = vec!["/api/quote".to_string()];
+        state.db.upsert_tool_manifest(&m).await?;
+
+        let resp = client
+            .call_tool(CallToolRequest {
+                call: ToolCall {
+                    tool_id: "quote".to_string(),
+                    args: serde_json::json!({ "provider_id": "evil", "symbol": "TEST" }),
                     context: ToolCallContext::new(),
                     approval_token: None,
                 },
@@ -5202,8 +5763,14 @@ mod tests {
         let auth_token = "test-token";
 
         let secrets = Arc::new(briefcase_secrets::InMemorySecretStore::default());
-        let state =
-            AppState::init(&db_path, auth_token.to_string(), provider_base_url, secrets).await?;
+        let state = AppState::init_with_options(
+            &db_path,
+            auth_token.to_string(),
+            provider_base_url,
+            secrets,
+            AppOptions::default(),
+        )
+        .await?;
         let app = router(state);
         let listener = tokio::net::UnixListener::bind(&sock_path)?;
 
@@ -5647,6 +6214,159 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn remote_mcp_profile_ok_in_ga_mode() -> anyhow::Result<()> {
+        let (provider_addr, _provider_state, provider_task) = start_mock_provider().await?;
+        let provider_base_url = format!("http://{provider_addr}");
+
+        let (remote_addr, remote_state, remote_task) = start_mock_remote_mcp().await?;
+        let remote_endpoint = format!("http://{remote_addr}/mcp");
+
+        let opts = AppOptions {
+            profile_mode: ProfileMode::Ga,
+            ..AppOptions::default()
+        };
+        let (_state, _daemon_base, client, daemon_task) =
+            start_daemon_with_options(provider_base_url, opts).await?;
+
+        client
+            .upsert_mcp_server("remote1", remote_endpoint.clone())
+            .await?;
+
+        let tools = client.list_tools().await?.tools;
+        assert!(tools.iter().any(|t| t.id == "mcp_remote1__hello"));
+
+        let resp = client
+            .call_tool(CallToolRequest {
+                call: ToolCall {
+                    tool_id: "mcp_remote1__hello".to_string(),
+                    args: serde_json::json!({ "text": "hi" }),
+                    context: ToolCallContext::new(),
+                    approval_token: None,
+                },
+            })
+            .await?;
+        let approval_id = match resp {
+            CallToolResponse::ApprovalRequired { approval } => approval.id,
+            _ => anyhow::bail!("expected approval_required"),
+        };
+
+        let tool_calls = *remote_state.tool_calls.lock().await;
+        assert_eq!(tool_calls, 0, "remote tool should not run before approval");
+
+        let approved = client.approve(&approval_id).await?;
+        let resp = client
+            .call_tool(CallToolRequest {
+                call: ToolCall {
+                    tool_id: "mcp_remote1__hello".to_string(),
+                    args: serde_json::json!({ "text": "hi" }),
+                    context: ToolCallContext::new(),
+                    approval_token: Some(approved.approval_token),
+                },
+            })
+            .await?;
+        assert!(matches!(resp, CallToolResponse::Ok { .. }));
+
+        daemon_task.abort();
+        remote_task.abort();
+        provider_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn remote_mcp_profile_missing_rejected_in_ga_mode() -> anyhow::Result<()> {
+        let (provider_addr, _provider_state, provider_task) = start_mock_provider().await?;
+        let provider_base_url = format!("http://{provider_addr}");
+
+        let (remote_addr, _remote_state, remote_task) =
+            start_mock_remote_mcp_with_profile(None).await?;
+        let remote_endpoint = format!("http://{remote_addr}/mcp");
+
+        let opts = AppOptions {
+            profile_mode: ProfileMode::Ga,
+            ..AppOptions::default()
+        };
+        let (_state, _daemon_base, client, daemon_task) =
+            start_daemon_with_options(provider_base_url, opts).await?;
+
+        client
+            .upsert_mcp_server("remote1", remote_endpoint.clone())
+            .await?;
+
+        let tools = client.list_tools().await?.tools;
+        assert!(
+            !tools.iter().any(|t| t.id == "mcp_remote1__hello"),
+            "incompatible remote MCP should not be surfaced"
+        );
+
+        let resp = client
+            .call_tool(CallToolRequest {
+                call: ToolCall {
+                    tool_id: "mcp_remote1__hello".to_string(),
+                    args: serde_json::json!({ "text": "hi" }),
+                    context: ToolCallContext::new(),
+                    approval_token: None,
+                },
+            })
+            .await?;
+        match resp {
+            CallToolResponse::Denied { reason } => assert_eq!(reason, "remote_mcp_incompatible"),
+            other => anyhow::bail!("expected denied got {other:?}"),
+        }
+
+        daemon_task.abort();
+        remote_task.abort();
+        provider_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn remote_mcp_profile_mismatch_rejected_in_ga_mode() -> anyhow::Result<()> {
+        let (provider_addr, _provider_state, provider_task) = start_mock_provider().await?;
+        let provider_base_url = format!("http://{provider_addr}");
+
+        let (remote_addr, _remote_state, remote_task) =
+            start_mock_remote_mcp_with_profile(Some("aacp_v0")).await?;
+        let remote_endpoint = format!("http://{remote_addr}/mcp");
+
+        let opts = AppOptions {
+            profile_mode: ProfileMode::Ga,
+            ..AppOptions::default()
+        };
+        let (_state, _daemon_base, client, daemon_task) =
+            start_daemon_with_options(provider_base_url, opts).await?;
+
+        client
+            .upsert_mcp_server("remote1", remote_endpoint.clone())
+            .await?;
+
+        let tools = client.list_tools().await?.tools;
+        assert!(
+            !tools.iter().any(|t| t.id == "mcp_remote1__hello"),
+            "incompatible remote MCP should not be surfaced"
+        );
+
+        let resp = client
+            .call_tool(CallToolRequest {
+                call: ToolCall {
+                    tool_id: "mcp_remote1__hello".to_string(),
+                    args: serde_json::json!({ "text": "hi" }),
+                    context: ToolCallContext::new(),
+                    approval_token: None,
+                },
+            })
+            .await?;
+        match resp {
+            CallToolResponse::Denied { reason } => assert_eq!(reason, "remote_mcp_incompatible"),
+            other => anyhow::bail!("expected denied got {other:?}"),
+        }
+
+        daemon_task.abort();
+        remote_task.abort();
+        provider_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn remote_mcp_oauth_discovery_and_refresh_enables_calls() -> anyhow::Result<()> {
         let (provider_addr, _provider_state, provider_task) = start_mock_provider().await?;
         let provider_base_url = format!("http://{provider_addr}");
@@ -6061,6 +6781,7 @@ mod tests {
 
         let bundle1 = briefcase_control_plane_api::types::PolicyBundle {
             bundle_id: 1,
+            compatibility_profile: COMPATIBILITY_PROFILE_VERSION.to_string(),
             policy_text: format!("{default_policy}\n// bundle 1\n"),
             budgets: budgets1,
             updated_at_rfc3339: Utc::now().to_rfc3339(),
@@ -6131,6 +6852,7 @@ mod tests {
         budgets2.insert("read".to_string(), 999);
         let bundle2 = briefcase_control_plane_api::types::PolicyBundle {
             bundle_id: 2,
+            compatibility_profile: COMPATIBILITY_PROFILE_VERSION.to_string(),
             policy_text: format!("{default_policy}\n// bundle 2\n"),
             budgets: budgets2,
             updated_at_rfc3339: Utc::now().to_rfc3339(),
@@ -6184,6 +6906,191 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn control_plane_enroll_rejects_dpop_replay_on_policy_endpoint() -> anyhow::Result<()> {
+        use base64::Engine as _;
+        use std::collections::BTreeMap;
+
+        let default_policy =
+            briefcase_policy::CedarPolicyEngineOptions::default_policies().policy_text;
+        let bundle = briefcase_control_plane_api::types::PolicyBundle {
+            bundle_id: 1,
+            compatibility_profile: COMPATIBILITY_PROFILE_VERSION.to_string(),
+            policy_text: default_policy,
+            budgets: BTreeMap::new(),
+            updated_at_rfc3339: Utc::now().to_rfc3339(),
+        };
+
+        let (cp_addr, _cp_state, cp_task) = start_mock_control_plane(bundle, false).await?;
+        let base_url = format!("http://{cp_addr}");
+
+        // Generate a device identity key and enroll.
+        let secrets = Arc::new(briefcase_secrets::InMemorySecretStore::default());
+        let keys = SoftwareKeyManager::new(secrets);
+        let handle = keys.generate(KeyAlgorithm::Ed25519).await?;
+        let signer = keys.signer(handle);
+        let pk = signer.public_key_bytes().await?;
+        let device_pubkey_b64 =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(pk.as_slice());
+
+        let http = reqwest::Client::new();
+        let device_id = Uuid::new_v4();
+        let enroll_url = format!("{base_url}/v1/admin/devices/enroll");
+        let _enroll: briefcase_control_plane_api::types::EnrollDeviceResponse = http
+            .post(enroll_url)
+            .header("authorization", "Bearer admin")
+            .json(&briefcase_control_plane_api::types::EnrollDeviceRequest {
+                device_id,
+                device_name: "replay-test".to_string(),
+                device_pubkey_b64,
+            })
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+
+        let policy_url = url::Url::parse(&format!("{base_url}/v1/devices/{device_id}/policy"))?;
+        let dpop = briefcase_dpop::dpop_proof_for_resource_request(
+            signer.as_ref(),
+            &policy_url,
+            "GET",
+            "device-token",
+        )
+        .await?;
+
+        let resp1 = http
+            .get(policy_url.clone())
+            .header("authorization", "Bearer device-token")
+            .header("dpop", dpop.clone())
+            .send()
+            .await?;
+        assert!(resp1.status().is_success(), "expected first policy GET ok");
+
+        let resp2 = http
+            .get(policy_url)
+            .header("authorization", "Bearer device-token")
+            .header("dpop", dpop)
+            .send()
+            .await?;
+        assert_eq!(resp2.status(), reqwest::StatusCode::CONFLICT);
+        let err: briefcase_control_plane_api::ErrorResponse = resp2.json().await?;
+        assert_eq!(err.code, "replay_detected");
+
+        cp_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn control_plane_enroll_rejects_stale_dpop_on_policy_endpoint() -> anyhow::Result<()> {
+        use base64::Engine as _;
+        use std::collections::BTreeMap;
+
+        async fn dpop_with_iat(
+            signer: &dyn briefcase_keys::Signer,
+            url: &url::Url,
+            method: &str,
+            access_token: &str,
+            iat: i64,
+            jti: &str,
+        ) -> anyhow::Result<String> {
+            fn b64url(bytes: &[u8]) -> String {
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+            }
+
+            let jwk = signer.public_jwk().await?;
+            let alg = match signer.handle().algorithm {
+                KeyAlgorithm::Ed25519 => "EdDSA",
+                KeyAlgorithm::P256 => "ES256",
+            };
+            let header = serde_json::json!({
+                "typ": "dpop+jwt",
+                "alg": alg,
+                "jwk": jwk,
+            });
+
+            let mut u = url.clone();
+            u.set_fragment(None);
+
+            let payload = serde_json::json!({
+                "htu": u.to_string(),
+                "htm": method.to_uppercase(),
+                "iat": iat,
+                "jti": jti,
+                "ath": briefcase_dpop::sha256_b64url(access_token.as_bytes()),
+            });
+
+            let header_b64 = b64url(&serde_json::to_vec(&header)?);
+            let payload_b64 = b64url(&serde_json::to_vec(&payload)?);
+            let signing_input = format!("{header_b64}.{payload_b64}");
+            let sig = signer.sign(signing_input.as_bytes()).await?;
+            let sig_b64 = b64url(&sig);
+            Ok(format!("{signing_input}.{sig_b64}"))
+        }
+
+        let default_policy =
+            briefcase_policy::CedarPolicyEngineOptions::default_policies().policy_text;
+        let bundle = briefcase_control_plane_api::types::PolicyBundle {
+            bundle_id: 1,
+            compatibility_profile: COMPATIBILITY_PROFILE_VERSION.to_string(),
+            policy_text: default_policy,
+            budgets: BTreeMap::new(),
+            updated_at_rfc3339: Utc::now().to_rfc3339(),
+        };
+
+        let (cp_addr, _cp_state, cp_task) = start_mock_control_plane(bundle, false).await?;
+        let base_url = format!("http://{cp_addr}");
+
+        // Generate a device identity key and enroll.
+        let secrets = Arc::new(briefcase_secrets::InMemorySecretStore::default());
+        let keys = SoftwareKeyManager::new(secrets);
+        let handle = keys.generate(KeyAlgorithm::Ed25519).await?;
+        let signer = keys.signer(handle);
+        let pk = signer.public_key_bytes().await?;
+        let device_pubkey_b64 =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(pk.as_slice());
+
+        let http = reqwest::Client::new();
+        let device_id = Uuid::new_v4();
+        let enroll_url = format!("{base_url}/v1/admin/devices/enroll");
+        let _enroll: briefcase_control_plane_api::types::EnrollDeviceResponse = http
+            .post(enroll_url)
+            .header("authorization", "Bearer admin")
+            .json(&briefcase_control_plane_api::types::EnrollDeviceRequest {
+                device_id,
+                device_name: "stale-test".to_string(),
+                device_pubkey_b64,
+            })
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+
+        let policy_url = url::Url::parse(&format!("{base_url}/v1/devices/{device_id}/policy"))?;
+        let stale_iat = Utc::now().timestamp() - 10_000;
+        let dpop = dpop_with_iat(
+            signer.as_ref(),
+            &policy_url,
+            "GET",
+            "device-token",
+            stale_iat,
+            "stale-jti",
+        )
+        .await?;
+
+        let resp = http
+            .get(policy_url)
+            .header("authorization", "Bearer device-token")
+            .header("dpop", dpop)
+            .send()
+            .await?;
+        assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+        cp_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn control_plane_enroll_with_remote_signer_is_used_for_dpop() -> anyhow::Result<()> {
         use std::collections::BTreeMap;
 
@@ -6198,6 +7105,7 @@ mod tests {
         budgets.insert("read".to_string(), 1_000_000);
         let bundle = briefcase_control_plane_api::types::PolicyBundle {
             bundle_id: 1,
+            compatibility_profile: COMPATIBILITY_PROFILE_VERSION.to_string(),
             policy_text: default_policy,
             budgets,
             updated_at_rfc3339: Utc::now().to_rfc3339(),
@@ -6261,11 +7169,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn policy_bundle_compat_rejects_incompatible_update_in_ga_mode() -> anyhow::Result<()> {
+        use std::collections::BTreeMap;
+
+        let (provider_addr, _provider_state, provider_task) = start_mock_provider().await?;
+        let provider_base_url = format!("http://{provider_addr}");
+
+        let opts = AppOptions {
+            profile_mode: ProfileMode::Ga,
+            ..AppOptions::default()
+        };
+        let (state, _daemon_base, client, daemon_task) =
+            start_daemon_with_options(provider_base_url, opts).await?;
+
+        let default_policy =
+            briefcase_policy::CedarPolicyEngineOptions::default_policies().policy_text;
+        let mut budgets1 = BTreeMap::new();
+        budgets1.insert("read".to_string(), 1_000);
+        let bundle1 = briefcase_control_plane_api::types::PolicyBundle {
+            bundle_id: 1,
+            compatibility_profile: COMPATIBILITY_PROFILE_VERSION.to_string(),
+            policy_text: format!("{default_policy}\n// ok\n"),
+            budgets: budgets1,
+            updated_at_rfc3339: Utc::now().to_rfc3339(),
+        };
+
+        let (cp_addr, cp_state, cp_task) = start_mock_control_plane(bundle1, false).await?;
+        let cp_base_url = format!("http://{cp_addr}");
+
+        client
+            .control_plane_enroll(briefcase_api::types::ControlPlaneEnrollRequest {
+                base_url: cp_base_url,
+                admin_token: "admin".to_string(),
+                device_name: "compat-test".to_string(),
+            })
+            .await?;
+
+        // Push an incompatible update from the control plane.
+        let mut budgets2 = BTreeMap::new();
+        budgets2.insert("read".to_string(), 9_999);
+        let bundle2 = briefcase_control_plane_api::types::PolicyBundle {
+            bundle_id: 2,
+            compatibility_profile: "aacp_v0".to_string(),
+            policy_text: format!("{default_policy}\n// bad\n"),
+            budgets: budgets2,
+            updated_at_rfc3339: Utc::now().to_rfc3339(),
+        };
+        *cp_state.bundle.lock().await = bundle2;
+
+        let sync = client.control_plane_sync().await;
+        assert!(sync.is_err(), "expected sync error for incompatible bundle");
+
+        // Daemon should keep the previous policy.
+        let pol = client.policy_get().await?;
+        assert!(pol.policy_text.contains("// ok"));
+        assert!(!pol.policy_text.contains("// bad"));
+
+        // Evidence should be recorded.
+        let receipts = state
+            .receipts
+            .list(200, 0)
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        assert!(
+            receipts.iter().any(|r| r
+                .event
+                .get("kind")
+                .and_then(|v| v.as_str())
+                .is_some_and(|k| k == "control_plane_policy_bundle_incompatible")),
+            "expected incompatible bundle receipt evidence"
+        );
+
+        daemon_task.abort();
+        provider_task.abort();
+        cp_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn no_secrets_in_logs_regression() -> anyhow::Result<()> {
         use std::collections::BTreeMap;
 
         let buf = init_log_capture();
+        let exporter = test_span_exporter();
         buf.lock().expect("lock").clear();
+        exporter.reset();
 
         let (provider_addr, _provider_state, provider_task) = start_mock_provider().await?;
         let provider_base_url = format!("http://{provider_addr}");
@@ -6278,6 +7266,7 @@ mod tests {
         budgets.insert("read".to_string(), 1_000_000);
         let bundle = briefcase_control_plane_api::types::PolicyBundle {
             bundle_id: 1,
+            compatibility_profile: COMPATIBILITY_PROFILE_VERSION.to_string(),
             policy_text: default_policy,
             budgets,
             updated_at_rfc3339: Utc::now().to_rfc3339(),
@@ -6293,6 +7282,7 @@ mod tests {
                 device_name: "log-scan".to_string(),
             })
             .await?;
+        client.control_plane_sync().await?;
 
         // Provider OAuth carries refresh tokens (secrets).
         client
@@ -6307,9 +7297,65 @@ mod tests {
             )
             .await?;
 
+        // Remote MCP OAuth carries refresh/access tokens (secrets).
+        let (secure_addr, _oauth_state, secure_task) = start_mock_oauth_protected_mcp().await?;
+        let secure_endpoint = format!("http://{secure_addr}/mcp");
+        client
+            .upsert_mcp_server("secure1", secure_endpoint.clone())
+            .await?;
+        let started = client
+            .mcp_oauth_start(
+                "secure1",
+                McpOAuthStartRequest {
+                    client_id: "briefcase-cli".to_string(),
+                    redirect_uri: "http://127.0.0.1/callback".to_string(),
+                    scope: Some("mcp.read".to_string()),
+                },
+            )
+            .await?;
+        client
+            .mcp_oauth_exchange(
+                "secure1",
+                McpOAuthExchangeRequest {
+                    code: "code_mock".to_string(),
+                    state: started.state,
+                },
+            )
+            .await?;
+
+        let tools = client.list_tools().await?.tools;
+        assert!(tools.iter().any(|t| t.id == "mcp_secure1__hello"));
+
+        let resp = client
+            .call_tool(CallToolRequest {
+                call: ToolCall {
+                    tool_id: "mcp_secure1__hello".to_string(),
+                    args: serde_json::json!({ "text": "hi" }),
+                    context: ToolCallContext::new(),
+                    approval_token: None,
+                },
+            })
+            .await?;
+        let approval_id = match resp {
+            CallToolResponse::ApprovalRequired { approval } => approval.id,
+            _ => anyhow::bail!("expected approval_required"),
+        };
+        let approved = client.approve(&approval_id).await?;
+        let mcp_call_resp = client
+            .call_tool(CallToolRequest {
+                call: ToolCall {
+                    tool_id: "mcp_secure1__hello".to_string(),
+                    args: serde_json::json!({ "text": "hi" }),
+                    context: ToolCallContext::new(),
+                    approval_token: Some(approved.approval_token),
+                },
+            })
+            .await?;
+        assert!(matches!(mcp_call_resp, CallToolResponse::Ok { .. }));
+
         // Tool call path (exercises payment parsing, VC issuance, etc).
         client.fetch_vc("demo").await?;
-        let _ = client
+        let quote_resp = client
             .call_tool(CallToolRequest {
                 call: ToolCall {
                     tool_id: "quote".to_string(),
@@ -6320,19 +7366,63 @@ mod tests {
             })
             .await?;
 
-        let guard = buf.lock().expect("lock");
-        let logs = String::from_utf8_lossy(&guard);
+        let secrets = [
+            "device-token",
+            "rt_mock",
+            "rt_mock2",
+            "at_mock",
+            "at_mock2",
+            MOCK_PROVIDER_CAPABILITY_TOKEN,
+            MOCK_PROVIDER_PAYMENT_PROOF,
+            "rt_mcp",
+            "at_mcp",
+        ];
+
+        let logs = {
+            let guard = buf.lock().expect("lock");
+            String::from_utf8_lossy(&guard).to_string()
+        };
         // Secrets used by the mock harnesses; if these ever show up in logs, we have a regression.
-        for secret in ["device-token", "rt_mock", "rt_mock2"] {
+        for secret in secrets {
             assert!(
                 !logs.contains(secret),
                 "logs leaked secret substring: {secret}"
             );
         }
 
+        let quote_json = serde_json::to_string(&quote_resp)?;
+        let mcp_call_json = serde_json::to_string(&mcp_call_resp)?;
+        let receipts_json = serde_json::to_string(&client.list_receipts().await?)?;
+        for secret in secrets {
+            assert!(
+                !quote_json.contains(secret),
+                "tool response leaked secret substring: {secret}"
+            );
+            assert!(
+                !mcp_call_json.contains(secret),
+                "remote mcp tool response leaked secret substring: {secret}"
+            );
+            assert!(
+                !receipts_json.contains(secret),
+                "receipts leaked secret substring: {secret}"
+            );
+        }
+
+        let spans = exporter
+            .get_finished_spans()
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let spans_dump = format!("{spans:?}");
+        for secret in secrets {
+            assert!(
+                !spans_dump.contains(secret),
+                "spans leaked secret substring: {secret}"
+            );
+        }
+
         daemon_task.abort();
         provider_task.abort();
         cp_task.abort();
+        secure_task.abort();
         Ok(())
     }
 
@@ -6349,6 +7439,7 @@ mod tests {
         budgets.insert("read".to_string(), 1);
         let bundle = briefcase_control_plane_api::types::PolicyBundle {
             bundle_id: 1,
+            compatibility_profile: COMPATIBILITY_PROFILE_VERSION.to_string(),
             policy_text: "this is not valid cedar".to_string(),
             budgets,
             updated_at_rfc3339: Utc::now().to_rfc3339(),

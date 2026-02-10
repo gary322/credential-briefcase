@@ -141,6 +141,8 @@ impl Db {
     }
 
     pub async fn init(&self) -> anyhow::Result<()> {
+        const CURRENT_SCHEMA_VERSION: i32 = 1;
+
         self.conn
             .call(|conn| {
                 conn.pragma_update(None, "journal_mode", "WAL")?;
@@ -310,38 +312,76 @@ impl Db {
                     );
                     "#,
                 )?;
+
+                fn column_exists(
+                    conn: &rusqlite::Connection,
+                    table: &str,
+                    column: &str,
+                ) -> rusqlite::Result<bool> {
+                    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+                    let mut rows = stmt.query([])?;
+                    while let Some(row) = rows.next()? {
+                        let name: String = row.get(1)?;
+                        if name == column {
+                            return Ok(true);
+                        }
+                    }
+                    Ok(false)
+                }
+
+                fn add_column_if_missing(
+                    conn: &rusqlite::Connection,
+                    table: &str,
+                    column: &str,
+                    decl: &str,
+                ) -> rusqlite::Result<()> {
+                    if column_exists(conn, table, column)? {
+                        return Ok(());
+                    }
+                    conn.execute(
+                        &format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"),
+                        [],
+                    )?;
+                    Ok(())
+                }
+
+                let user_version: i32 =
+                    conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+
+                // Version 1: add the columns that were introduced after the initial schema
+                // (pre-PRAGMA user_version tracking). Migrations are additive only.
+                if user_version < 1 {
+                    add_column_if_missing(
+                        conn,
+                        "remote_mcp_oauth",
+                        "dpop_algs_json",
+                        "TEXT NOT NULL DEFAULT '[]'",
+                    )?;
+                    add_column_if_missing(conn, "remote_mcp_oauth", "revocation_endpoint", "TEXT")?;
+                    add_column_if_missing(conn, "vcs", "status_list_url", "TEXT")?;
+                    add_column_if_missing(conn, "vcs", "status_list_index", "INTEGER")?;
+                    add_column_if_missing(conn, "vcs", "status_purpose", "TEXT")?;
+                    add_column_if_missing(conn, "vcs", "revoked_at_rfc3339", "TEXT")?;
+                    add_column_if_missing(
+                        conn,
+                        "approvals",
+                        "approval_kind",
+                        "TEXT NOT NULL DEFAULT 'local'",
+                    )?;
+                    add_column_if_missing(
+                        conn,
+                        "signers",
+                        "algorithm",
+                        "TEXT NOT NULL DEFAULT 'ed25519'",
+                    )?;
+                    add_column_if_missing(conn, "signers", "device_name", "TEXT")?;
+
+                    conn.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION)?;
+                }
+
                 Ok(())
             })
             .await?;
-
-        // Best-effort schema migration for older DBs (SQLite has limited ALTER TABLE).
-        let _ = self
-            .conn
-            .call(|conn| {
-                let _ = conn.execute(
-                    "ALTER TABLE remote_mcp_oauth ADD COLUMN dpop_algs_json TEXT NOT NULL DEFAULT '[]'",
-                    [],
-                );
-                let _ = conn.execute(
-                    "ALTER TABLE remote_mcp_oauth ADD COLUMN revocation_endpoint TEXT",
-                    [],
-                );
-                let _ = conn.execute("ALTER TABLE vcs ADD COLUMN status_list_url TEXT", []);
-                let _ = conn.execute("ALTER TABLE vcs ADD COLUMN status_list_index INTEGER", []);
-                let _ = conn.execute("ALTER TABLE vcs ADD COLUMN status_purpose TEXT", []);
-                let _ = conn.execute("ALTER TABLE vcs ADD COLUMN revoked_at_rfc3339 TEXT", []);
-                let _ = conn.execute(
-                    "ALTER TABLE approvals ADD COLUMN approval_kind TEXT NOT NULL DEFAULT 'local'",
-                    [],
-                );
-                let _ = conn.execute(
-                    "ALTER TABLE signers ADD COLUMN algorithm TEXT NOT NULL DEFAULT 'ed25519'",
-                    [],
-                );
-                let _ = conn.execute("ALTER TABLE signers ADD COLUMN device_name TEXT", []);
-                Ok(())
-            })
-            .await;
 
         // Seed a conservative default budget if missing.
         // $3/day for read tools, $0/day for write/admin (forcing approval).
@@ -2152,5 +2192,203 @@ impl Db {
             })
             .await
             .map_err(Into::into)
+    }
+}
+
+#[cfg(test)]
+mod migration_tests {
+    use super::*;
+
+    use rusqlite::Connection;
+    use tempfile::tempdir;
+
+    fn column_exists(conn: &Connection, table: &str, column: &str) -> anyhow::Result<bool> {
+        let mut stmt = conn
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .context("prepare pragma table_info")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let name: String = row.get(1)?;
+            if name == column {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn create_pre_versioning_db(path: &Path) -> anyhow::Result<()> {
+        let conn = Connection::open(path).context("open sqlite")?;
+        conn.execute_batch(
+            r#"
+            -- Minimal "v0" schema (pre user_version tracking).
+            CREATE TABLE approvals (
+              id                TEXT PRIMARY KEY,
+              created_at_rfc3339 TEXT NOT NULL,
+              expires_at_rfc3339 TEXT NOT NULL,
+              tool_id            TEXT NOT NULL,
+              reason             TEXT NOT NULL,
+              summary_json       TEXT NOT NULL,
+              call_hash_hex      TEXT NOT NULL,
+              status             TEXT NOT NULL
+            );
+
+            CREATE TABLE signers (
+              id                TEXT PRIMARY KEY,
+              pubkey_b64         TEXT NOT NULL,
+              created_at_rfc3339 TEXT NOT NULL
+            );
+
+            CREATE TABLE vcs (
+              provider_id        TEXT PRIMARY KEY,
+              vc_jwt             TEXT NOT NULL,
+              expires_at_rfc3339 TEXT NOT NULL,
+              created_at_rfc3339 TEXT NOT NULL
+            );
+
+            CREATE TABLE remote_mcp_oauth (
+              server_id              TEXT PRIMARY KEY,
+              issuer                 TEXT NOT NULL,
+              authorization_endpoint TEXT NOT NULL,
+              token_endpoint         TEXT NOT NULL,
+              resource               TEXT NOT NULL,
+              discovered_at_rfc3339  TEXT NOT NULL
+            );
+
+            CREATE TABLE providers (
+              id                TEXT PRIMARY KEY,
+              base_url          TEXT NOT NULL,
+              created_at_rfc3339 TEXT NOT NULL
+            );
+            "#,
+        )
+        .context("create v0 schema")?;
+
+        conn.execute(
+            "INSERT INTO approvals(id, created_at_rfc3339, expires_at_rfc3339, tool_id, reason, summary_json, call_hash_hex, status) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            rusqlite::params![
+                "a1",
+                "2026-01-01T00:00:00Z",
+                "2026-01-02T00:00:00Z",
+                "echo",
+                "test",
+                "{\"ok\":true}",
+                "00",
+                "pending",
+            ],
+        )
+        .context("insert approvals")?;
+
+        conn.execute(
+            "INSERT INTO signers(id, pubkey_b64, created_at_rfc3339) VALUES (?1, ?2, ?3)",
+            rusqlite::params!["s1", "pk", "2026-01-01T00:00:00Z"],
+        )
+        .context("insert signers")?;
+
+        conn.execute(
+            "INSERT INTO vcs(provider_id, vc_jwt, expires_at_rfc3339, created_at_rfc3339) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![
+                "demo",
+                "vc",
+                "2026-02-01T00:00:00Z",
+                "2026-01-01T00:00:00Z"
+            ],
+        )
+        .context("insert vcs")?;
+
+        conn.execute(
+            "INSERT INTO remote_mcp_oauth(server_id, issuer, authorization_endpoint, token_endpoint, resource, discovered_at_rfc3339) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                "srv1",
+                "issuer",
+                "https://auth/authorize",
+                "https://auth/token",
+                "https://resource",
+                "2026-01-01T00:00:00Z"
+            ],
+        )
+        .context("insert remote_mcp_oauth")?;
+
+        conn.execute(
+            "INSERT INTO providers(id, base_url, created_at_rfc3339) VALUES (?1, ?2, ?3)",
+            rusqlite::params!["demo", "https://provider", "2026-01-01T00:00:00Z"],
+        )
+        .context("insert providers")?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn migration_upgrade_from_v0_adds_columns_and_sets_user_version() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("briefcase.sqlite");
+        create_pre_versioning_db(&path)?;
+
+        let db = Db::open(&path).await?;
+        db.init().await?;
+
+        let conn = Connection::open(&path)?;
+        let user_version: i32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        assert_eq!(user_version, 1);
+
+        assert!(column_exists(&conn, "remote_mcp_oauth", "dpop_algs_json")?);
+        assert!(column_exists(
+            &conn,
+            "remote_mcp_oauth",
+            "revocation_endpoint"
+        )?);
+        assert!(column_exists(&conn, "vcs", "status_list_url")?);
+        assert!(column_exists(&conn, "vcs", "status_list_index")?);
+        assert!(column_exists(&conn, "vcs", "status_purpose")?);
+        assert!(column_exists(&conn, "vcs", "revoked_at_rfc3339")?);
+        assert!(column_exists(&conn, "approvals", "approval_kind")?);
+        assert!(column_exists(&conn, "signers", "algorithm")?);
+        assert!(column_exists(&conn, "signers", "device_name")?);
+
+        // Existing rows must remain queryable, and new NOT NULL columns must have defaults.
+        let approval_kind: String = conn.query_row(
+            "SELECT approval_kind FROM approvals WHERE id=?1",
+            rusqlite::params!["a1"],
+            |row| row.get(0),
+        )?;
+        assert_eq!(approval_kind, "local");
+        let dpop_algs_json: String = conn.query_row(
+            "SELECT dpop_algs_json FROM remote_mcp_oauth WHERE server_id=?1",
+            rusqlite::params!["srv1"],
+            |row| row.get(0),
+        )?;
+        assert_eq!(dpop_algs_json, "[]");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn migration_downgrade_old_queries_still_work_after_upgrade() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("briefcase.sqlite");
+        create_pre_versioning_db(&path)?;
+
+        let db = Db::open(&path).await?;
+        db.init().await?;
+
+        let conn = Connection::open(&path)?;
+
+        // These queries intentionally ignore the newer columns; they model "N-1" binaries that
+        // still only select the original columns.
+        let _approval_id: String = conn.query_row(
+            "SELECT id FROM approvals WHERE id=?1",
+            rusqlite::params!["a1"],
+            |row| row.get(0),
+        )?;
+        let _signer_id: String = conn.query_row(
+            "SELECT id FROM signers WHERE id=?1",
+            rusqlite::params!["s1"],
+            |row| row.get(0),
+        )?;
+        let _server_id: String = conn.query_row(
+            "SELECT server_id FROM remote_mcp_oauth WHERE server_id=?1",
+            rusqlite::params!["srv1"],
+            |row| row.get(0),
+        )?;
+        Ok(())
     }
 }

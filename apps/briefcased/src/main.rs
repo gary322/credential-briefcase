@@ -2,6 +2,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
+use briefcase_core::ProfileMode;
 use briefcase_secrets::{SecretStoreKind, SecretStoreOptions};
 use clap::Parser;
 use directories::ProjectDirs;
@@ -11,16 +12,9 @@ use tracing::info;
 use base64::Engine as _;
 use briefcase_otel::TracingInitOptions;
 
-mod app;
-mod control_plane;
-mod db;
-mod firewall;
-mod middleware;
-mod pairing;
-mod policy_compiler;
-mod provider;
-mod remote_mcp;
-mod tools;
+use briefcased::app;
+
+const PROFILE_MODES_HELP: &str = "Profile mode: reference | staging | ga";
 
 #[derive(Debug, Clone, Parser)]
 #[command(name = "briefcased", version, about = "Credential Briefcase daemon")]
@@ -37,6 +31,11 @@ struct Args {
     #[arg(long, env = "BRIEFCASE_UNIX_SOCKET")]
     unix_socket: Option<PathBuf>,
 
+    /// Listen on a Windows named pipe. Default: derived from the daemon auth token (Windows only).
+    #[cfg(windows)]
+    #[arg(long, env = "BRIEFCASE_NAMED_PIPE")]
+    named_pipe: Option<String>,
+
     /// Base URL for the reference provider gateway.
     #[arg(
         long,
@@ -52,6 +51,23 @@ struct Args {
     /// - otherwise uses `keyring`
     #[arg(long, env = "BRIEFCASE_SECRET_BACKEND")]
     secret_backend: Option<String>,
+
+    #[arg(
+        long,
+        env = "BRIEFCASE_PROFILE_MODE",
+        default_value = "reference",
+        help = PROFILE_MODES_HELP
+    )]
+    profile_mode: String,
+
+    /// Strict host isolation mode (recommended for shared hosts).
+    ///
+    /// Enforces:
+    /// - loopback-only TCP binds
+    /// - Unix: 0700 data dir and 0600 auth_token; unix socket path must be within data_dir
+    /// - Windows: named pipe path must be derived from the auth token (no override)
+    #[arg(long, env = "BRIEFCASE_STRICT_HOST", default_value_t = false)]
+    strict_host: bool,
 }
 
 #[tokio::main]
@@ -70,13 +86,28 @@ async fn main() -> anyhow::Result<()> {
     let auth_token_path = data_dir.join("auth_token");
     let auth_token = load_or_create_auth_token(&auth_token_path)?;
 
+    if args.strict_host {
+        briefcased::host::enforce_strict_host_fs(&data_dir, &auth_token_path)
+            .context("enforce strict host fs permissions")?;
+    }
+
+    let profile_mode = args
+        .profile_mode
+        .parse::<ProfileMode>()
+        .map_err(|e| anyhow::anyhow!("invalid --profile-mode: {e}"))?;
+
     let db_path = data_dir.join("briefcase.sqlite");
     let secrets = open_secret_store(&data_dir, args.secret_backend.as_deref()).await?;
-    let state = app::AppState::init(
+    let state = app::AppState::init_with_options(
         &db_path,
         auth_token.clone(),
         args.provider_base_url,
         secrets,
+        app::AppOptions {
+            profile_mode,
+            strict_host: args.strict_host,
+            ..app::AppOptions::default()
+        },
     )
     .await?;
 
@@ -91,19 +122,47 @@ async fn main() -> anyhow::Result<()> {
             let sock_path = args
                 .unix_socket
                 .unwrap_or_else(|| data_dir.join("briefcased.sock"));
+            if args.strict_host {
+                briefcased::host::validate_unix_socket_within_data_dir(&data_dir, &sock_path)
+                    .context("validate unix socket path in strict host mode")?;
+            }
             info!(path = %sock_path.display(), "starting briefcased (unix socket)");
             app::serve_unix(sock_path, state).await?;
             return Ok(());
         }
-        #[cfg(not(unix))]
-        {
-            tracing::warn!("unix sockets are not supported on this platform; falling back to TCP");
+    }
+
+    #[cfg(windows)]
+    {
+        if args.tcp_addr.is_none() {
+            let default_pipe = briefcase_api::default_named_pipe_name(&auth_token);
+            if args.strict_host {
+                if let Some(p) = args.named_pipe.as_deref()
+                    && p != default_pipe.as_str()
+                {
+                    anyhow::bail!(
+                        "strict host mode requires the default named pipe path (set BRIEFCASE_NAMED_PIPE to the derived default or unset it)"
+                    );
+                }
+            }
+
+            let pipe_name = if args.strict_host {
+                default_pipe
+            } else {
+                args.named_pipe.unwrap_or(default_pipe)
+            };
+            info!(pipe_name = %pipe_name, "starting briefcased (named pipe)");
+            app::serve_named_pipe(pipe_name, state).await?;
+            return Ok(());
         }
     }
 
     let addr = args
         .tcp_addr
         .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 0)));
+    if args.strict_host {
+        briefcased::host::validate_loopback_tcp_bind(addr).context("validate tcp bind addr")?;
+    }
     info!(addr = %addr, "starting briefcased (tcp)");
     app::serve_tcp(addr, state).await?;
     Ok(())
