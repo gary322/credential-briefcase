@@ -1,6 +1,7 @@
 use std::net::SocketAddr;
 use std::path::Path;
 
+#[cfg(unix)]
 use anyhow::Context as _;
 
 pub fn validate_loopback_tcp_bind(addr: SocketAddr) -> anyhow::Result<()> {

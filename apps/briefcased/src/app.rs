@@ -431,7 +431,7 @@ pub async fn serve_named_pipe(pipe_name: String, state: AppState) -> anyhow::Res
 
                 tokio::spawn(async move {
                     let io = TokioIo::new(server);
-                    let mut builder = Builder::new(TokioExecutor::new());
+                    let builder = Builder::new(TokioExecutor::new());
                     let _ = builder.serve_connection_with_upgrades(io, hyper_service).await;
                 });
             }
